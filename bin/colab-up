@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Create (or reuse) the session for a profile. Usage: colab-up [profile]
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
+wrap_enter
+PROFILE="${1:-workload}"
+# shellcheck disable=SC2046
+"$COLAB_BIN" --auth oauth2 new $(profile_args "$PROFILE")

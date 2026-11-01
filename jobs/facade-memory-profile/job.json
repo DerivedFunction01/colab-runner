@@ -1,0 +1,1 @@
+{"args":[],"checkpoint_pull_seconds":60,"name":"facade-memory-profile","outputs":["profile-report.json","profile.log"],"profile":"workload","script":"snippets/facade_memory_profiler.py","timeout":3600,"units":1}

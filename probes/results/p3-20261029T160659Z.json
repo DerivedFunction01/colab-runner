@@ -1,0 +1,14 @@
+{
+  "probe": "p3",
+  "at": "2026-10-29T16:06:59.881335+00:00",
+  "install": {
+    "seconds": 14.26,
+    "rc": 0,
+    "tail": "[colab] Installing packages on probe (preferring uv)...\nInstallation Complete (via uv)!"
+  },
+  "smoke_remote": "{\"rows\": 1000000, \"total\": 71998582.5, \"duckdb\": \"1.3.2\"}",
+  "smoke_local": "se SystemExit(main())\n                     ^^^^^^\n  File \"~/colab-runner/snippets/smoke_duckdb.py\", line 13, in main\n    import duckdb\nModuleNotFoundError: No module named 'duckdb'",
+  "smoke_match": "local duckdb unavailable",
+  "sec_from_colab": "{\"status\": 200, \"seconds\": 0.12, \"bytes_sampled\": 512, \"verdict\": \"reachable\"}",
+  "gate_remote_note": "Remote gate leg runs via bin/colab-check once the Step 7 bundle exists; verdicts must agree, only wall time may differ."
+}

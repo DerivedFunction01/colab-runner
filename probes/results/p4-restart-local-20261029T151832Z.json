@@ -1,0 +1,20 @@
+{
+  "probe": "p4-restart-local",
+  "at": "2026-10-29T15:18:32.899235+00:00",
+  "legs": {
+    "wrapper_trigger_restore": true,
+    "cron_trigger_restore": true,
+    "newer_canonical_not_clobbered": true,
+    "bootstrap_recreates_tool": true,
+    "bootstrap_stdout_tail": [
+      "== installing google-colab-cli via uv tool",
+      "colab: /tmp/tmpu12xqbli/bare-home/.local/bin/colab version=0.7.5 (floor 0.7.1)",
+      "== login state (presence only)",
+      "present: /tmp/tmpu12xqbli/bare-home/.config/colab-cli/token.json",
+      "present: /tmp/tmpu12xqbli/bare-home/.config/colab-cli/sessions.json",
+      "restore cron: NOT registered yet \u2014 see ops/restore-cron.md"
+    ],
+    "colab_leg": "STAGED \u2014 needs the operator's login: start the smoke job, `colab stop` mid-run, fresh session, `bin/colab-run smoke --resume <run-id>`, final hashes must equal the uninterrupted control (tests/test_runner_fake.py proves the same flow against the fake CLI)."
+  },
+  "local_leg_passed": true
+}

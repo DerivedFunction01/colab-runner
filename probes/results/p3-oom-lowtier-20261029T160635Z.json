@@ -1,0 +1,41 @@
+{
+  "probe": "p3-oom-lowtier",
+  "at": "2026-10-29T16:06:35.245905+00:00",
+  "resources": {
+    "python": "3.13.18",
+    "python_full": "3.13.18 (main, Oct 26 2026, 15:28:15) [GCC 13.3.0]",
+    "cpus": 2,
+    "mem_total_bytes": 13605810176,
+    "cgroup_memory_max_bytes": null,
+    "disk": {
+      "total": 242486079488,
+      "free": 220400291840
+    },
+    "derive_resources": {
+      "workers": 2,
+      "memory_budget_bytes": 13605810176,
+      "per_worker_bytes": 6802905088
+    }
+  },
+  "ramp": {
+    "rc": 0,
+    "lines": [
+      ""
+    ],
+    "stderr_tail": "mp.py'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mread\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'memory_ramp.py'\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'exec'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mg\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[0;31mFileNotFoundError\u001b[0m: [Errno 2] No such file or directory: 'memory_ramp.py'"
+  },
+  "bert": {
+    "rc": 0,
+    "stdout": "",
+    "stderr_tail": "0m\u001b[0;34m)\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mread\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'bert_batch_ramp.py'\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m'exec'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mg\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[0;31mFileNotFoundError\u001b[0m: [Errno 2] No such file or directory: 'bert_batch_ramp.py'"
+  },
+  "status_after": "[probe-low] m-s-use4a5-du1nd0qnd0ri | Hardware: CPU | Shape: Standard | Variant: DEFAULT | Status: IDLE\n  Last Execution: ~/colab-runner/var/oom-bert_batch_ramp.py at 2026-10-29 12:06:30",
+  "session_reusable": true,
+  "edge_cases": {
+    "ramp_failure_mode": "no failure observed within cap",
+    "ramp_rc": 0,
+    "session_reusable_after_ramp_and_bert": true,
+    "status_reported_after": true,
+    "bert_ceiling_batch": null
+  }
+}

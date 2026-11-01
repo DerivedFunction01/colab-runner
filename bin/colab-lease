@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Thin CLI over sync/lease.py — the shared-session lease.
+
+Usage: colab-lease status|acquire [profile] [--hours H] [--via TAG]|extend [profile] --hours H|release [profile]|reap|keepalive|auto|request [profile] [--reason TEXT] [--via TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst PROFILE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]
+Prints one JSON result. `reap` is the reaper-hook duty (deadline +
+orphan reconciliation across all profile records); `auto` is the
+hook's auto-acquire duty (inert unless enabled in config/lease.json);
+`request` records a lease demand that `auto` consumes; `--at ISO-TIME`
+makes it a timed start the duty fires when due — data, not an agent
+job. `grant` opens
+a two-tier window whose lobby the `standing` duty keeps up; `extend`
+moves a lease's deadline later (delta-priced, flags the lease as a
+renewable window) and `extend-grant` moves the grant's end the same
+way; `state` is the UI's single read (records + grant + specs +
+budget). `budget-caps` updates the budget caps in config/lease.json
+(the panel's editor rides it); each value is a non-negative number
+or `none` for no cap, and an omitted flag leaves its cap untouched.
+"""
+
+import importlib.util
+import json
+import os
+import sys
+from datetime import datetime
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "bin"))
+
+spec = importlib.util.spec_from_loader("colab_run", SourceFileLoader("colab_run", str(REPO / "bin" / "colab-run")))
+cr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cr)
+
+spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+lease = importlib.util.module_from_spec(spec_l)
+spec_l.loader.exec_module(lease)
+
+TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
+
+
+def parse_hours(rest: list[str]) -> tuple[float | None, list[str], str | None]:
+    """Pull `--hours H` out of an argument list. Returns (hours,
+    remaining, error): hours is None when the flag is absent."""
+    hours, out = None, []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--hours":
+            if i + 1 >= len(rest):
+                return None, out, "--hours needs a value"
+            try:
+                hours = float(rest[i + 1])
+            except ValueError:
+                return None, out, "--hours needs a number"
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    if hours is not None and hours <= 0:
+        return None, out, "--hours must be > 0"
+    return hours, out, None
+
+
+def parse_flag(rest: list[str], flag: str) -> tuple[str | None, list[str], str | None]:
+    """Pull `--flag VALUE` out of an argument list. Returns (value,
+    remaining, error): value is None when the flag is absent."""
+    value, out = None, []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == flag:
+            if i + 1 >= len(rest):
+                return None, out, f"{flag} needs a value"
+            value = rest[i + 1]
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    return value, out, None
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] not in ("status", "acquire", "extend", "release", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps"):
+        print(__doc__.strip().split("\n")[2], file=sys.stderr)
+        return 2
+    if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
+        print("colab-lease: STAGED — no colab login yet.", file=sys.stderr)
+        return 2
+    cr.mirror("restore")
+    cmd = args[0]
+    if cmd == "status":
+        result = lease.status(cr.colab, REPO)
+    elif cmd == "acquire":
+        hours, rest, err = parse_hours(args[1:])
+        via = None
+        if err is None:
+            via, rest, err = parse_flag(rest, "--via")
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        positional = [t for t in rest if not t.startswith("--")]
+        profile = positional[0] if positional else json.loads((REPO / "config" / "profiles.json").read_text()).get("default_profile", "workload")
+        result = lease.acquire(cr.colab, REPO, profile, hours=hours, via=via)
+    elif cmd == "extend":
+        hours, rest, err = parse_hours(args[1:])
+        if err is None and hours is None:
+            err = "extend requires --hours H (H > 0)"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        positional = [t for t in rest if not t.startswith("--")]
+        profile = positional[0] if positional else json.loads((REPO / "config" / "profiles.json").read_text()).get("default_profile", "workload")
+        result = lease.extend(cr.colab, REPO, profile, hours)
+    elif cmd == "release":
+        profile = args[1] if len(args) > 1 else None
+        result = lease.release(cr.colab, REPO, profile=profile)
+    elif cmd == "grant":
+        hours, rest, err = parse_hours(args[1:])
+        burst = None
+        i = 0
+        while err is None and i < len(rest):
+            if rest[i] == "--burst" and i + 1 < len(rest):
+                burst = rest[i + 1]
+                i += 2
+            else:
+                i += 1
+        if err is None and hours is None:
+            err = "grant requires --hours H (H > 0)"
+        if err is None and burst is not None and burst not in lease.catalog_profiles(REPO, cr.colab):
+            err = f"unknown burst profile {burst!r}"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        result = lease.write_grant(REPO, hours, burst_profile=burst)
+    elif cmd == "extend-grant":
+        hours, rest, err = parse_hours(args[1:])
+        if err is None and hours is None:
+            err = "extend-grant requires --hours H (H > 0)"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        result = lease.extend_grant(cr.colab, REPO, hours)
+    elif cmd == "ungrant":
+        result = lease.ungrant(cr.colab, REPO)
+    elif cmd == "standing":
+        result = lease.standing_duty(cr.colab, REPO)
+        result["bridge"] = lease.bridge_duty(cr.colab, REPO)
+    elif cmd == "state":
+        result = lease.state(cr.colab, REPO)
+    elif cmd == "budget-caps":
+        updates = {}
+        err = None
+        rest = args[1:]
+        flags = {"--daily": "daily", "--monthly": "monthly", "--standing-daily": "standing_daily"}
+        i = 0
+        while err is None and i < len(rest):
+            tok = rest[i]
+            if tok not in flags:
+                err = f"unknown argument {tok!r}"
+            elif i + 1 >= len(rest):
+                err = f"{tok} needs a value (a number or 'none')"
+            else:
+                raw = rest[i + 1]
+                if raw.lower() == "none":
+                    updates[flags[tok]] = None
+                else:
+                    try:
+                        updates[flags[tok]] = float(raw)
+                    except ValueError:
+                        err = f"{tok} needs a number or 'none'"
+                i += 2
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        result = lease.set_budget_caps(REPO, **updates)
+    elif cmd == "keepalive":
+        rec = lease.load_record(REPO)
+        if not rec:
+            result = {"action": "no-lease"}
+        else:
+            launched = lease.ensure_keepalive(cr.colab, REPO, rec["session"])
+            import time as _time
+
+            _time.sleep(3)
+            age = lease.heartbeat_age(cr.colab, REPO, rec["session"])
+            result = {"action": "keepalive-ensured", **launched, "heartbeat_age_s": round(age, 1) if age is not None else None}
+    elif cmd == "auto":
+        result = lease.auto_acquire(cr.colab, REPO)
+    elif cmd == "request":
+        profile, reason, via, at = None, "", None, None
+        rest = args[1:]
+        while rest:
+            tok, rest = rest[0], rest[1:]
+            if tok == "--reason" and rest:
+                reason, rest = rest[0], rest[1:]
+            elif tok == "--via" and rest:
+                via, rest = rest[0], rest[1:]
+            elif tok == "--at" and rest:
+                at, rest = rest[0], rest[1:]
+            elif not tok.startswith("--"):
+                profile = tok
+        if at is not None:
+            try:
+                datetime.fromisoformat(at)
+            except ValueError:
+                print("colab-lease: --at needs an ISO timestamp", file=sys.stderr)
+                return 2
+        result = lease.write_request(REPO, reason=reason, profile=profile, via=via, not_before=at)
+    elif cmd == "unrequest":
+        had = lease.load_request(REPO) is not None
+        lease.clear_request(REPO)
+        result = {"action": "request-cleared" if had else "no-demand"}
+    else:
+        result = lease.reap(cr.colab, REPO)
+    print(json.dumps(result, indent=2))
+    cr.mirror("capture")
+    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

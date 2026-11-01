@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stop the session for a profile. Usage: colab-down [profile]
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
+wrap_enter
+PROFILE="${1:-workload}"
+SESSION="$(profile_field "$PROFILE" session)"
+"$COLAB_BIN" --auth oauth2 stop -s "$SESSION"

@@ -1,0 +1,171 @@
+/* Lease control UI theme — primitives mirrored from the workbench viewer
+ * (its client themes: index.css scales, olive.css — the viewer's default
+ * palette, fonts.css font stacks). Token names and values are the workbench's own
+ * (--wb-*), so this page reads as a sibling of the workbench.
+ * Deviation: the viewer's bundled woff2 @font-face files are NOT copied
+ * (this UI ships no external assets); the font stacks below fall back to
+ * the identical system fonts named in the same stacks. */
+
+/* ---- Scales (workbench themes/index.css :root) ---- */
+:root {
+  --wb-olive-50: #f4f5ec;
+  --wb-olive-100: #e3e7cf;
+  --wb-olive-200: #c2d199;
+  --wb-olive-300: #9db45c;
+  --wb-olive-400: #67742f;
+  --wb-olive-500: #4b5320;
+  --wb-olive-600: #40491b;
+  --wb-olive-700: #363d16;
+  --wb-olive-800: #2a2e12;
+  --wb-olive-900: #1d200c;
+  --wb-teal-50: #effaf8;
+  --wb-teal-100: #d7f5f0;
+  --wb-teal-200: #99e5da;
+  --wb-teal-300: #2dd4bf;
+  --wb-teal-400: #14b8a6;
+  --wb-teal-500: #0f766e;
+  --wb-teal-600: #0b5e57;
+  --wb-teal-700: #084f4a;
+  --wb-teal-800: #063f3b;
+  --wb-teal-900: #042f2c;
+  --wb-okabe-blue: #0072B2;
+  --wb-okabe-sky-blue: #56B4E9;
+  --wb-okabe-bluish-green: #009E73;
+  --wb-okabe-orange: #E69F00;
+  --wb-okabe-vermilion: #D55E00;
+  --wb-okabe-reddish-purple: #CC79A7;
+  --wb-okabe-yellow: #F0E442;
+  --wb-gray-olive-500: #6f7263;
+  --wb-space-4: 4px;
+  --wb-space-8: 8px;
+  --wb-space-12: 12px;
+  --wb-space-16: 16px;
+  --wb-space-24: 24px;
+  --wb-space-32: 32px;
+  --wb-radius-sm: 6px;
+  --wb-radius-md: 10px;
+  --wb-radius-lg: 12px;
+  --wb-radius-pill: 9999px;
+  --wb-font-ui: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --wb-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --wb-font-size-xs: 12px;
+  --wb-font-size-sm: 14px;
+  --wb-font-size-base: 16px;
+  --wb-font-size-lg: 18px;
+  --wb-font-size-xl: 20px;
+  --wb-font-size-2xl: 24px;
+  --wb-line-height-xs: 16px;
+  --wb-line-height-sm: 20px;
+  --wb-line-height-base: 24px;
+  --wb-line-height-lg: 28px;
+  --wb-line-height-xl: 28px;
+  --wb-line-height-2xl: 32px;
+  --wb-motion-duration-pop: 160ms;
+  --wb-motion-duration-sheet: 200ms;
+  --wb-motion-duration-panel: 160ms;
+  --wb-motion-ease: ease-out;
+  scrollbar-color: var(--wb-border-default) transparent;
+  scrollbar-width: thin;
+}
+
+/* ---- Olive palette, light (workbench themes/olive.css) ---- */
+:root {
+  color-scheme: light;
+  --wb-surface-1: #f7f7ee;
+  --wb-surface-2: #ffffff;
+  --wb-surface-3: #ffffff;
+  --wb-surface-canvas: #edeee3;
+  --wb-surface-sunken: #e4e5d3;
+  --wb-content-primary: #22251a;
+  --wb-content-secondary: #5c604e;
+  --wb-content-muted: #83876f;
+  --wb-border-default: #c9cbb4;
+  --wb-border-strong: #a9ac8f;
+  --wb-accent: var(--wb-olive-500);
+  --wb-accent-hover: #40491b;
+  --wb-on-accent: #ffffff;
+  --wb-focus-ring: var(--wb-accent);
+  --wb-danger: #b03a22;
+  --wb-unknown: #5b6b7a;
+  --wb-shadow-overlay: 0 8px 24px rgb(34 37 26 / 0.14);
+  --wb-status-ok: var(--wb-okabe-bluish-green);
+  --wb-status-ok-text: #006e52;
+  --wb-status-info: var(--wb-okabe-blue);
+  --wb-status-info-text: #005f94;
+  --wb-status-warn: var(--wb-okabe-orange);
+  --wb-status-warn-text: #7d5200;
+  --wb-status-bad: var(--wb-okabe-vermilion);
+  --wb-status-bad-text: #a63f00;
+  --wb-chip-radius: var(--wb-radius-pill);
+  --wb-card-bg: var(--wb-surface-2);
+  --wb-card-radius: var(--wb-radius-md);
+  --wb-card-padding: var(--wb-space-16);
+  --wb-button-radius: var(--wb-radius-sm);
+  --wb-frame-radius: var(--wb-radius-md);
+  --wb-panel-radius: var(--wb-radius-lg);
+  --wb-panel-padding: var(--wb-space-24);
+  --wb-layout-section-gap: var(--wb-space-24);
+  --wb-layout-page-padding: var(--wb-space-24);
+  --wb-layout-content-gap: var(--wb-space-16);
+  --wb-row-height: 40px;
+}
+
+/* ---- Olive palette, dark (workbench themes/olive.css) ---- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --wb-surface-1: #171912;
+    --wb-surface-2: #21241b;
+    --wb-surface-3: #2a2e21;
+    --wb-surface-canvas: #101208;
+    --wb-surface-sunken: #12140c;
+    --wb-content-primary: #eceeda;
+    --wb-content-secondary: #a9ad97;
+    --wb-content-muted: #82856f;
+    --wb-border-default: #3a3e2e;
+    --wb-border-strong: #4c5138;
+    --wb-accent: var(--wb-olive-300);
+    --wb-accent-hover: #aabd72;
+    --wb-on-accent: #15170f;
+    --wb-focus-ring: var(--wb-accent);
+    --wb-danger: #e07a5f;
+    --wb-unknown: #93a7ba;
+    --wb-shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45);
+    --wb-status-ok: var(--wb-okabe-bluish-green);
+    --wb-status-ok-text: #45c493;
+    --wb-status-info: var(--wb-okabe-blue);
+    --wb-status-info-text: #56B4E9;
+    --wb-status-warn: var(--wb-okabe-orange);
+    --wb-status-warn-text: #e8a33d;
+    --wb-status-bad: var(--wb-okabe-vermilion);
+    --wb-status-bad-text: #f0854c;
+  }
+}
+
+/* ---- Base (workbench themes/index.css body rules) ---- */
+html {
+  overscroll-behavior: none;
+}
+
+body {
+  font-family: var(--wb-font-ui);
+  background: var(--wb-surface-canvas);
+  color: var(--wb-content-primary);
+  overscroll-behavior: none;
+}
+
+.num {
+  font-feature-settings: "tnum";
+}
+
+.mono {
+  font-family: var(--wb-font-mono);
+  font-feature-settings: "zero";
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

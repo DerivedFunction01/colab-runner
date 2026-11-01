@@ -1,0 +1,6 @@
+name: colab-runner
+slug: colab-runner
+registry: workbench/registry.db
+plans: .plans
+mockups: workbench/entries
+archive: workbench/archive

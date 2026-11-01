@@ -1,0 +1,1 @@
+{"args":["--units","3","--unit-seconds","1","--seed","smoke"],"checkpoint_pull_seconds":2,"name":"smoke","outputs":["unit-0.bin","unit-1.bin","unit-2.bin","checkpoint.json","heartbeat.log"],"profile":"workload","script":"snippets/heartbeat_job.py","timeout":600,"units":3}

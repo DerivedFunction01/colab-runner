@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Gate job: ship the selected repo's current tree by snapshot bundle and
+run check.py remotely with the probed worker count. Returns verdict + wall
+time.
+
+Usage: colab-check <check.py paths...> [--repo ID] [--variant NAME]
+       [--profile workload]
+The repo comes from the local registry (config/repos.json): --repo, else
+its default_repo — no repo is named in this file. Its entry supplies the
+local checkout, the clone URL, the remote dest, the venv path, and the
+version checks the gate substrate must satisfy.
+Staged behind the operator's login, like the probe drivers.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "bin"))
+import importlib.util
+
+from importlib.machinery import SourceFileLoader
+
+spec = importlib.util.spec_from_loader("colab_run", SourceFileLoader("colab_run", str(REPO / "bin" / "colab-run")))
+cr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cr)
+
+TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
+
+spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+lease = importlib.util.module_from_spec(spec_l)
+spec_l.loader.exec_module(lease)
+
+spec_r = importlib.util.spec_from_file_location("repo_registry", REPO / "sync" / "repo_registry.py")
+registry_mod = importlib.util.module_from_spec(spec_r)
+spec_r.loader.exec_module(registry_mod)
+
+
+def main() -> int:
+    paths = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # --repo/--variant/--profile take values; keep those values out of paths.
+    cleaned = []
+    skip_next = False
+    for a in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--repo", "--variant", "--profile"):
+            skip_next = True
+            continue
+        if not a.startswith("--"):
+            cleaned.append(a)
+    paths = cleaned
+    if not paths:
+        print("usage: colab-check <paths...> [--repo ID] [--variant NAME]", file=sys.stderr)
+        return 2
+    if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
+        print("colab-check: STAGED — no colab login yet (see README).", file=sys.stderr)
+        return 2
+    profile_name = "workload"
+    if "--profile" in sys.argv:
+        profile_name = sys.argv[sys.argv.index("--profile") + 1]
+    profile = json.loads((REPO / "config" / "profiles.json").read_text())["profiles"][profile_name]
+    session = profile["session"]
+
+    registry = registry_mod.load_local_registry(REPO)
+    repo_id = sys.argv[sys.argv.index("--repo") + 1] if "--repo" in sys.argv else None
+    variant = sys.argv[sys.argv.index("--variant") + 1] if "--variant" in sys.argv else None
+    try:
+        repo_id, entry = registry_mod.get_entry(registry, repo_id)
+        dest = registry_mod.variant_dest(entry, variant)
+    except ValueError as exc:
+        print(f"colab-check: {exc}", file=sys.stderr)
+        return 2
+    local_checkout = Path(os.path.expanduser(entry["local_path"]))
+    venv_rel = entry["venv"]
+    version_checks = entry.get("version_checks") or {}
+
+    bundle_env = dict(os.environ)
+    bundle_env["COLAB_REPO_SRC"] = str(local_checkout)
+    bundle = subprocess.run(["bash", str(REPO / "sync" / "make_snapshot_bundle.sh")], capture_output=True, text=True, env=bundle_env)
+    if bundle.returncode != 0:
+        print(bundle.stderr[-500:], file=sys.stderr)
+        return 1
+    manifest = json.loads(bundle.stdout)
+    bundle_path = Path(manifest["bundle"])
+    repo_url = subprocess.run(["git", "-C", str(local_checkout), "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
+    # Lease model (sync/lease.py): share the profile's session and leave it
+    # up; per-job sessions only when the lease is disabled in config.
+    use_lease = bool(lease.load_config(REPO).get("enabled"))
+    lease_id = f"check-{int(time.time())}"
+    if use_lease:
+        got = lease.acquire(cr.colab, REPO, profile_name, via="runner")
+        if got["action"] in ("refused-budget", "create-failed"):
+            print(json.dumps({"gate": "lease-failed", "detail": got}))
+            return 1
+        lease.touch_job(REPO, lease_id)
+    try:
+        if not use_lease:
+            cr.colab("new", "-s", session, *(["--high-mem"] if profile.get("high_mem") else []), timeout=600)
+        cr.colab("upload", "-s", session, str(REPO / "sync" / "base_clone.sh"), "/content/base_clone.sh", timeout=300)
+        cr.colab("upload", "-s", session, str(REPO / "sync" / "apply_bundle_remote.py"), "/content/apply_bundle_remote.py", timeout=300)
+        # The bundle is ~95 MB: above the single-file ceiling, so it moves in
+        # 32 MB chunks and is reassembled + hash-verified on the VM.
+        spec_t = importlib.util.spec_from_file_location("transfer", REPO / "sync" / "transfer.py")
+        xfer = importlib.util.module_from_spec(spec_t)
+        spec_t.loader.exec_module(xfer)
+        up = xfer.chunked_upload(session, bundle_path, bundle_path.name)
+        if not up["ok"]:
+            print(json.dumps({"gate": "upload-failed", "detail": up}))
+            return 1
+        cr.colab("upload", "-s", session, str(bundle_path) + ".manifest.json", f"/content/{bundle_path.name}.manifest.json", timeout=300)
+        setup = REPO / "var" / "gate-setup.py"
+        setup.parent.mkdir(parents=True, exist_ok=True)
+        setup.write_text(
+            "import subprocess, json\n"
+            f"subprocess.run(['bash','base_clone.sh','{repo_url}','/content/{dest}'], check=True)\n"
+            f"r = subprocess.run(['python3','apply_bundle_remote.py','{bundle_path.name}','{dest}'], capture_output=True, text=True)\n"
+            "print(r.stdout); print(r.stderr[-500:])\n"
+        )
+        r = cr.colab("exec", "-s", session, "--timeout", "1800", "-f", str(setup), timeout=1900)
+        print(r.stdout.strip()[-1000:])
+        if '"applied": true' not in r.stdout or manifest["tree"] not in r.stdout:
+            print(json.dumps({"gate": "apply-failed", "detail": "snapshot apply did not verify the shipped tree; refusing to gate a stale clone"}))
+            return 1
+        checks_json = json.dumps(version_checks)
+        gate = REPO / "var" / "gate-run.py"
+        gate.write_text(
+            "import json, subprocess, time\n"
+            "from pathlib import Path\n"
+            "probe = subprocess.run(['python3', 'probe_resources.py'], capture_output=True, text=True)\n"
+            "workers = 2\n"
+            "try:\n    workers = json.loads(probe.stdout)['derive_resources']['workers']\nexcept Exception:\n    pass\n"
+            # The gate must run under the repo venv the env-build created;
+            # the kernel's system python silently substitutes a different
+            # interpreter and dependency set. Refuse loudly instead, and
+            # refuse a substrate whose checked versions are out of spec.
+            f"py = Path('/content/{dest}/{venv_rel}/bin/python')\n"
+            "if not py.exists():\n"
+            f"    print(json.dumps({{'rc': 2, 'error': 'repo venv missing at /content/{dest}/{venv_rel}; refusing to gate under the system python'}}))\n"
+            "    raise SystemExit(2)\n"
+            f"checks = json.loads({checks_json!r})\n"
+            "def parse(t):\n"
+            "    out = []\n"
+            "    for piece in str(t).split('.'):\n"
+            "        num = ''\n"
+            "        for ch in piece:\n"
+            "            if ch.isdigit(): num += ch\n"
+            "            else: break\n"
+            "        out.append(int(num) if num else 0)\n"
+            "    return tuple(out)\n"
+            "def satisfies(ver, spec):\n"
+            "    v = parse(ver)\n"
+            "    for clause in spec.split(','):\n"
+            "        clause = clause.strip()\n"
+            "        if not clause: continue\n"
+            "        op = next((o for o in ('==','!=','>=','<=','>','<') if clause.startswith(o)), None)\n"
+            "        if op is None: return False\n"
+            "        want = parse(clause[len(op):])\n"
+            "        n = max(len(v), len(want)); a = v + (0,)*(n-len(v)); b = want + (0,)*(n-len(want))\n"
+            "        if not {'==': a==b, '!=': a!=b, '>=': a>=b, '<=': a<=b, '>': a>b, '<': a<b}[op]: return False\n"
+            "    return True\n"
+            "probe_code = \"import importlib.metadata as m, json, sys; pkgs = json.loads(sys.argv[1]); have = {(d.metadata.get('Name') or '').lower(): d.version for d in m.distributions() if d.metadata.get('Name')}; print(sys.version.split()[0]); print(json.dumps({p: have.get(p.lower()) for p in pkgs}))\"\n"
+            "ver_probe = subprocess.run([str(py), '-c', probe_code, json.dumps(list(checks))], capture_output=True, text=True)\n"
+            "ver_lines = ver_probe.stdout.strip().split('\\n')\n"
+            "pyver = ver_lines[0] if ver_lines else ''\n"
+            "installed = {}\n"
+            "try:\n    installed = {k.lower(): v for k, v in json.loads(ver_lines[-1]).items()}\n"
+            "except Exception:\n    pass\n"
+            "bad = []\n"
+            "for pkg, cspec in checks.items():\n"
+            "    got_v = installed.get(pkg.lower())\n"
+            "    if not got_v or not satisfies(got_v, cspec):\n"
+            "        bad.append(pkg + '=' + str(got_v) + ' vs ' + cspec)\n"
+            "if bad:\n"
+            "    print(json.dumps({'rc': 2, 'error': 'checked versions out of spec: ' + '; '.join(bad) + '; refusing to gate on an unconformed substrate'}))\n"
+            "    raise SystemExit(2)\n"
+            "substrate = pyver + ' ' + ' '.join(f'{p}=={installed.get(p.lower())}' for p in checks)\n"
+            "t0 = time.time()\n"
+            f"p = subprocess.run([str(py), 'check.py'] + {paths!r} + ['--workers', str(workers)], cwd='{dest}', capture_output=True, text=True)\n"
+            "print(json.dumps({'rc': p.returncode, 'workers': workers, 'substrate': substrate, 'seconds': round(time.time() - t0, 1), 'tail': (p.stdout + p.stderr)[-1500:]}))\n"
+        )
+        cr.colab("upload", "-s", session, str(REPO / "snippets" / "probe_resources.py"), "/content/probe_resources.py", timeout=300)
+        t0 = time.time()
+        out = cr.colab("exec", "-s", session, "--timeout", str(profile.get("timeout", 18000)), "-f", str(gate), timeout=19000)
+        print(out.stdout.strip()[-2000:])
+        print(json.dumps({"gate": "remote", "repo": repo_id, "variant": variant, "paths": paths, "outer_seconds": round(time.time() - t0, 1)}))
+        return 0
+    finally:
+        if use_lease:
+            lease.finish_job(REPO, lease_id)
+        else:
+            cr.colab("stop", "-s", session, timeout=120)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,319 @@
+/* Lease UI components — built entirely on the workbench --wb-* tokens
+ * in theme.css. Layout follows the approved mockup
+ * (ui/mockups/2026-11-01-lease-lifecycle-mockup.html): one frontend at
+ * every width. Below 1024px the slots stack in phone order (budget,
+ * control, leases, events); at 1024px and up the layout opens into a
+ * main column (leases, then events) and a 330px right rail (budget,
+ * then the start/grant control), capped at 1200px and centered. */
+
+* { box-sizing: border-box; }
+
+body { margin: 0; }
+
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: var(--wb-layout-page-padding);
+  display: flex;
+  flex-direction: column;
+  gap: var(--wb-layout-section-gap);
+}
+
+/* ---- top bar ---- */
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--wb-space-12);
+}
+
+.topbar h1 {
+  font-size: var(--wb-font-size-xl);
+  line-height: var(--wb-line-height-xl);
+  margin: 0;
+}
+
+#balance-chip { display: none; }
+
+/* Author display rules below must never resurrect a hidden element. */
+#layout[hidden], #balance-chip[hidden] { display: none; }
+
+.lab { font-size: var(--wb-font-size-sm); color: var(--wb-content-secondary); }
+
+.muted { color: var(--wb-content-muted); }
+
+.notice {
+  border: 1px solid var(--wb-status-warn);
+  color: var(--wb-status-warn-text);
+  background: var(--wb-surface-1);
+  border-radius: var(--wb-radius-md);
+  padding: var(--wb-space-8) var(--wb-space-12);
+  margin: 0;
+}
+
+/* ---- layout ---- */
+
+.layout { display: flex; flex-direction: column; gap: var(--wb-layout-content-gap); }
+.col-main, .col-rail { display: contents; }
+#slot-budget { order: 1; }
+#slot-control { order: 2; }
+#slot-leases { order: 3; }
+#slot-events { order: 4; }
+#slot-leases, #slot-events, #slot-budget, #slot-control { min-width: 0; }
+
+@media (min-width: 1024px) {
+  .page { max-width: 1200px; }
+  .topbar h1 { font-size: var(--wb-font-size-2xl); line-height: var(--wb-line-height-2xl); }
+  #balance-chip { display: inline-block; }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 330px;
+    gap: var(--wb-space-24);
+    align-items: start;
+  }
+  .col-main, .col-rail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--wb-layout-content-gap);
+    min-width: 0;
+  }
+}
+
+/* ---- cards and rows ---- */
+
+.card {
+  background: var(--wb-card-bg);
+  border: 1px solid var(--wb-border-default);
+  border-radius: var(--wb-card-radius);
+  padding: var(--wb-card-padding);
+}
+
+.card .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--wb-space-8);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--wb-layout-content-gap);
+}
+
+#grant-card:empty { display: none; }
+#grant-card:not(:empty) { margin-bottom: var(--wb-layout-content-gap); }
+#grant-card .card { border-color: var(--wb-border-strong); }
+
+.big {
+  font-size: 26px;
+  font-weight: 650;
+  margin: var(--wb-space-8) 0 2px;
+}
+
+@media (min-width: 1024px) {
+  .big { font-size: 30px; }
+}
+
+.kvline {
+  font-size: var(--wb-font-size-sm);
+  line-height: var(--wb-line-height-sm);
+  color: var(--wb-content-secondary);
+  margin: 0 0 var(--wb-space-8);
+}
+
+.kvline b { color: var(--wb-content-primary); font-weight: 600; }
+
+.chip {
+  display: inline-block;
+  border-radius: var(--wb-chip-radius);
+  padding: 1px 10px;
+  font-size: var(--wb-font-size-xs);
+  font-weight: 600;
+  border: 1px solid var(--wb-border-strong);
+  color: var(--wb-content-secondary);
+  background: var(--wb-surface-1);
+  white-space: nowrap;
+}
+
+.chip.ok { border-color: var(--wb-status-ok); color: var(--wb-status-ok-text); }
+.chip.info { border-color: var(--wb-status-info); color: var(--wb-status-info-text); }
+.chip.warn { border-color: var(--wb-status-warn); color: var(--wb-status-warn-text); }
+.chip.bad { border-color: var(--wb-status-bad); color: var(--wb-status-bad-text); }
+
+/* ---- buttons ---- */
+
+button {
+  font-family: var(--wb-font-ui);
+  font-size: var(--wb-font-size-sm);
+  border-radius: var(--wb-button-radius);
+  border: 1px solid var(--wb-border-strong);
+  background: var(--wb-surface-2);
+  color: var(--wb-content-primary);
+  min-height: 32px;
+  padding: 0 var(--wb-space-12);
+  cursor: pointer;
+  transition: background var(--wb-motion-duration-pop) var(--wb-motion-ease);
+}
+
+button:hover { border-color: var(--wb-accent); }
+button:disabled { opacity: 0.55; cursor: wait; }
+button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--wb-focus-ring);
+  outline-offset: 1px;
+}
+
+button.primary {
+  background: var(--wb-accent);
+  border-color: var(--wb-accent);
+  color: var(--wb-on-accent);
+  font-weight: 600;
+}
+
+button.primary:hover { background: var(--wb-accent-hover); }
+
+button.ghost { background: transparent; font-weight: 500; }
+
+button.danger {
+  border-color: var(--wb-danger);
+  color: var(--wb-danger);
+  background: transparent;
+}
+
+button.block { display: block; width: 100%; min-height: 40px; font-size: var(--wb-font-size-base); }
+
+/* ---- start / grant control ---- */
+
+.seg {
+  display: flex;
+  border: 1px solid var(--wb-border-strong);
+  border-radius: var(--wb-radius-sm);
+  overflow: hidden;
+  margin-bottom: var(--wb-space-16);
+}
+
+.seg button {
+  flex: 1;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  min-height: 38px;
+  font-size: var(--wb-font-size-sm);
+}
+
+.seg button.selected {
+  background: var(--wb-accent);
+  color: var(--wb-on-accent);
+  font-weight: 600;
+}
+
+.spec-list { margin-bottom: var(--wb-space-4); }
+
+.spec {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--wb-space-8);
+  width: 100%;
+  text-align: left;
+  padding: 9px 10px;
+  margin-top: var(--wb-space-8);
+  border: 1px solid var(--wb-border-default);
+  border-radius: var(--wb-radius-sm);
+  background: var(--wb-surface-2);
+  min-height: 0;
+  font-size: var(--wb-font-size-sm);
+}
+
+.spec.selected { border-color: var(--wb-accent); border-width: 2px; padding: 8px 9px; }
+.spec .cost { white-space: nowrap; color: var(--wb-content-secondary); }
+
+.chips {
+  display: flex;
+  gap: var(--wb-space-8);
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: var(--wb-space-12);
+}
+
+.chips button {
+  border-radius: var(--wb-radius-pill);
+  padding: 4px 14px;
+  min-height: 30px;
+}
+
+.chips button.selected {
+  background: var(--wb-accent);
+  border-color: var(--wb-accent);
+  color: var(--wb-on-accent);
+  font-weight: 600;
+}
+
+.chips .custom {
+  border: 1px dashed var(--wb-border-strong);
+  border-radius: var(--wb-radius-pill);
+  background: transparent;
+  color: var(--wb-content-primary);
+  font-family: var(--wb-font-ui);
+  font-size: var(--wb-font-size-sm);
+  padding: 4px 14px;
+  min-height: 30px;
+  width: 150px;
+}
+
+.chips .custom::placeholder { color: var(--wb-content-secondary); }
+
+/* ---- extend pickers (lease + grant cards) ---- */
+
+.extend-box { margin-top: var(--wb-space-12); }
+.extend-box .chips { margin-top: 0; }
+
+/* ---- budget cap editor ---- */
+
+.cap-box { margin-top: var(--wb-space-12); }
+.cap-box .cap-row { margin-bottom: var(--wb-space-8); }
+.cap-input {
+  border: 1px solid var(--wb-border-strong);
+  border-radius: var(--wb-radius-pill);
+  background: transparent;
+  color: var(--wb-content-primary);
+  font-family: var(--wb-font-ui);
+  font-size: var(--wb-font-size-sm);
+  padding: 4px 14px;
+  min-height: 30px;
+  width: 120px;
+  text-align: right;
+}
+#budget-card .ghost { margin-top: var(--wb-space-8); }
+
+.projected {
+  color: var(--wb-content-secondary);
+  font-size: var(--wb-font-size-sm);
+  margin: var(--wb-space-12) 0;
+}
+
+.projected strong { color: var(--wb-content-primary); }
+
+/* ---- events ---- */
+
+.event {
+  font-size: var(--wb-font-size-sm);
+  padding: var(--wb-space-8) 0;
+  border-bottom: 1px solid var(--wb-border-default);
+}
+
+.event:last-child { border-bottom: none; }
+
+/* ---- degraded (server unreachable) ---- */
+
+.degraded { border-color: var(--wb-okabe-orange); }
+.degraded .kvline { margin-top: var(--wb-space-8); }
+
+.degraded-actions { display: flex; flex-direction: column; gap: var(--wb-space-8); }
+.degraded-actions button { min-height: 40px; font-size: var(--wb-font-size-base); }
+
+@media (min-width: 1024px) {
+  .degraded-actions { flex-direction: row; }
+  .degraded-actions button { padding: 0 var(--wb-space-24); }
+}

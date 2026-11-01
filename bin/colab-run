@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Run a named job on Colab: sweep orphans, sync in, execute detached, poll,
+pull results, stop the session on every exit path.
+
+Usage: colab-run <job-name> [--resume RUN_ID]
+Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
+The CLI is resolved via $COLAB_BIN (tests point this at a fake), else PATH,
+else ~/.local/bin/colab.
+"""
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+RUNS = REPO / "results" / "runs"
+TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
+
+import importlib.util
+
+_spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+lease = importlib.util.module_from_spec(_spec_l)
+_spec_l.loader.exec_module(lease)
+
+
+def colab_bin() -> str:
+    return os.environ.get("COLAB_BIN") or shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
+
+
+def colab_env() -> dict:
+    env = dict(os.environ)
+    for key in ("NO_PROXY", "no_proxy"):
+        suffix = "google.com,googleapis.com,googleusercontent.com,colab.dev"
+        env[key] = f"{env[key]},{suffix}" if env.get(key) else suffix
+    return env
+
+
+AUTH_PROMPT = "Enter the authorization code"
+AUTH_RC = 3
+TOKEN_MIN_REFRESH_LEN = 20
+
+
+def _token_bytes() -> bytes | None:
+    try:
+        return TOKEN.read_bytes()
+    except OSError:
+        return None
+
+
+def _token_valid(data: bytes | None) -> bool:
+    """A stored credential is valid when it parses as JSON and carries
+    a refresh_token of plausible length. The interactive flow's stub
+    (a lone refresh_token key, 15 chars) fails this, as does any
+    truncated or non-JSON write. Contents are never printed."""
+    if not data:
+        return False
+    try:
+        parsed = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    rt = parsed.get("refresh_token")
+    return isinstance(rt, str) and len(rt) >= TOKEN_MIN_REFRESH_LEN
+
+
+def _atomic_write_token(data: bytes) -> None:
+    """Write the token via a .tmp sibling + rename, so no reader ever
+    sees a partial credential and an interrupted write cannot destroy
+    the live file (owner ruling, 2026-11-01: token writes are atomic
+    at every seam)."""
+    tmp = TOKEN.with_name(TOKEN.name + ".tmp")
+    tmp.write_bytes(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TOKEN)
+
+
+def _note_auth_required(reason: str) -> None:
+    try:
+        var = lease.var_dir(REPO)
+        var.mkdir(parents=True, exist_ok=True)
+        (var / "auth-required.json").write_text(json.dumps({"noted_at": now(), "reason": reason}, indent=2))
+    except OSError:
+        pass
+
+
+def _clear_auth_required() -> None:
+    try:
+        (lease.var_dir(REPO) / "auth-required.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _auth_blocked(cmd: list[str], reason: str) -> subprocess.CompletedProcess:
+    _note_auth_required(reason)
+    return subprocess.CompletedProcess(args=cmd, returncode=AUTH_RC, stdout="", stderr=f"colab auth required: {reason}")
+
+
+def colab(*args: str, timeout: int = 18000) -> subprocess.CompletedProcess:
+    """The one funnel for every automated Colab CLI call, guarded so a
+    dead credential can never again masquerade as data (2026-11-01: a
+    failed token refresh dropped the CLI into its interactive login
+    flow, which overwrote the stored token with a stub and printed the
+    auth prompt where callers expected a session list / usage text —
+    the prompt read as "session absent" and a live lease's record was
+    deleted under it). The guard:
+    - never invokes the CLI when the stored token is missing/invalid;
+    - snapshots the token before the call and restores it atomically
+      if the call leaves it invalid (the flow writes its stub BEFORE
+      prompting, so this also covers a call that times out blocked on
+      the prompt);
+    - turns any call whose output carries the auth prompt into an
+      auth-required result (rc 3, empty stdout), so downstream reads
+      see "unknown", never junk data.
+    Inert under COLAB_BIN: the test fakes are not credential flows."""
+    cmd = [colab_bin(), "--auth", "oauth2", *args]
+    if os.environ.get("COLAB_BIN"):
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=colab_env())
+    snapshot = _token_bytes()
+    if not _token_valid(snapshot):
+        return _auth_blocked(cmd, "stored token missing or invalid; re-authorization required (no CLI call made)")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=colab_env(), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        if not _token_valid(_token_bytes()):
+            _atomic_write_token(snapshot)
+            _note_auth_required("CLI call timed out after overwriting the token; snapshot restored")
+        raise
+    if AUTH_PROMPT in (result.stdout + result.stderr):
+        if not _token_valid(_token_bytes()):
+            _atomic_write_token(snapshot)
+        return _auth_blocked(cmd, "CLI entered its interactive login flow")
+    if not _token_valid(_token_bytes()):
+        _atomic_write_token(snapshot)
+        return _auth_blocked(cmd, "CLI call overwrote the stored token; snapshot restored")
+    if result.returncode == 0:
+        _clear_auth_required()
+    return result
+
+
+def mirror(op: str) -> None:
+    subprocess.run([sys.executable, str(REPO / "ops" / "mirror_transient.py"), op], capture_output=True)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def save_record(rec: dict) -> None:
+    RUNS.mkdir(parents=True, exist_ok=True)
+    (RUNS / f"{rec['run_id']}.json").write_text(json.dumps(rec, indent=2))
+
+
+def orphan_sweep() -> list[dict]:
+    """Reconcile non-terminal run records against live sessions."""
+    findings = []
+    if not RUNS.exists():
+        return findings
+    live = colab("sessions", timeout=120).stdout if TOKEN.exists() or os.environ.get("COLAB_BIN") else ""
+    for f in sorted(RUNS.glob("*.json")):
+        rec = json.loads(f.read_text())
+        if rec["state"] in ("running", "polling") and rec["session"] not in live:
+            rec["state"] = "orphaned"
+            rec["orphan_noted_at"] = now()
+            save_record(rec)
+            findings.append({"run_id": rec["run_id"], "job": rec["job"], "action": "marked orphaned; relaunch with --resume RUN_ID to continue from its remote run-id"})
+    return findings
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        print("usage: colab-run <job-name> [--resume RUN_ID]", file=sys.stderr)
+        return 2
+    job_name = args[0]
+    resume = args[args.index("--resume") + 1] if "--resume" in args else None
+    manifest_path = REPO / "jobs" / job_name / "job.json"
+    if not manifest_path.exists():
+        print(f"no job manifest at {manifest_path}", file=sys.stderr)
+        return 2
+    job = json.loads(manifest_path.read_text())
+    if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
+        print("colab-run: STAGED — no colab login yet. Run ops/bootstrap_local.sh, then the one-time login (see README).", file=sys.stderr)
+        return 2
+
+    mirror("restore")
+    findings = orphan_sweep()
+    for f in findings:
+        print(f"orphan sweep: {f['run_id']} ({f['job']}) — {f['action']}")
+
+    profile_name = job.get("profile", "workload")
+    profile = json.loads((REPO / "config" / "profiles.json").read_text())["profiles"][profile_name]
+    session = profile["session"]
+    run_id = resume or f"{job_name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    rec = {"run_id": run_id, "job": job_name, "session": session, "state": "starting", "started_at": now(), "resumed": bool(resume)}
+    save_record(rec)
+    usage_before = colab("usage", timeout=120).stdout.strip()
+    # Lease model (sync/lease.py): adopt-or-acquire the shared session and
+    # leave it up at the end; the reaper owns its lifecycle. With the lease
+    # disabled in config, fall back to the original per-job session.
+    use_lease = bool(lease.load_config(REPO).get("enabled"))
+    if use_lease:
+        got = lease.acquire(colab, REPO, profile_name, via="runner")
+        if got["action"] in ("refused-budget", "create-failed"):
+            rec.update(state="failed", error=json.dumps(got)[:300])
+            save_record(rec)
+            print(json.dumps({"run_id": run_id, "state": "failed", "lease": got}, indent=2))
+            return 1
+        rec["lease_action"] = got["action"]
+        lease.touch_job(REPO, run_id)
+        save_record(rec)
+    try:
+        if not use_lease:
+            new_args = ["new", "-s", session] + (["--high-mem"] if profile.get("high_mem") else []) + (["--gpu", profile["gpu"]] if profile.get("gpu") else [])
+            r = colab(*new_args, timeout=600)
+            if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
+                rec.update(state="failed", error=(r.stderr or r.stdout).strip()[-300:])
+                save_record(rec)
+                return 1
+        script = REPO / job["script"]
+        colab("upload", "-s", session, str(script), f"/content/{script.name}", timeout=600)
+        # Relative to the session working dir (/content on a real Colab VM;
+        # the fake CLI's sandbox root under test) so the same code runs both.
+        # Per-run: a fixed dir leaks the previous run's heartbeat tail,
+        # checkpoint, and outputs into this run's completion check.
+        remote_out = f"{job_name}-out-{run_id}"
+        rec.update(state="running", remote_out=remote_out)
+        save_record(rec)
+        # Detached launch (default pending the kill-matrix verdict): a short
+        # exec starts the job under nohup; the CLI is never the job's lifeline.
+        job_args = "".join(f",'{a}'" for a in job.get("args", []))
+        launch = (
+            f"import subprocess; subprocess.Popen(['nohup','python3','{script.name}',"
+            f"'--out','{remote_out}'{job_args}], stdout=open('{remote_out}.log','w'), stderr=subprocess.STDOUT, start_new_session=True)"
+        )
+        launcher = REPO / "var" / f"launch-{run_id}.py"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text(launch + "\nprint('launched')\n")
+        colab("exec", "-s", session, "--timeout", "120", "-f", str(launcher), timeout=300)
+        rec["state"] = "polling"
+        save_record(rec)
+        reader = REPO / "var" / f"read-{run_id}.py"
+        reader.write_text(
+            "import json, subprocess\n"
+            "from pathlib import Path\n"
+            f"d = Path('{remote_out}')\n"
+            "ck = d / 'checkpoint.json'\n"
+            "log = d / 'heartbeat.log'\n"
+            "out = {'checkpoint': json.loads(ck.read_text()) if ck.exists() else None,\n"
+            "       'heartbeat_tail': log.read_text().strip().split('\\n')[-3:] if log.exists() else [],\n"
+            "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split()}\n"
+            "print(json.dumps(out))\n"
+        )
+        deadline = time.time() + job.get("timeout", 18000)
+        cadence = job.get("checkpoint_pull_seconds", 300)
+        state = {}
+        while time.time() < deadline:
+            time.sleep(cadence)
+            chk = colab("exec", "-s", session, "--timeout", "120", "-f", str(reader), timeout=300)
+            try:
+                state = json.loads(chk.stdout[chk.stdout.index("{"):])
+            except (ValueError, json.JSONDecodeError):
+                continue
+            done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
+            rec["last_checkpoint_units"] = done_units
+            save_record(rec)
+            log = state.get("heartbeat_tail") or []
+            if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]):
+                break
+        # Pull expected outputs and verify by the job's own unit hashes.
+        pulled = []
+        for name in job.get("outputs", []):
+            dest = REPO / "results" / run_id / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
+            if dest.exists():
+                pulled.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()})
+        rec.update(state="complete", finished_at=now(), pulled=pulled, usage_before=usage_before, usage_after=colab("usage", timeout=120).stdout.strip())
+        save_record(rec)
+        print(json.dumps({"run_id": run_id, "state": "complete", "pulled": pulled}, indent=2))
+        return 0
+    finally:
+        if use_lease:
+            lease.finish_job(REPO, run_id)
+        else:
+            colab("stop", "-s", session, timeout=120)
+        mirror("capture")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

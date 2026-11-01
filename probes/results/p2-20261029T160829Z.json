@@ -1,0 +1,87 @@
+{
+  "probe": "p2",
+  "at": "2026-10-29T16:08:29.453172+00:00",
+  "transfers": [
+    {
+      "mb": 1,
+      "sha256": "ced27d9fe440be531a53ed0ba634aa4317fb55f31417bc395c681bb53847cfb9",
+      "upload": {
+        "seconds": 2.85,
+        "rc": 0,
+        "stdout_tail": "[colab] Uploaded '~/colab-runner/var/p2/payload-1mb.bin' to 'payload-1mb.bin'",
+        "stderr_tail": ""
+      },
+      "download": {
+        "seconds": 1.96,
+        "rc": 0,
+        "stdout_tail": "[colab] Downloaded 'payload-1mb.bin' to '~/colab-runner/var/p2/down-1mb.bin'",
+        "stderr_tail": ""
+      },
+      "roundtrip_hash_ok": true
+    },
+    {
+      "mb": 10,
+      "sha256": "16e531459ee084ad33d11cd3613ff7684f30b02981b1b466aa9f11969396b09b",
+      "upload": {
+        "seconds": 7.23,
+        "rc": 0,
+        "stdout_tail": "[colab] Uploaded '~/colab-runner/var/p2/payload-10mb.bin' to 'payload-10mb.bin'",
+        "stderr_tail": ""
+      },
+      "download": {
+        "seconds": 7.36,
+        "rc": 0,
+        "stdout_tail": "[colab] Downloaded 'payload-10mb.bin' to '~/colab-runner/var/p2/down-10mb.bin'",
+        "stderr_tail": ""
+      },
+      "roundtrip_hash_ok": true
+    },
+    {
+      "mb": 100,
+      "sha256": "f50b401aadda7d2aec7239365b7e34eb0612748c40c8863594a92e63223e3ad8",
+      "upload": {
+        "seconds": 2.31,
+        "rc": 1,
+        "stdout_tail": "jI0LCJwb3J0Ijo4MDgwfQ.Yp3s3LKdKFqup3ygSn-fpJ-KbYDBtFqrJL4tSAoHI2Bp2BgXspkEeebmcMsnMOpYbFPFmeJYc_RCIsTtYYDr_w (Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:2417)')))",
+        "stderr_tail": ""
+      },
+      "download": {
+        "seconds": 1.07,
+        "rc": 1,
+        "stdout_tail": "[colab] Download failed: File or directory not found: payload-100mb.bin",
+        "stderr_tail": ""
+      },
+      "roundtrip_hash_ok": false
+    },
+    {
+      "mb": 1024,
+      "sha256": "2adf97e1b031ade559c464e696273dbfbd5acb8350decb2b8c26fbeaddcffcf1",
+      "upload": {
+        "seconds": 28.89,
+        "rc": 1,
+        "stdout_tail": "jI0LCJwb3J0Ijo4MDgwfQ.Yp3s3LKdKFqup3ygSn-fpJ-KbYDBtFqrJL4tSAoHI2Bp2BgXspkEeebmcMsnMOpYbFPFmeJYc_RCIsTtYYDr_w (Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:2417)')))",
+        "stderr_tail": ""
+      },
+      "download": {
+        "seconds": 2.33,
+        "rc": 1,
+        "stdout_tail": "[colab] Download failed: File or directory not found: payload-1024mb.bin",
+        "stderr_tail": ""
+      },
+      "roundtrip_hash_ok": false
+    }
+  ],
+  "in_vm_clone": {
+    "seconds": 2.91,
+    "rc": 0,
+    "stdout_tail": "rc 127\nbash: base_clone.sh: No such file or directory",
+    "stderr_tail": ""
+  },
+  "bundle_build": {
+    "rc": 0,
+    "stdout": "{\n  \"bundle\": \"~/colab-runner/var/snapshot-20261029T160805Z.bundle\",\n  \"bytes\": 94751782,\n  \"sha256\": \"330168a822356c8ccd8a7c4e16f7d1dfb4764b16a1711c56ef73af49779c7c9f\",\n  \"snapshot_commit\": \"427e10604c138a7c85646c2cde64f3b69bc4d836\",\n  \"parent_origin_tip\": \"c07b12107b32e8cfeafa444e73e9ea1cd0cd449d\",\n  \"tree\": \"1ea0b857378b5140556fea143f14455628caedbe\",\n  \"apply\": \"git fetch ~/colab-runner/var/snapshot-20261029T160805Z.bundle 427e10604c138a7c85646c2cde64f3b69bc4d836 && git merge --ff-only FETCH_HEAD\"\n}",
+    "stderr_tail": ""
+  },
+  "usage_end": "Current balance: 581.81 compute units\nUsage rate: 0.26/hr\nActive assignments: 1",
+  "notes": "Bundle upload/apply timing and the hybrid filing_catalog route run through sync/apply_bundle_remote.py once a bundle exists; network-regen calibration runs the bounded SEC fetch snippet on the VM with SEC_USER_AGENT passed via --env."
+}

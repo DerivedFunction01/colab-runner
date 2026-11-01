@@ -1,0 +1,81 @@
+{
+  "items": [
+    {
+      "canonical": "~/.config/colab-cli/token.json",
+      "id": "colab-token",
+      "kind": "file",
+      "mirror": "state/transient/colab-cli/token.json",
+      "mode": "600",
+      "notes": "OAuth refresh token; rotates in use, so neither copy may blindly overwrite a newer other copy. Contents never printed or logged.",
+      "rule": "newest-wins",
+      "secret": true,
+      "triggers": [
+        "wrapper",
+        "cron",
+        "bootstrap"
+      ],
+      "verify": "json",
+      "validate": "colab-token"
+    },
+    {
+      "canonical": "~/.config/colab-cli/sessions.json",
+      "id": "colab-sessions",
+      "kind": "file",
+      "mirror": "state/transient/colab-cli/sessions.json",
+      "mode": "600",
+      "never_capture_empty": true,
+      "notes": "Capture takes the canonical file whenever it exists, except an empty {} never overwrites a non-empty mirror (a colab run emptied this file while its assignment lived on, 2026-10-29). A restored file is stale until colab sessions/status validates it; dead sessions are pruned by the runner's orphan sweep, never trusted blindly. Contains a short-lived tunnel token: treat as secret, never print.",
+      "rule": "restore-if-missing",
+      "secret": true,
+      "triggers": [
+        "wrapper",
+        "cron",
+        "bootstrap"
+      ],
+      "verify": "json"
+    },
+    {
+      "canonical": "~/.colab-cli-oauth-config.json",
+      "id": "colab-oauth-config",
+      "kind": "file",
+      "mirror": "state/transient/colab-cli/oauth-config.json",
+      "mode": "600",
+      "notes": "Only present when a custom client OAuth config is used.",
+      "rule": "newest-wins",
+      "secret": true,
+      "triggers": [
+        "wrapper",
+        "cron",
+        "bootstrap"
+      ],
+      "verify": "json"
+    },
+    {
+      "canonical": "~/.ssh/colab_key",
+      "enabled": false,
+      "id": "colab-ssh-key",
+      "kind": "file",
+      "mirror": "state/transient/ssh/colab_key",
+      "mode": "600",
+      "notes": "Dedicated colab ssh key only (Ed25519/ECDSA). The ~/.ssh/config block for it is restored by marker-delimited append-merge in bootstrap, never by overwriting the file. Enable this item when colab ssh is first used.",
+      "rule": "restore-if-missing",
+      "secret": true,
+      "triggers": [
+        "wrapper",
+        "bootstrap"
+      ],
+      "verify": "exists"
+    },
+    {
+      "id": "colab-tool",
+      "kind": "recreate",
+      "min_version": "0.7.1",
+      "notes": "Not file-mirrored. Recreated by uv tool install from the pin when missing or below min_version.",
+      "package": "google-colab-cli",
+      "triggers": [
+        "bootstrap"
+      ]
+    }
+  ],
+  "version": 1
+}

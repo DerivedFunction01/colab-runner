@@ -1,0 +1,55 @@
+{
+  "probe": "p1",
+  "at": "2026-10-29T15:27:14.477175+00:00",
+  "source": "live session 'workload' driven directly during login completion (p1_session.py driver run still owed for drivemount/ssh legs)",
+  "login": {
+    "method": "oauth2 copy-paste",
+    "token_bytes": 930,
+    "mirrored": true
+  },
+  "usage": {
+    "balance_cu": 581.87,
+    "high_ram_rate_cu_per_hr": 0.26,
+    "active_assignments_after": 0
+  },
+  "session": {
+    "name": "workload",
+    "id_shape": "m-hm-euw4c0 (EU west)",
+    "hardware": "CPU",
+    "shape": "High-RAM"
+  },
+  "resources": {
+    "python": "3.13.18",
+    "cpus": 8,
+    "mem_total_bytes": 54750392320,
+    "cgroup_memory_max_bytes": null,
+    "disk_total_bytes": 242486079488,
+    "disk_free_bytes": 220400287744,
+    "derive_resources": {
+      "workers": 8,
+      "per_worker_bytes": 6843799040
+    }
+  },
+  "verdict": {
+    "high_mem_shape_ok": true,
+    "python_gate": "remote is 3.13.18 while workload-repo targets 3.12 \u2014 dependency wheels and check.py behaviour under 3.13 are P3's comparative-gate question",
+    "proxy_411": "session assignment failed 411 through the hatch egress proxy on both shapes despite Content-Length: 0 being sent (CLI debug log); direct egress (NO_PROXY bypass) assigns instantly \u2014 fix encoded in all wrappers/drivers"
+  },
+  "install": {
+    "duckdb_via_uv_seconds": 15.7
+  },
+  "smoke": {
+    "rows": 1000000,
+    "total": 71998582.5,
+    "duckdb": "1.3.2",
+    "matches_analytic_local_value": true,
+    "via": [
+      "exec",
+      "run"
+    ]
+  },
+  "cli_semantics": {
+    "exec": "IPython kernel cell: sys.argv leaks CLI flags, SystemExit non-fatal",
+    "run": "real process; STOPS the session on completion"
+  }
+}

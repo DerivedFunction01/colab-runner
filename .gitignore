@@ -1,0 +1,19 @@
+# Transient mirror: restore state, never source. Contents are secrets-adjacent
+# (OAuth token, session state) and must never be committed.
+/state/transient/*
+!/state/transient/README.md
+
+# Local repo registry: which target repos this machine provisions is local
+# data, seeded from the tracked config/repos.example.json — never committed.
+/config/repos.json
+
+# Job results: manifests are tracked under jobs/; payload bytes are not.
+/results/*
+!/results/.gitkeep
+
+# Probe payloads and scratch
+/probes/results/*.bin
+/var/
+*.bundle
+__pycache__/
+.pytest_cache/

@@ -1,0 +1,112 @@
+"""colab-sh unit tests with a stubbed subprocess (no network, no ssh).
+
+Pins the shell channel's construction rules: the ProxyCommand goes
+through the CLI venv python by absolute path (PATH is not trusted in
+automation), --auth oauth2 is passed explicitly, the identity is the
+ed25519 key, remote scripts arrive on stdin to `bash -s` with env
+exports shlex-quoted ahead of them, and exit codes propagate (124 on
+timeout).
+"""
+
+import importlib.util
+import subprocess
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_loader("colab_sh", SourceFileLoader("colab_sh", str(REPO / "bin" / "colab-sh")))
+sh = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sh)
+
+
+def test_proxy_command_uses_cli_venv_python_and_oauth2():
+    cmd = sh.proxy_command("workload")
+    assert str(sh.CLI_VENV_PYTHON) in cmd
+    assert "-m colab_cli.cli" in cmd
+    assert "--auth oauth2" in cmd
+    assert "ssh --proxy-mode -s workload" in cmd
+
+
+def test_ssh_argv_shape():
+    argv = sh.ssh_argv("workload", "/content", ["--skip-system"], sh.DEFAULT_IDENTITY)
+    assert argv[0] == "ssh"
+    assert "root@colab-runtime" in argv
+    assert str(sh.DEFAULT_IDENTITY) in argv
+    assert "StrictHostKeyChecking=no" in argv
+    remote = argv[-1]
+    assert remote.startswith("cd /content && bash -s")
+    assert "-- --skip-system" in remote
+
+
+def test_build_stdin_quotes_env_values():
+    script = "echo hi\n"
+    out = sh.build_stdin(script, [("A", "plain"), ("B", "has space"), ("C", "it's")])
+    lines = out.split("\n")
+    assert lines[0] == "export A=plain"
+    assert lines[1] == "export B='has space'"
+    assert lines[2] == "export C='it'\"'\"'s'"
+    assert out.endswith(script)
+    assert sh.build_stdin(script, []) == script
+
+
+def test_proxy_env_appends_suffixes_both_cases():
+    env = sh.proxy_env({"NO_PROXY": "localhost"})
+    assert env["NO_PROXY"] == "localhost,google.com,googleapis.com,googleusercontent.com,colab.dev"
+    assert env["no_proxy"].endswith("colab.dev")
+
+
+def test_resolve_session_precedence(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    (tmp_path / "lease.json").write_text('{"session": "from-record"}')
+    assert sh.resolve_session(None) == "from-record"
+    monkeypatch.setenv("COLAB_SH_SESSION", "from-env")
+    assert sh.resolve_session(None) == "from-env"
+    assert sh.resolve_session("from-flag") == "from-flag"
+
+
+def test_resolve_session_none_without_any_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_SH_SESSION", raising=False)
+    assert sh.resolve_session(None) is None
+
+
+class FakeRun:
+    def __init__(self, rc=0, exc=None):
+        self.rc = rc
+        self.exc = exc
+        self.calls = []
+
+    def __call__(self, cmd, **kw):
+        self.calls.append((cmd, kw))
+        if self.exc:
+            raise self.exc
+        return subprocess.CompletedProcess(cmd, self.rc)
+
+
+def run_main(monkeypatch, fake, argv):
+    monkeypatch.setattr(sh.subprocess, "run", fake)
+    return sh.main(argv)
+
+
+def test_main_propagates_remote_exit_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    fake = FakeRun(rc=7)
+    assert run_main(monkeypatch, fake, ["-s", "workload", "exit 7"]) == 7
+    cmd, kw = fake.calls[-1]
+    assert cmd[0] == "ssh"
+    assert kw["input"].strip() == "exit 7"
+    assert kw["env"]["NO_PROXY"].endswith("colab.dev")
+
+
+def test_main_timeout_is_124(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    fake = FakeRun(exc=subprocess.TimeoutExpired(cmd=["ssh"], timeout=1))
+    assert run_main(monkeypatch, fake, ["-s", "workload", "--timeout", "1", "sleep 9"]) == 124
+
+
+def test_main_no_session_is_2(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_SH_SESSION", raising=False)
+    fake = FakeRun()
+    assert run_main(monkeypatch, fake, ["echo hi"]) == 2
+    assert fake.calls == [] or fake.calls[-1][0][0] != "ssh"

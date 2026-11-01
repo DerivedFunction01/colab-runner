@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Bare-shell channel to a leased Colab session, over real SSH.
+
+Usage:
+  colab-sh [-s SESSION] [--dir DIR] [--timeout SECONDS] [--env K=V ...]
+           ('inline command' | -f script.sh | -- args...) [< script]
+
+The official CLI's `exec` runs Python inside the session's IPython
+kernel (sys.argv leaks, SystemExit non-fatal, kernel state shared).
+This wrapper instead drives the CLI's own SSH bridge
+(`colab ssh --proxy-mode`, a WebSocket to the runtime's /colab/ssh
+endpoint) with the system `ssh`, so the remote side is a plain bash
+process: real exit codes, clean stdout/stderr, no kernel involved.
+The script (inline, file, or stdin) is delivered on ssh's stdin to
+`bash -s`; anything after `--` becomes the script's positional args.
+
+Rules:
+- Targets an existing session only — the active lease's session by
+  default. It never creates a session (the CLI's ssh auto-create is
+  deliberately not used; session lifecycle belongs to the lease).
+- One SSH connection per runtime at a time (the server answers 429
+  while another is connected). This wrapper is one-shot: it connects,
+  runs, disconnects.
+- Auth is the local ~/.ssh/id_ed25519 key (ed25519/ecdsa only; the
+  server rejects RSA). The CLI derives the offered public key from
+  the same key, so the pair always matches.
+- Colab/Google traffic bypasses this machine's egress proxy (the
+  NO_PROXY suffix rule in AGENTS.md); ssh passes its environment to
+  the ProxyCommand, so the fix set here reaches the bridge.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+CLI_VENV_PYTHON = (
+    Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "python"
+)
+DEFAULT_IDENTITY = Path.home() / ".ssh" / "id_ed25519"
+SSH_HOST = "root@colab-runtime"
+PROXY_SUFFIXES = "google.com,googleapis.com,googleusercontent.com,colab.dev"
+
+
+def proxy_env(env: dict) -> dict:
+    """Return env with the Colab proxy-bypass suffixes appended."""
+    out = dict(env)
+    for key in ("NO_PROXY", "no_proxy"):
+        cur = out.get(key)
+        out[key] = f"{cur},{PROXY_SUFFIXES}" if cur else PROXY_SUFFIXES
+    return out
+
+
+def proxy_command(session: str) -> str:
+    """The OpenSSH ProxyCommand bridging to the session's /colab/ssh."""
+    return shlex.join(
+        [
+            str(CLI_VENV_PYTHON),
+            "-m",
+            "colab_cli.cli",
+            "--auth",
+            "oauth2",
+            "ssh",
+            "--proxy-mode",
+            "-s",
+            session,
+        ]
+    )
+
+
+def ssh_argv(session: str, remote_dir: str, script_args: list, identity: Path) -> list:
+    remote = f"cd {shlex.quote(remote_dir)} && bash -s"
+    if script_args:
+        remote += " -- " + " ".join(shlex.quote(a) for a in script_args)
+    return [
+        "ssh",
+        "-o",
+        f"ProxyCommand={proxy_command(session)}",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-i",
+        str(identity),
+        SSH_HOST,
+        remote,
+    ]
+
+
+def build_stdin(script: str, env_pairs: list) -> str:
+    """Env exports (shlex-quoted) ahead of the script, exec-style."""
+    lines = [f"export {k}={shlex.quote(v)}" for k, v in env_pairs]
+    if lines:
+        return "\n".join(lines) + "\n" + script
+    return script
+
+
+def resolve_session(flag: str | None) -> str | None:
+    """-s flag, then $COLAB_SH_SESSION, then the active lease record."""
+    if flag:
+        return flag
+    if os.environ.get("COLAB_SH_SESSION"):
+        return os.environ["COLAB_SH_SESSION"]
+    var = Path(os.environ.get("COLAB_RUNNER_VAR", REPO / "var"))
+    try:
+        rec = json.loads((var / "lease.json").read_text())
+        return rec.get("session")
+    except Exception:
+        return None
+
+
+def read_script(args) -> str | None:
+    if args.file:
+        return Path(args.file).read_text()
+    if args.command:
+        return " ".join(args.command) + "\n"
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return None
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="colab-sh", description=__doc__.split("\n")[0])
+    ap.add_argument("-s", "--session", help="session name (default: the active lease's)")
+    ap.add_argument("-f", "--file", help="shell script file to run")
+    ap.add_argument("--dir", default="/content", help="remote working directory")
+    ap.add_argument("--timeout", type=float, default=900, help="seconds (default 900)")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                    help="environment variable for the remote script; repeatable")
+    ap.add_argument("command", nargs="*", help="inline command (or after --, script args with -f)")
+    args, script_args = ap.parse_known_args(argv)
+    # argparse puts everything after `--` in script_args only when it
+    # follows the options; positionals before `--` are the command.
+    if args.file and args.command:
+        script_args = args.command + script_args
+        args.command = []
+
+    session = resolve_session(args.session)
+    if not session:
+        print("colab-sh: no session (no -s, no $COLAB_SH_SESSION, no lease record)", file=sys.stderr)
+        return 2
+    identity = DEFAULT_IDENTITY
+    if not identity.exists():
+        print(f"colab-sh: identity key {identity} missing (server accepts ed25519/ecdsa only)", file=sys.stderr)
+        return 2
+    if not CLI_VENV_PYTHON.exists():
+        print(f"colab-sh: colab CLI venv python missing at {CLI_VENV_PYTHON}", file=sys.stderr)
+        return 2
+    script = read_script(args)
+    if script is None or not script.strip():
+        print("colab-sh: no script (pass a command, -f FILE, or pipe stdin)", file=sys.stderr)
+        return 2
+    env_pairs = []
+    for item in args.env:
+        if "=" not in item:
+            print(f"colab-sh: invalid --env {item!r} (expected K=V)", file=sys.stderr)
+            return 2
+        env_pairs.append(tuple(item.split("=", 1)))
+
+    # Wrapper parity: restore transient state on entry (best-effort).
+    try:
+        subprocess.run(
+            [sys.executable, str(REPO / "ops" / "mirror_transient.py"), "restore"],
+            capture_output=True, timeout=120,
+        )
+    except Exception:
+        pass
+
+    cmd = ssh_argv(session, args.dir, script_args, identity)
+    try:
+        r = subprocess.run(
+            cmd,
+            input=build_stdin(script, env_pairs),
+            text=True,
+            timeout=args.timeout,
+            env=proxy_env(os.environ),
+        )
+    except subprocess.TimeoutExpired:
+        print(f"colab-sh: timed out after {args.timeout}s (session {session})", file=sys.stderr)
+        return 124
+    except FileNotFoundError:
+        print("colab-sh: system ssh not found", file=sys.stderr)
+        return 2
+    return r.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
