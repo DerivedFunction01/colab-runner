@@ -17,3 +17,15 @@
 *.bundle
 __pycache__/
 .pytest_cache/
+
+# Working state is not tracked source (standing ruling, the sibling
+# repos' rule): plans and workbench bundle todos are harness working
+# documents — the harness runs on the files, not the git index.
+.plans/
+
+# Probe run outputs are run records, not source.
+probes/results/*.json
+
+# Landed mockups are transient design material; the shipped UI and
+# the docs are the durable record.
+ui/mockups/
