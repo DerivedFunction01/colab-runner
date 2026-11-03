@@ -299,13 +299,7 @@ button.block { display: block; width: 100%; min-height: 40px; font-size: var(--w
 
 /* ---- events ---- */
 
-.event {
-  font-size: var(--wb-font-size-sm);
-  padding: var(--wb-space-8) 0;
-  border-bottom: 1px solid var(--wb-border-default);
-}
 
-.event:last-child { border-bottom: none; }
 
 /* ---- degraded (server unreachable) ---- */
 
@@ -386,3 +380,119 @@ button.block { display: block; width: 100%; min-height: 40px; font-size: var(--w
 .settings-lab { margin: var(--wb-space-12) 0 var(--wb-space-8); }
 #settings-mode-seg { margin-bottom: var(--wb-space-4); }
 #slot-settings .kvline { margin-top: var(--wb-space-12); }
+
+/* ---- logs (grouped ledger; form model in app.js) ---- */
+
+.logs-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--wb-space-8);
+}
+.logs-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wb-space-4) var(--wb-space-12);
+  margin-top: var(--wb-space-12);
+  font-size: var(--wb-font-size-xs);
+  color: var(--wb-content-secondary);
+}
+.legend-item { display: inline-flex; align-items: center; gap: var(--wb-space-4); }
+
+.kind-code {
+  font-family: var(--wb-font-mono);
+  font-size: var(--wb-font-size-xs);
+  background: var(--wb-surface-sunken);
+  color: var(--wb-content-secondary);
+  border-radius: var(--wb-radius-sm);
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+.level-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: var(--wb-radius-pill);
+  flex: none;
+}
+.level-dot.ok { background: var(--wb-status-ok); }
+.level-dot.info { background: var(--wb-status-info); }
+.level-dot.warn { background: var(--wb-status-warn); }
+.level-dot.error { background: var(--wb-status-bad); }
+
+.logs-filters { margin-top: var(--wb-space-12); }
+
+.tl-day { margin-top: var(--wb-space-12); }
+.tl-band {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--wb-space-8);
+  background: var(--wb-surface-1);
+  border-radius: var(--wb-radius-sm);
+  padding: var(--wb-space-4) var(--wb-space-8);
+  font-size: var(--wb-font-size-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.tl-band .muted { font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+.tl-row {
+  display: grid;
+  grid-template-columns: 76px 18px 1fr;
+  gap: var(--wb-space-8);
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: var(--wb-space-8) 0;
+  min-height: 40px;
+}
+.logs-compact .tl-row { padding: var(--wb-space-4) 0; min-height: 32px; }
+.tl-row:hover { background: var(--wb-surface-sunken); }
+
+.tl-time { display: flex; flex-direction: column; font-size: var(--wb-font-size-xs); padding-top: 2px; }
+.tl-rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding-top: 5px;
+}
+.tl-rail::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: -1px;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: var(--wb-border-default);
+}
+.tl-entry:first-of-type .tl-rail::before { top: 5px; }
+.tl-entry:last-of-type .tl-rail::before { bottom: auto; height: 14px; }
+.tl-rail .level-dot { position: relative; width: 11px; height: 11px; border: 2px solid var(--wb-surface-2); }
+
+.tl-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.tl-top { display: flex; align-items: center; gap: var(--wb-space-8); }
+.tl-who { font-size: var(--wb-font-size-sm); overflow-wrap: anywhere; }
+.tl-detail { font-size: var(--wb-font-size-sm); color: var(--wb-content-secondary); overflow-wrap: anywhere; }
+
+.log-json {
+  font-family: var(--wb-font-mono);
+  font-size: var(--wb-font-size-xs);
+  background: var(--wb-surface-sunken);
+  border-radius: var(--wb-radius-sm);
+  padding: var(--wb-space-8) var(--wb-space-12);
+  margin: var(--wb-space-4) 0 var(--wb-space-8);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.log-empty { padding: var(--wb-space-12) 0; font-size: var(--wb-font-size-sm); }
+#logs-foot { margin-top: var(--wb-space-8); }
+
+@media (max-width: 640px) {
+  .tl-row { grid-template-columns: 68px 16px 1fr; }
+}

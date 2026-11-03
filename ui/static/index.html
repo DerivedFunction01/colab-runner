@@ -76,10 +76,19 @@
       </section>
       <section id="slot-events">
         <div class="card">
-          <b>Events</b>
-          <div id="event-list">
-            <div class="event muted">No events yet.</div>
+          <div class="logs-head">
+            <b>Logs</b>
           </div>
+          <div id="logs-legend" class="logs-legend"></div>
+          <div class="chips logs-filters" id="logs-filters">
+            <button type="button" data-lfilter="all">All</button>
+            <button type="button" data-lfilter="leases">Leases</button>
+            <button type="button" data-lfilter="grants">Grants</button>
+            <button type="button" data-lfilter="budget">Budget</button>
+            <button type="button" data-lfilter="errors">Errors</button>
+          </div>
+          <div id="logs-body"></div>
+          <p id="logs-foot" class="kvline muted"></p>
         </div>
       </section>
     </div>

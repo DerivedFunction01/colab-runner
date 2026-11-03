@@ -388,8 +388,7 @@ def test_frontend_renders_envelope():
     assert "envelope" in js  # grant card renders the served envelope block
     assert "Envelope leases" in js
     assert "Envelope caps (at grant)" in js
-    assert "envelope-lease-started" in js
-    assert "envelope-lease-released" in js
+    assert "envelope-lease-released" in js  # in the logs vocabulary (closed, 2026-11-03)
 
 
 def test_budget_caps_endpoint_invokes_core_and_appends_event(ui):
@@ -426,7 +425,6 @@ def test_budget_caps_core_refusal_is_a_400(tmp_path):
 def test_frontend_has_budget_cap_editor():
     js = (REPO / "ui" / "static" / "app.js").read_text()
     assert "/api/config/budget" in js
-    assert "budget-caps-changed" in js
     assert "Edit caps" in js
 
 
@@ -480,7 +478,6 @@ def test_instance_start_stop_route_through_lease_endpoints(ui):
 def test_frontend_has_parallel_toggle_and_instance_card():
     js = (REPO / "ui" / "static" / "app.js").read_text()
     assert "/api/config/parallel" in js
-    assert "parallel-changed" in js
     assert "data-parallel" in js  # the per-spec toggle, bound to the served block
     assert "data-istart" in js  # the dormant instance card's Start
     assert "parallelToggleHTML" in js
