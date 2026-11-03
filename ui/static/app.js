@@ -860,8 +860,7 @@ async function poll(force) {
 
 $("retry-btn").addEventListener("click", (e) => act(e.currentTarget, () => poll(true)));
 
-$("restart-btn").addEventListener("click", async (e) => {
-  const btn = e.currentTarget;
+async function restartServer(btn) {
   btn.disabled = true;
   try {
     // The restart stops the very server answering this, so a failed
@@ -874,7 +873,10 @@ $("restart-btn").addEventListener("click", async (e) => {
   } finally {
     btn.disabled = false;
   }
-});
+}
+
+$("restart-btn").addEventListener("click", (e) => restartServer(e.currentTarget));
+$("settings-restart-btn").addEventListener("click", (e) => restartServer(e.currentTarget));
 
 /* ---------- theme (palette + mode; on-device only) ----------
  * Presentation state, not lease state: stored in localStorage,
