@@ -61,7 +61,10 @@ space_json() {
 JSON
 }
 
-CLIENT_FILES="index.html theme.css app.css app.js"
+CLIENT_FILES="index.html theme.css app.css app.js colab-icon.svg"
+# Generated icon PNGs (ui/make-icon-png.sh) ship when they exist; the
+# SVG is the tracked source and the only required icon file.
+OPTIONAL_CLIENT_FILES="colab-icon-192.png colab-icon-512.png colab-icon-180.png"
 
 if [ "$CHECK" -eq 1 ]; then
   DRIFT=0
@@ -74,10 +77,17 @@ if [ "$CHECK" -eq 1 ]; then
       echo "check: DRIFTED client/$f"; DRIFT=1
     fi
   done
+  for f in $OPTIONAL_CLIENT_FILES; do
+    if [ -f "$HERE/static/$f" ] && [ ! -f "$RUNTIME/client/$f" ]; then
+      echo "check: MISSING client/$f (generated locally, not deployed)"; DRIFT=1
+    elif [ -f "$HERE/static/$f" ] && ! cmp -s "$HERE/static/$f" "$RUNTIME/client/$f"; then
+      echo "check: DRIFTED client/$f"; DRIFT=1
+    fi
+  done
   for f in "$RUNTIME/client"/*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
-    case " $CLIENT_FILES " in
+    case " $CLIENT_FILES $OPTIONAL_CLIENT_FILES " in
       *" $base "*) ;;
       *) echo "check: DRIFTED client/$base (deployed, not a repo source)"; DRIFT=1 ;;
     esac
@@ -118,6 +128,11 @@ step "deploy — sync artifact sources to $RUNTIME"
 mkdir -p "$RUNTIME/client" "$RUNTIME/brief"
 for f in $CLIENT_FILES; do
   cp "$HERE/static/$f" "$RUNTIME/client/"
+done
+for f in $OPTIONAL_CLIENT_FILES; do
+  if [ -f "$HERE/static/$f" ]; then
+    cp "$HERE/static/$f" "$RUNTIME/client/"
+  fi
 done
 cp "$HERE/artifact-brief.md" "$RUNTIME/brief/"
 space_json > "$RUNTIME/space.json"
