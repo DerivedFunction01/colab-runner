@@ -6,6 +6,13 @@ travel with the push. The connector snapshot flow is the fallback only —
 it carries none of those (a snapshot restore needs `chmod +x` on the
 executables before anything runs).
 
+Route preference for snapshot syncs (standing rule, 2026-11-03): when a
+sync is a snapshot (a tree publication rather than an ordinary history
+push) and it can ride Colab — an already-active session first, per the
+shared-session etiquette — it goes by the Colab route (Route B
+mechanics). The connector snapshot flow is used only when Colab is not
+possible.
+
 ## Key and host pinning
 
 - One Ed25519 keypair, registered at account level on GitHub. The
