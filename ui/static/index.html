@@ -4,6 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Colab Lease</title>
+<script>
+/* Theme boot: resolve the saved palette + mode onto <html> before
+ * first paint. Stored on-device only; the server never sees it.
+ * data-mode holds the RESOLVED mode (light|dark). */
+(function () {
+  var palette = "olive", mode = "system";
+  try {
+    palette = localStorage.getItem("lease-ui-palette") || "olive";
+    mode = localStorage.getItem("lease-ui-mode") || "system";
+  } catch (e) { /* storage unavailable: defaults */ }
+  if (["olive", "colab", "google", "teal"].indexOf(palette) < 0) palette = "olive";
+  if (["system", "light", "dark"].indexOf(mode) < 0) mode = "system";
+  var resolved = mode === "system"
+    ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+    : mode;
+  document.documentElement.setAttribute("data-palette", palette);
+  document.documentElement.setAttribute("data-mode", resolved);
+})();
+</script>
 <link rel="icon" type="image/svg+xml" href="/static/colab-icon.svg">
 <link rel="icon" type="image/png" sizes="192x192" href="/static/colab-icon-192.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/colab-icon-180.png">
@@ -13,8 +32,28 @@
 <body>
 <main class="page">
   <header class="topbar">
-    <h1>Colab Lease</h1>
-    <span id="balance-chip" class="chip ok num" hidden>Balance — CU</span>
+    <div class="brand">
+      <img class="brand-icon" src="/static/colab-icon.svg" alt="" width="28" height="28">
+      <h1>Colab Lease</h1>
+    </div>
+    <div class="topbar-actions">
+      <div class="theme-anchor">
+        <button id="theme-btn" class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" title="Theme" aria-label="Theme">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18c1.1 0 2-.9 2-2 0-.55-.22-1.05-.59-1.41-.37-.37-.58-.86-.58-1.34 0-1.1.9-2 2-2H17a4.99 4.99 0 0 0 5-5c0-3.87-4.48-7-10-7Zm-5 9.5A1.75 1.75 0 1 1 8.75 10 1.76 1.76 0 0 1 7 12.5Zm3.5-4A1.75 1.75 0 1 1 12.25 6 1.76 1.76 0 0 1 10.5 8.5Zm5 0A1.75 1.75 0 1 1 17.25 6 1.76 1.76 0 0 1 15.5 8.5ZM8.13 16.75A1.75 1.75 0 1 1 9.88 15a1.76 1.76 0 0 1-1.75 1.75Z"/></svg>
+        </button>
+        <div id="theme-menu" class="theme-menu card" hidden>
+          <div class="lab">Mode</div>
+          <div class="seg" id="theme-mode-seg">
+            <button type="button" data-tmode="system">System</button>
+            <button type="button" data-tmode="light">Light</button>
+            <button type="button" data-tmode="dark">Dark</button>
+          </div>
+          <div class="lab">Palette</div>
+          <div id="theme-palette-list"></div>
+        </div>
+      </div>
+      <span id="balance-chip" class="chip ok num" hidden>Balance — CU</span>
+    </div>
   </header>
   <p id="notice" class="notice" hidden></p>
 
@@ -97,6 +136,20 @@
                 The lobby is held by the standing duty; revoke from the grant card.</p>
             </div>
           </div>
+        </div>
+      </section>
+      <section id="slot-settings">
+        <div class="card">
+          <b>Settings</b>
+          <div class="lab settings-lab">Appearance</div>
+          <div class="seg" id="settings-mode-seg">
+            <button type="button" data-tmode="system">System</button>
+            <button type="button" data-tmode="light">Light</button>
+            <button type="button" data-tmode="dark">Dark</button>
+          </div>
+          <div class="lab settings-lab">Palette</div>
+          <div id="settings-palette-list"></div>
+          <p class="kvline muted">Theme is stored on this device only.</p>
         </div>
       </section>
     </div>

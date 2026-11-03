@@ -319,3 +319,70 @@ button.block { display: block; width: 100%; min-height: 40px; font-size: var(--w
   .degraded-actions { flex-direction: row; }
   .degraded-actions button { padding: 0 var(--wb-space-24); }
 }
+
+/* ---- theme controls (palette icon menu + Settings card) ---- */
+
+.brand { display: flex; align-items: center; gap: var(--wb-space-8); }
+.brand-icon { display: block; }
+
+.topbar-actions { display: flex; align-items: center; gap: var(--wb-space-8); }
+#balance-chip { display: inline-flex; }
+
+.theme-anchor { position: relative; }
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: var(--wb-radius-pill);
+  background: transparent;
+  color: var(--wb-content-secondary);
+}
+.icon-btn:hover { background: var(--wb-surface-sunken); color: var(--wb-content-primary); }
+
+.theme-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + var(--wb-space-8));
+  width: 264px;
+  z-index: 30;
+  box-shadow: var(--wb-shadow-overlay);
+}
+.theme-menu .lab { margin: var(--wb-space-4) 0 var(--wb-space-8); }
+.theme-menu .lab:first-child { margin-top: 0; }
+.theme-menu .seg { margin-bottom: var(--wb-space-12); }
+
+.palette-row {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-8);
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--wb-radius-sm);
+  padding: var(--wb-space-8);
+  min-height: 40px;
+  font-size: var(--wb-font-size-sm);
+}
+.palette-row:hover { background: var(--wb-surface-sunken); }
+.palette-row.selected { border-color: var(--wb-accent); }
+.palette-row .check { margin-left: auto; color: var(--wb-accent); font-weight: 700; }
+
+.swatches { display: inline-flex; }
+.swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--wb-radius-pill);
+  border: 1px solid var(--wb-border-default);
+  margin-left: -5px;
+}
+.swatch:first-child { margin-left: 0; }
+
+#slot-settings { order: 5; }
+.settings-lab { margin: var(--wb-space-12) 0 var(--wb-space-8); }
+#settings-mode-seg { margin-bottom: var(--wb-space-4); }
+#slot-settings .kvline { margin-top: var(--wb-space-12); }

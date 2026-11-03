@@ -169,3 +169,221 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- Palette + mode overrides (themes, approved mockup 2026-11-03) ----
+ * The boot script in index.html always sets data-palette and the
+ * RESOLVED data-mode (light|dark) on <html> before first paint, from
+ * the on-device saved choice (default: olive palette, system mode).
+ * With no attributes the blocks above govern, exactly as before.
+ * Status hues are the same Okabe–Ito set in every palette; each block
+ * restates the mode's status TEXT variants so a forced mode never
+ * mixes one mode's surfaces with the other's text colors. */
+
+/* Olive, forced modes (values identical to the base blocks above). */
+:root[data-mode="dark"] {
+  color-scheme: dark;
+  --wb-surface-1: #171912;
+  --wb-surface-2: #21241b;
+  --wb-surface-3: #2a2e21;
+  --wb-surface-canvas: #101208;
+  --wb-surface-sunken: #12140c;
+  --wb-content-primary: #eceeda;
+  --wb-content-secondary: #a9ad97;
+  --wb-content-muted: #82856f;
+  --wb-border-default: #3a3e2e;
+  --wb-border-strong: #4c5138;
+  --wb-accent: var(--wb-olive-300);
+  --wb-accent-hover: #aabd72;
+  --wb-on-accent: #15170f;
+  --wb-focus-ring: var(--wb-accent);
+  --wb-danger: #e07a5f;
+  --wb-unknown: #93a7ba;
+  --wb-shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45);
+  --wb-status-ok-text: #45c493;
+  --wb-status-info-text: #56B4E9;
+  --wb-status-warn-text: #e8a33d;
+  --wb-status-bad-text: #f0854c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-mode="light"] {
+    color-scheme: light;
+    --wb-surface-1: #f7f7ee;
+    --wb-surface-2: #ffffff;
+    --wb-surface-3: #ffffff;
+    --wb-surface-canvas: #edeee3;
+    --wb-surface-sunken: #e4e5d3;
+    --wb-content-primary: #22251a;
+    --wb-content-secondary: #5c604e;
+    --wb-content-muted: #83876f;
+    --wb-border-default: #c9cbb4;
+    --wb-border-strong: #a9ac8f;
+    --wb-accent: var(--wb-olive-500);
+    --wb-accent-hover: #40491b;
+    --wb-on-accent: #ffffff;
+    --wb-focus-ring: var(--wb-accent);
+    --wb-danger: #b03a22;
+    --wb-unknown: #5b6b7a;
+    --wb-shadow-overlay: 0 8px 24px rgb(34 37 26 / 0.14);
+    --wb-status-ok-text: #006e52;
+    --wb-status-info-text: #005f94;
+    --wb-status-warn-text: #7d5200;
+    --wb-status-bad-text: #a63f00;
+  }
+}
+
+/* Colab palette — Google Material surfaces, Colab amber accent,
+ * Google blue for focus/interactive rings. */
+:root[data-palette="colab"] {
+  color-scheme: light;
+  --wb-font-ui: Roboto, Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --wb-surface-1: #f1f3f4;
+  --wb-surface-2: #ffffff;
+  --wb-surface-3: #ffffff;
+  --wb-surface-canvas: #f8f9fa;
+  --wb-surface-sunken: #e8eaed;
+  --wb-content-primary: #202124;
+  --wb-content-secondary: #5f6368;
+  --wb-content-muted: #80868b;
+  --wb-border-default: #dadce0;
+  --wb-border-strong: #bdc1c6;
+  --wb-accent: #f9ab00;
+  --wb-accent-hover: #e37400;
+  --wb-on-accent: #202124;
+  --wb-focus-ring: #1a73e8;
+  --wb-danger: #d93025;
+  --wb-unknown: #5f6368;
+  --wb-shadow-overlay: 0 8px 24px rgb(32 33 36 / 0.16);
+  --wb-status-ok-text: #006e52;
+  --wb-status-info-text: #005f94;
+  --wb-status-warn-text: #7d5200;
+  --wb-status-bad-text: #a63f00;
+}
+
+:root[data-palette="colab"][data-mode="dark"] {
+  color-scheme: dark;
+  --wb-surface-1: #292a2d;
+  --wb-surface-2: #303134;
+  --wb-surface-3: #3c4043;
+  --wb-surface-canvas: #202124;
+  --wb-surface-sunken: #17181a;
+  --wb-content-primary: #e8eaed;
+  --wb-content-secondary: #9aa0a6;
+  --wb-content-muted: #80868b;
+  --wb-border-default: #3c4043;
+  --wb-border-strong: #5f6368;
+  --wb-accent: #f9ab00;
+  --wb-accent-hover: #fbbc04;
+  --wb-on-accent: #202124;
+  --wb-focus-ring: #8ab4f8;
+  --wb-danger: #f28b82;
+  --wb-unknown: #9aa0a6;
+  --wb-shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45);
+  --wb-status-ok-text: #45c493;
+  --wb-status-info-text: #56B4E9;
+  --wb-status-warn-text: #e8a33d;
+  --wb-status-bad-text: #f0854c;
+}
+
+/* Google palette — Material blue-led. */
+:root[data-palette="google"] {
+  color-scheme: light;
+  --wb-font-ui: Roboto, Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --wb-surface-1: #f1f3f4;
+  --wb-surface-2: #ffffff;
+  --wb-surface-3: #ffffff;
+  --wb-surface-canvas: #f8f9fa;
+  --wb-surface-sunken: #e8f0fe;
+  --wb-content-primary: #202124;
+  --wb-content-secondary: #5f6368;
+  --wb-content-muted: #80868b;
+  --wb-border-default: #dadce0;
+  --wb-border-strong: #bdc1c6;
+  --wb-accent: #1a73e8;
+  --wb-accent-hover: #1765cc;
+  --wb-on-accent: #ffffff;
+  --wb-focus-ring: #1a73e8;
+  --wb-danger: #d93025;
+  --wb-unknown: #5f6368;
+  --wb-shadow-overlay: 0 8px 24px rgb(32 33 36 / 0.16);
+  --wb-status-ok-text: #006e52;
+  --wb-status-info-text: #005f94;
+  --wb-status-warn-text: #7d5200;
+  --wb-status-bad-text: #a63f00;
+}
+
+:root[data-palette="google"][data-mode="dark"] {
+  color-scheme: dark;
+  --wb-surface-1: #292a2d;
+  --wb-surface-2: #303134;
+  --wb-surface-3: #3c4043;
+  --wb-surface-canvas: #202124;
+  --wb-surface-sunken: #17181a;
+  --wb-content-primary: #e8eaed;
+  --wb-content-secondary: #9aa0a6;
+  --wb-content-muted: #80868b;
+  --wb-border-default: #3c4043;
+  --wb-border-strong: #5f6368;
+  --wb-accent: #8ab4f8;
+  --wb-accent-hover: #aecbfa;
+  --wb-on-accent: #202124;
+  --wb-focus-ring: #8ab4f8;
+  --wb-danger: #f28b82;
+  --wb-unknown: #9aa0a6;
+  --wb-shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45);
+  --wb-status-ok-text: #45c493;
+  --wb-status-info-text: #56B4E9;
+  --wb-status-warn-text: #e8a33d;
+  --wb-status-bad-text: #f0854c;
+}
+
+/* Teal palette — the workbench viewer's second palette family. */
+:root[data-palette="teal"] {
+  color-scheme: light;
+  --wb-surface-1: #f4faf8;
+  --wb-surface-2: #ffffff;
+  --wb-surface-3: #ffffff;
+  --wb-surface-canvas: #e9f2f0;
+  --wb-surface-sunken: #d9e9e5;
+  --wb-content-primary: #12211e;
+  --wb-content-secondary: #47635c;
+  --wb-content-muted: #71867f;
+  --wb-border-default: #bfd8d2;
+  --wb-border-strong: #93bbb2;
+  --wb-accent: var(--wb-teal-500);
+  --wb-accent-hover: #0b5e57;
+  --wb-on-accent: #ffffff;
+  --wb-focus-ring: var(--wb-accent);
+  --wb-danger: #b03a22;
+  --wb-unknown: #5b6b7a;
+  --wb-shadow-overlay: 0 8px 24px rgb(18 33 30 / 0.14);
+  --wb-status-ok-text: #006e52;
+  --wb-status-info-text: #005f94;
+  --wb-status-warn-text: #7d5200;
+  --wb-status-bad-text: #a63f00;
+}
+
+:root[data-palette="teal"][data-mode="dark"] {
+  color-scheme: dark;
+  --wb-surface-1: #062e29;
+  --wb-surface-2: #083832;
+  --wb-surface-3: #0b443c;
+  --wb-surface-canvas: #03211d;
+  --wb-surface-sunken: #021a17;
+  --wb-content-primary: #e2f2ee;
+  --wb-content-secondary: #9dbfb7;
+  --wb-content-muted: #6f938a;
+  --wb-border-default: #12463d;
+  --wb-border-strong: #1c5a4f;
+  --wb-accent: var(--wb-teal-300);
+  --wb-accent-hover: #5eead4;
+  --wb-on-accent: #03211d;
+  --wb-focus-ring: var(--wb-accent);
+  --wb-danger: #e07a5f;
+  --wb-unknown: #93a7ba;
+  --wb-shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45);
+  --wb-status-ok-text: #45c493;
+  --wb-status-info-text: #56B4E9;
+  --wb-status-warn-text: #e8a33d;
+  --wb-status-bad-text: #f0854c;
+}
