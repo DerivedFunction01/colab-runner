@@ -6,12 +6,14 @@ travel with the push. The connector snapshot flow is the fallback only —
 it carries none of those (a snapshot restore needs `chmod +x` on the
 executables before anything runs).
 
-Route preference for snapshot syncs (standing rule, 2026-11-03): when a
-sync is a snapshot (a tree publication rather than an ordinary history
-push) and it can ride Colab — an already-active session first, per the
-shared-session etiquette — it goes by the Colab route (Route B
-mechanics). The connector snapshot flow is used only when Colab is not
-possible.
+Route preference (standing rule, 2026-11-03, away-scoped): when the
+operator is away — stated explicitly, or late night / early morning
+with him inactive — pushes and snapshot syncs use the Colab route
+(Route B mechanics, riding an already-active session first per the
+shared-session etiquette), because the connector's approval cards
+cannot be tapped while he is away and unattended VM git writes are
+unreliable. When he is present, route choice is free: VM-direct SSH,
+Colab, or the connector.
 
 ## Key and host pinning
 
