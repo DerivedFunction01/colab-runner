@@ -1,0 +1,20 @@
+# Template — render before installing: ui/install-unit.sh
+# substitutes @ROOT@, @PYTHON@ and @HOME@ for the host.
+# The rendered unit is a machine-local artefact, never tracked.
+[Unit]
+Description=Colab lease UI companion server (lease panel on 127.0.0.1:8793)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=@PYTHON@ @ROOT@/ui/server.py
+Restart=always
+RestartSec=2
+StandardOutput=append:@ROOT@/var/lease-ui.log
+StandardError=append:@ROOT@/var/lease-ui.log
+
+[Install]
+WantedBy=default.target

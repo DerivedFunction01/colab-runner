@@ -53,19 +53,35 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
   (`--wb-*`: olive palette, surfaces, accent, radius, font stacks) so
   the page reads as a sibling of the workbench.
 
-## Watchdog
+## Supervision and watchdog
 
-This server is unsupervised — nothing else starts it, so a runtime
-restart used to leave the panel down until a human noticed. The
-`colab-lease-reaper` hook (script `~/hooks/scripts/colab-lease-reaper.sh`,
-120 s poll) carries a watchdog duty that runs after its lease duties:
-it probes `GET http://127.0.0.1:8793/` (the static page — cheap; any
-HTTP response means up) and, when the probe fails, runs `ui/ui.sh start`
-and re-probes once. The outcome is recorded as `ui_action` (`up`,
-`restarted`, `restart-failed`) in `~/hooks/state/colab-lease-reaper.json`.
-The hook stays silent while the server is up; it wakes the chat only
-when it restarted the server or the restart failed. Hook dry runs
-probe only and never restart.
+The server runs under systemd: `ui/colab-lease-ui.service.tmpl` is
+the tracked unit template (`Restart=always`, logs appended to
+`var/lease-ui.log`), `ui/install-unit.sh` renders and installs it,
+and `ui/ui.sh` delegates every verb to systemctl while the unit is
+installed (the nohup + pidfile path remains the fallback where it
+is not). Runtime deployments replace this VM — PID 1 restarts,
+/etc is wiped, every unsupervised process dies — which killed the
+previously unsupervised (nohup) server at least four times on
+2026-11-02 (12:41, 14:39, 16:50, 22:02 EST), each time in the same
+minutes as the sibling companion servers and with the server log
+ending mid-traffic on a 200: annihilated with the VM, never a
+crash, never OOM (its RSS is ~17 MB).
+
+Recovery is `ui/watchdog.sh`, the restore ladder in the sibling
+servers' shape: probe `GET http://127.0.0.1:8793/` (the static page
+— cheap; any HTTP response means up); healthy but unit file
+missing → reinstall the unit quietly; down → reinstall the unit,
+start the service, poll-verify; fallback → `ui/ui.sh start`,
+poll-verify again. Exit 0 means healthy or restored-and-verified.
+The `colab-lease-reaper` hook (script
+`~/hooks/scripts/colab-lease-reaper.sh`, 120 s poll) carries a
+watchdog duty that runs after its lease duties: it probes the
+page and, when the probe fails, runs the ladder. The outcome is
+recorded as `ui_action` (`up`, `restored`, `restart-failed`) in
+`~/hooks/state/colab-lease-reaper.json`. A successful restore is
+routine and stays silent — the hook wakes the chat only when the
+ladder failed. Hook dry runs probe only and never restore.
 
 ## Env overrides (tests)
 
