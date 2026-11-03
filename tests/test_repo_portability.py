@@ -10,6 +10,7 @@ scan: it has to name the patterns to forbid them (the same reason
 tests/test_env_registry_unit.py carries its forbidden literals).
 """
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -39,6 +40,32 @@ def test_tracked_files_are_portable():
     assert not offenders, "\n".join(offenders)
 
 
+def test_profiles_config_is_local_and_seeded_from_tracked_example():
+    """The workspace's named profiles are local data, following the
+    repos-registry split: the actual config/profiles.json is
+    gitignored and untracked, while a fictional, schema-complete
+    config/profiles.example.json is tracked as the seed."""
+    names = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+    assert "config/profiles.example.json" in names
+    assert "config/profiles.json" not in names
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "config/profiles.json"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+    )
+    assert ignored.returncode == 0
+
+    example = json.loads((REPO / "config" / "profiles.example.json").read_text())
+    profiles = example.get("profiles", {})
+    assert profiles
+    assert example.get("default_profile") in profiles
+    assert all(profile.get("rate_cu_per_hour") is None for profile in profiles.values())
+    example_text = json.dumps(example)
+    assert WORKLOAD_LITERAL not in example_text
+    assert "pay" + "gate" not in example_text
+
+
 def test_no_workload_literal_in_executable_code():
     """The default workload's profile id must not appear as a
     literal in executable code (2026-11-03 hardcode strip):
@@ -55,8 +82,8 @@ def test_no_workload_literal_in_executable_code():
     are scanned (.py/.sh/.js and the extensionless bin
     executables): docs, markup, stylesheets, job definitions and
     fixtures are data and out of scope, and
-    config/profiles.json — outside these directories anyway —
-    is the sanctioned seam that names the workload. The literal
+    the local config/profiles.json — outside these directories
+    anyway — is the sanctioned seam that names the workload. The literal
     is matched as a standalone token, so the workload repo's own
     name (with a hyphenated suffix) and the SEC system's name
     are not the profile id."""

@@ -31,7 +31,7 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
   countdown arithmetic on served timestamps and projected-CU arithmetic
   over the served rate table.
 - `GET /api/state` — core `state` JSON plus `profiles` and `caps` read
-  from `config/profiles.json` / `config/lease.json`.
+  from `config/profiles.json` (local, untracked) and `config/lease.json`.
 - `POST /api/lease/start {profile, hours}`, `POST /api/lease/stop
   {profile}`, `POST /api/grant {hours, burst}`, `POST /api/ungrant`.
   The profile/spec pickers (normal mode, and the burst tier in

@@ -7,6 +7,11 @@
 # data, seeded from the tracked config/repos.example.json — never committed.
 /config/repos.json
 
+# Local workload profiles: which named profiles, sessions, default, and
+# measured rates this workspace uses are local data, seeded from the
+# tracked config/profiles.example.json — never committed.
+/config/profiles.json
+
 # Job results: manifests are tracked under jobs/; payload bytes are not.
 /results/*
 !/results/.gitkeep

@@ -12,7 +12,7 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 ## Key pieces
 
 - `config/transient.json` + `ops/mirror_transient.py` — everything that would not survive a VM restart (OAuth token, session state, the CLI install) is mirrored into `state/transient/` (untracked) and restored from there, by the reaper hook's poll and on every wrapper use, under per-item rules in the registry.
-- `config/profiles.json` — the spec catalog: every grantable Colab tier with its CU/h rate (null = unconfirmed) (`workload`: high-RAM CPU; `lobby`/`standard`: standard CPU; `t4`: T4 GPU).
+- `config/profiles.example.json` — the tracked template for the local, untracked `config/profiles.json`: the named workload profiles available to this workspace, each with its CU/h rate (null = unconfirmed). Colab's generic shapes are served dynamically; the local file names only this workspace's workloads and roles.
 - `ui/` — the operator's lease control panel (127.0.0.1:8793): start any spec for a chosen duration, grant a two-tier lease (standing lobby + burst spec), terminate early; every action is a `bin/colab-lease` call, and starts/stops/grants are announced to the main chat via the outbox + notify hook. No agent operates the lease.
 - `sync/` — snapshot-bundle construction on the origin lineage, bundle apply, the per-class data manifest (transfer vs driver-plus-regenerate vs network regeneration, priced), and result pull-back with hash verification.
 - `probes/` — the P0–P4 probe suites: local network, session shape, transfer channels, execution behaviour + kill matrix, restart survival. Results land in `probes/results/`.
@@ -21,12 +21,15 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 
 ## First-time setup
 
-Operator-only step: the one-time OAuth login.
+First create this workspace's local profile config from the tracked example, then edit its profile ids, labels, session names, and default for the workloads this workspace actually runs. Leave a rate null until a lease on this workspace's account measures it.
 
 ```bash
+[ -f config/profiles.json ] || cp config/profiles.example.json config/profiles.json
+# edit config/profiles.json for this workspace
 ops/bootstrap_local.sh          # installs google-colab-cli via uv, restores transients
-colab --auth oauth2 new -s workload --high-mem   # prints a URL; open it anywhere, paste the code back
 ```
+
+Operator-only step: the one-time OAuth login. Use the session named by the local default profile, adding `--high-mem` when that profile sets `high_mem: true`; the command prints a URL to open anywhere and paste the returned code back.
 
 After that, the token is cached and mirrored, and wrappers handle the rest. Design and rulings: `.plans/2026-10-29-colab-runner-for-workload-repo.md`.
 

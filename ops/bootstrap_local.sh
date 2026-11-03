@@ -56,5 +56,6 @@ fi
 
 echo "== lease machinery"
 [ -f "$REPO_ROOT/config/lease.json" ] && echo "present: config/lease.json" || echo "absent:  config/lease.json"
+[ -f "$REPO_ROOT/config/profiles.json" ] && echo "present: config/profiles.json" || echo "absent:  config/profiles.json — copy config/profiles.example.json there and edit it for this workspace"
 "$PY" -m py_compile "$REPO_ROOT/sync/lease.py" "$REPO_ROOT/bin/colab-lease" && echo "lease module + CLI compile OK"
 [ -f "$REPO_ROOT/var/lease.json" ] && echo "lease state: a lease record exists (see bin/colab-lease status)" || echo "lease state: no active lease"
