@@ -36,7 +36,7 @@ REPO = UI_DIR.parent
 STATIC_DIR = UI_DIR / "static"
 CONFIG_PATH = UI_DIR / "config.json"
 
-FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid"}
+FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live"}
 # The panel's budget-cap editor fields, in body-name → core-flag order.
 BUDGET_CAP_FIELDS = {"daily_cu_budget": "--daily", "monthly_cu_budget": "--monthly", "standing_daily_cu_cap": "--standing-daily"}
 CORE_TIMEOUT_S = 1800
@@ -332,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_ungrant()
         if parsed.path == "/api/config/budget":
             return self.api_config_budget(body)
+        if parsed.path == "/api/config/parallel":
+            return self.api_config_parallel(body)
         if parsed.path == "/api/server/restart":
             return self.api_server_restart()
         return self.send_json(404, {"error": "not found"})
@@ -488,6 +490,26 @@ class Handler(BaseHTTPRequestHandler):
             OUTBOX.append("budget-caps-changed", {"caps": result.get("caps"), "previous": result.get("previous")})
             return self.send_json(200, result)
         return self.send_json(400, result)
+
+    def api_config_parallel(self, body: dict) -> None:
+        """Set one base profile's parallel-instance toggle: the core
+        validates eligibility and persists it to config/lease.json.
+        The endpoint forwards exactly one profile and one boolean;
+        the core's refusals (ineligible shape, instance lease live)
+        answer 200 with the refusal action, like the extend
+        endpoints, so the page can read and report the reason."""
+        profile = body.get("profile")
+        if not profile or not isinstance(profile, str):
+            return self.send_json(400, {"error": "profile is required"})
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            return self.send_json(400, {"error": "enabled must be a boolean"})
+        rc, result, err = run_core("parallel", profile, "--on" if enabled else "--off")
+        if result is None:
+            return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
+        if is_success(rc, result):
+            OUTBOX.append("parallel-changed", {"profile": profile, "enabled": enabled, "instance": result.get("instance"), "previous": result.get("previous")})
+        return self.send_json(200, result)
 
 
 def main(argv: list[str]) -> int:

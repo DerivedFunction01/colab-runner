@@ -328,6 +328,26 @@ function wireExtendPickers(container) {
   });
 }
 
+/* A toggled-on instance with no lease yet gets a dormant card with
+ * its own Start; once it runs, its record renders the ordinary
+ * lease card (deadline, Terminate, Extend) like any profile. Start
+ * and stop ride the existing lease endpoints with the instance
+ * profile id the core served — no instance endpoints exist. */
+function dormantInstanceCards(records) {
+  const live = new Set(records.map((e) => e.profile || (e.record || {}).profile));
+  return specsFromState()
+    .filter((s) => s.parallel && s.parallel.enabled && s.parallel.instance && !live.has(s.parallel.instance))
+    .map((s) => {
+      const inst = specById(s.parallel.instance);
+      const title = inst ? specTitle(inst) : s.parallel.instance;
+      return `<div class="card">
+      <div class="row"><b>${esc(title)}</b><span class="chip warn">Not running</span></div>
+      <p class="kvline">Parallel instance of <b>${esc(specLabel(s.id))}</b> · session <span class="mono">${esc(inst ? inst.session || "—" : "—")}</span> · Burn <b>${esc(inst ? specRateText(inst) : "—")}</b></p>
+      <button type="button" class="primary" data-istart="${esc(s.parallel.instance)}">Start</button>
+    </div>`;
+    }).join("");
+}
+
 function renderLeases() {
   const records = (S && S.records) || [];
   const box = $("lease-cards");
@@ -348,7 +368,13 @@ function renderLeases() {
       <button type="button" class="ghost" data-xtoggle="${esc(profile)}">Extend</button>
       ${extOpen.has(extKey("lease", profile)) ? extendPickerHTML("lease", profile) : ""}
     </div>`;
-  }).join("");
+  }).join("") + dormantInstanceCards(records);
+  box.querySelectorAll("[data-istart]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const profile = btn.getAttribute("data-istart");
+      act(btn, () => api("/api/lease/start", { profile, hours: sel.normalHours }));
+    });
+  });
   box.querySelectorAll("[data-stop]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const profile = btn.getAttribute("data-stop");
@@ -413,6 +439,17 @@ function renderGrant() {
   $("grant-until").textContent = fmtTime(grant.until);
 }
 
+/* The Parallel toggle rides the spec row of every eligible spec,
+ * bound to the served parallel block (eligibility, state, instance
+ * id are the core's; the page derives none of them). Ineligible
+ * specs — every GPU/TPU shape, and instances themselves — render
+ * no toggle. */
+function parallelToggleHTML(s) {
+  const p = s.parallel;
+  if (!p || !p.eligible) return "";
+  return `<span class="chip ptoggle${p.enabled ? " on" : ""}" data-parallel="${esc(s.id)}" title="Allow a second, parallel session of this spec">Parallel ${p.enabled ? "on" : "off"}</span>`;
+}
+
 function renderSpecList(containerId, key) {
   const specs = specsFromState();
   const box = $(containerId);
@@ -422,7 +459,7 @@ function renderSpecList(containerId, key) {
   box.innerHTML = specs.map((s) => `
     <button type="button" class="spec${s.id === sel[key] ? " selected" : ""}" data-spec="${esc(s.id)}">
       <span><b>${esc(s.label || s.id)}</b> · ${esc(specDescriptor(s))}</span>
-      <span class="cost num">${esc(specRateText(s))}</span>
+      <span class="cost num">${esc(specRateText(s))}</span>${parallelToggleHTML(s)}
     </button>`).join("");
 }
 
@@ -467,6 +504,8 @@ function eventText(ev) {
       return `Envelope lease started — ${specLabel(profile)}${d.via ? ` via ${esc(d.via)}` : ""} · ${time}`;
     case "envelope-lease-released":
       return `Envelope lease released — ${specLabel(profile)}${d.reason ? `, ${esc(d.reason)}` : ""} · ${time}`;
+    case "parallel-changed":
+      return `Parallel ${d.enabled ? "enabled" : "disabled"} — ${specLabel(profile)} · ${time}`;
     case "budget-caps-changed": {
       const c = d.caps || {};
       return `Budget caps changed — daily ${capText(c.daily)}, monthly ${capText(c.monthly)}, standing ${capText(c.standing_daily)} · ${time}`;
@@ -497,6 +536,25 @@ function render(events) {
 
 function wireSpecList(containerId, key) {
   $(containerId).addEventListener("click", (e) => {
+    const toggle = e.target.closest("[data-parallel]");
+    if (toggle) {
+      // The toggle is not a spec selection: it flips the served
+      // toggle state through the config endpoint. A core refusal
+      // answers 200 with its action (the extend pattern), so the
+      // page reads it and says why.
+      const profile = toggle.getAttribute("data-parallel");
+      const spec = specById(profile);
+      const enabled = !(spec && spec.parallel && spec.parallel.enabled);
+      act(toggle.closest("button") || toggle, async () => {
+        const res = await api("/api/config/parallel", { profile, enabled });
+        if (res.action === "parallel-updated") {
+          notice(`Parallel ${enabled ? "enabled" : "disabled"} — ${specLabel(profile)}`);
+        } else {
+          notice(`Parallel toggle refused: ${res.action || "failed"}`);
+        }
+      });
+      return;
+    }
     const row = e.target.closest("[data-spec]");
     if (!row) return;
     sel[key] = row.getAttribute("data-spec");

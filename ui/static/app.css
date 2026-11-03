@@ -228,6 +228,8 @@ button.block { display: block; width: 100%; min-height: 40px; font-size: var(--w
 
 .spec.selected { border-color: var(--wb-accent); border-width: 2px; padding: 8px 9px; }
 .spec .cost { white-space: nowrap; color: var(--wb-content-secondary); }
+.spec .ptoggle { cursor: pointer; }
+.spec .ptoggle.on { border-color: var(--wb-status-ok); color: var(--wb-status-ok-text); }
 
 .chips {
   display: flex;

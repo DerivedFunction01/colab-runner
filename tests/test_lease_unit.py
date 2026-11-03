@@ -11,6 +11,8 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
 lease = importlib.util.module_from_spec(spec)
@@ -945,3 +947,94 @@ def test_auto_timed_start_waits_then_fires(tmp_path, monkeypatch):
     assert lease.load_request(REPO) is None
     rec = lease.load_record(REPO, "standard")
     assert rec is not None and rec["via"] == "timer"
+
+
+# --- Parallel instances (plan: .plans/2026-11-03-parallel-cpu-sessions.md) -----
+# A low-tier CPU profile may run one extra session next to its primary,
+# gated by a per-profile toggle in config/lease.json. Eligibility is the
+# core's determination, served ready in each spec's parallel block.
+
+
+def _seed_parallel_repo(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "profiles.json").write_text(json.dumps({
+        "default_profile": "workload",
+        "profiles": {
+            "workload": {"label": "High-RAM", "high_mem": True, "rate_cu_per_hour": 0.26, "session": "workload", "timeout": 18000},
+            "standard": {"label": "Standard", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "standard", "timeout": 3600},
+            "t4": {"label": "T4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "session": "t4", "timeout": 18000},
+        },
+    }))
+    (cfg_dir / "lease.json").write_text(json.dumps({"enabled": True, "daily_cu_budget": 15, "monthly_cu_budget": 150, "max_hours": 8, "keepalive": {"enabled": True}}, sort_keys=True, separators=(",", ":")))
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    return tmp_path
+
+
+def test_parallel_eligibility_is_served_per_spec(tmp_path, monkeypatch):
+    """CPU standard and high-RAM specs serve eligible; every GPU/TPU
+    spec serves ineligible; the toggle defaults off everywhere."""
+    _seed_parallel_repo(tmp_path, monkeypatch)
+    specs = {s["id"]: s for s in lease.specs(tmp_path, _help_stub())}
+    assert specs["workload"]["parallel"] == {"eligible": True, "enabled": False, "instance": "workload2"}
+    assert specs["standard"]["parallel"]["eligible"] is True
+    for pid, spec in specs.items():
+        if spec["gpu"] or spec["tpu"]:
+            assert spec["parallel"]["eligible"] is False, pid
+            assert spec["parallel"]["enabled"] is False, pid
+    assert "workload2" not in specs  # nothing registered while the toggle is off
+
+
+def test_set_parallel_roundtrip_and_instance_registration(tmp_path, monkeypatch):
+    """The toggle persists in config/lease.json (other keys preserved),
+    registers the derived instance profile in the catalog and the
+    served specs, and unregisters on off."""
+    _seed_parallel_repo(tmp_path, monkeypatch)
+    out = lease.set_parallel(tmp_path, "workload", True)
+    assert out == {"action": "parallel-updated", "profile": "workload", "enabled": True, "instance": "workload2", "previous": False}
+    cfg = json.loads((tmp_path / "config" / "lease.json").read_text())
+    assert cfg["parallel"] == {"workload": True}
+    assert cfg["daily_cu_budget"] == 15 and cfg["enabled"] is True
+    catalog = lease.catalog_profiles(tmp_path)
+    inst = catalog["workload2"]
+    assert inst["session"] == "workload2" and inst["high_mem"] is True and inst["rate_cu_per_hour"] == 0.26
+    assert inst["parallel_of"] == "workload"
+    specs = {s["id"]: s for s in lease.specs(tmp_path)}
+    assert specs["workload"]["parallel"]["enabled"] is True
+    assert specs["workload2"]["parallel"] == {"eligible": False, "enabled": True, "instance": None, "parallel_of": "workload"}
+    out = lease.set_parallel(tmp_path, "workload", False)
+    assert out["enabled"] is False and out["previous"] is True
+    assert "workload2" not in lease.catalog_profiles(tmp_path)
+    cfg = json.loads((tmp_path / "config" / "lease.json").read_text())
+    assert cfg["parallel"] == {}
+
+
+def test_set_parallel_refusals(tmp_path, monkeypatch):
+    """Accelerator profiles and instances themselves are ineligible,
+    unknown profiles are refused, and toggle-off refuses while the
+    instance lease exists — the toggle never stops a session."""
+    _seed_parallel_repo(tmp_path, monkeypatch)
+    assert lease.set_parallel(tmp_path, "t4", True)["action"] == "parallel-ineligible"
+    assert lease.set_parallel(tmp_path, "nope", True)["action"] == "parallel-unknown-profile"
+    lease.set_parallel(tmp_path, "workload", True)
+    assert lease.set_parallel(tmp_path, "workload2", True)["action"] == "parallel-ineligible"
+    rec = {"profile": "workload2", "session": "workload2", "acquired_at": NOW.isoformat(), "deadline": (NOW + timedelta(hours=8)).isoformat(), "last_used_at": NOW.isoformat(), "jobs": []}
+    lease.save_record(tmp_path, rec)
+    assert lease.set_parallel(tmp_path, "workload", False)["action"] == "parallel-instance-live"
+    assert lease.parallel_enabled(tmp_path, "workload") is True  # unchanged by the refusal
+    lease.save_record(tmp_path, None, profile="workload2")
+    assert lease.set_parallel(tmp_path, "workload", False)["action"] == "parallel-updated"
+
+
+def test_default_profile_fails_loudly_without_the_config_key(tmp_path):
+    """Executable code resolves the default profile only from
+    config/profiles.json; a config without the key is an error,
+    never a silently substituted workload name (hardcode strip,
+    2026-11-03)."""
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "profiles.json").write_text(json.dumps({"profiles": {}}))
+    with pytest.raises(ValueError):
+        lease.default_profile(tmp_path)
+    (cfg_dir / "profiles.json").write_text(json.dumps({"default_profile": "someprofile", "profiles": {}}))
+    assert lease.default_profile(tmp_path) == "someprofile"

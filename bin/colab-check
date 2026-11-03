@@ -4,7 +4,7 @@ run check.py remotely with the probed worker count. Returns verdict + wall
 time.
 
 Usage: colab-check <check.py paths...> [--repo ID] [--variant NAME]
-       [--profile workload]
+       [--profile PROFILE]
 The repo comes from the local registry (config/repos.json): --repo, else
 its default_repo — no repo is named in this file. Its entry supplies the
 local checkout, the clone URL, the remote dest, the venv path, and the
@@ -61,10 +61,17 @@ def main() -> int:
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
         print("colab-check: STAGED — no colab login yet (see README).", file=sys.stderr)
         return 2
-    profile_name = "workload"
+    profiles_cfg = json.loads((REPO / "config" / "profiles.json").read_text())
     if "--profile" in sys.argv:
         profile_name = sys.argv[sys.argv.index("--profile") + 1]
-    profile = json.loads((REPO / "config" / "profiles.json").read_text())["profiles"][profile_name]
+    else:
+        # The default profile comes only from the config; no
+        # workload name is hardcoded here.
+        profile_name = profiles_cfg.get("default_profile")
+    if not profile_name:
+        print("colab-check: no --profile given and config/profiles.json has no default_profile", file=sys.stderr)
+        return 2
+    profile = profiles_cfg["profiles"][profile_name]
     session = profile["session"]
 
     registry = registry_mod.load_local_registry(REPO)

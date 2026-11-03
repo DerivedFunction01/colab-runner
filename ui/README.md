@@ -38,6 +38,18 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
   two-tier mode) are rendered from the core's `state.specs` list —
   every spec with its served label and `rate_cu_per_hour`; a null rate
   renders as "Cost unconfirmed", including in the projected cost.
+- `POST /api/config/parallel {profile, enabled}` — sets a base
+  profile's parallel-instance toggle (`bin/colab-lease parallel
+  <profile> --on|--off`). Eligible specs (CPU shapes, per the core's
+  served `parallel` block on each `state.specs` entry) render a
+  Parallel toggle on their picker row; a toggled-on instance renders
+  as its own lease card — a Start card while dormant, the ordinary
+  lease card while it runs. Instance start/stop ride the lease
+  endpoints above with the instance profile id; there are no
+  instance-specific endpoints. A core refusal (ineligible shape,
+  toggle-off while the instance lease is live) answers 200 with the
+  refusal action, like extend. Success appends a `parallel-changed`
+  outbox event.
 - `POST /api/server/restart` — spawns `ui/ui.sh restart` detached
   (path overridable via `COLAB_LEASE_UI_SH`) and answers
   `{action: "restart-requested"}` immediately. It is the degraded

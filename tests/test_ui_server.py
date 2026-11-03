@@ -428,3 +428,59 @@ def test_frontend_has_budget_cap_editor():
     assert "/api/config/budget" in js
     assert "budget-caps-changed" in js
     assert "Edit caps" in js
+
+
+def test_parallel_endpoint_invokes_core_and_appends_event(ui):
+    status, data = ui.post("/api/config/parallel", {"profile": "workload", "enabled": True})
+    assert status == 200
+    assert data["action"] == "parallel-updated"
+    assert data["instance"] == "workload2"
+    assert "parallel workload --on" in ui.invocations()
+    events = ui.outbox_events()
+    assert [e["kind"] for e in events] == ["parallel-changed"]
+    assert events[0]["detail"]["enabled"] is True
+    status, data = ui.post("/api/config/parallel", {"profile": "workload", "enabled": False})
+    assert status == 200
+    assert "parallel workload --off" in ui.invocations()
+
+
+def test_parallel_endpoint_rejects_bad_bodies(ui):
+    for payload in ({}, {"enabled": True}, {"profile": 5, "enabled": True}, {"profile": "workload"}, {"profile": "workload", "enabled": "yes"}, {"profile": "workload", "enabled": 1}):
+        status, _ = ui.post("/api/config/parallel", payload)
+        assert status == 400, payload
+    assert ui.invocations() == []  # nothing reached the core
+    assert ui.outbox_events() == []
+
+
+def test_parallel_core_refusal_answers_200_with_the_action(tmp_path):
+    """Like the extend endpoints: a core refusal is a 200 carrying
+    the refusal action (the page reads it and says why), and no
+    outbox event is appended for a change that did not happen."""
+    server = UiServer(tmp_path, extra_env={"STUB_PARALLEL_INELIGIBLE": "1"})
+    try:
+        status, data = server.post("/api/config/parallel", {"profile": "t4", "enabled": True})
+        assert status == 200
+        assert data["action"] == "parallel-ineligible"
+        assert server.outbox_events() == []
+    finally:
+        server.close()
+
+
+def test_instance_start_stop_route_through_lease_endpoints(ui):
+    """No new lease endpoints for instances: start/stop carry the
+    instance profile id through the existing routes."""
+    status, result = ui.post("/api/lease/start", {"profile": "workload2", "hours": 2})
+    assert status == 200 and result["action"] == "acquired"
+    assert "acquire workload2 --hours 2 --via panel" in ui.invocations()
+    status, result = ui.post("/api/lease/stop", {"profile": "workload2"})
+    assert status == 200 and result["action"] == "released"
+    assert "release workload2" in ui.invocations()
+
+
+def test_frontend_has_parallel_toggle_and_instance_card():
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    assert "/api/config/parallel" in js
+    assert "parallel-changed" in js
+    assert "data-parallel" in js  # the per-spec toggle, bound to the served block
+    assert "data-istart" in js  # the dormant instance card's Start
+    assert "parallelToggleHTML" in js

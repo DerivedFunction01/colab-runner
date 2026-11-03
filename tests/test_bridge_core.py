@@ -55,7 +55,7 @@ def make_repo(tmp_path):
     (repo / "snippets").mkdir(parents=True)
     (repo / "config" / "lease.json").write_text(json.dumps({"enabled": True, "standing": {"profile": "lobby"}}))
     (repo / "config" / "profiles.json").write_text(json.dumps({
-        "default": "workload",
+        "default_profile": "workload",
         "profiles": {
             "workload": {"session": "workload", "spec": "high-ram", "rate_cu_per_hour": 0.26, "high_mem": True},
             "lobby": {"session": "lobby", "spec": "standard", "rate_cu_per_hour": 0.08},

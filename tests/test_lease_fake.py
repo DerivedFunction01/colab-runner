@@ -147,3 +147,169 @@ def test_reap_renews_window_lease_with_fresh_session(tmp_path):
     sessions = Path(env["FAKE_COLAB_STATE"]) / "sessions"
     assert (sessions / after["session"] / "ACTIVE").exists()
     assert not (sessions / "standard" / "ACTIVE").exists()
+
+
+# --- Parallel instances (plan: .plans/2026-11-03-parallel-cpu-sessions.md) -----
+# The instance lifecycle at the module seam: a stateful in-process fake
+# of the colab callable drives lease.acquire/reap/release against a
+# scratch repo (config + symlinked snippets), so the exact CLI calls
+# issued — above all, the absence of `new`/`stop` on the adopt-foreign
+# path — are assertable.
+
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location("lease_mod", REPO / "sync" / "lease.py")
+lease_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(lease_mod)
+
+PNOW = datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc)
+
+
+class FakeColab:
+    """Stateful fake of the injected colab callable: a session set
+    plus a full call log."""
+
+    def __init__(self, alive=()):
+        self.alive = set(alive)
+        self.calls = []
+
+    def __call__(self, *a, **k):
+        self.calls.append(a)
+        cmd = a[0] if a else ""
+        if cmd == "usage":
+            return subprocess.CompletedProcess([], 0, "balance: 500 CU (fake)", "")
+        if cmd == "sessions":
+            return subprocess.CompletedProcess([], 0, json.dumps(sorted(self.alive)), "")
+        if cmd == "new":
+            self.alive.add(a[a.index("-s") + 1])
+            return subprocess.CompletedProcess([], 0, "created", "")
+        if cmd == "stop":
+            self.alive.discard(a[a.index("-s") + 1])
+            return subprocess.CompletedProcess([], 0, "stopped", "")
+        if cmd == "download":
+            return subprocess.CompletedProcess([], 1, "", "")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    def verbs(self):
+        return [c[0] for c in self.calls if c]
+
+
+def parallel_repo(tmp_path, monkeypatch, daily_cap=15):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "profiles.json").write_text(json.dumps({
+        "default_profile": "standard",
+        "profiles": {
+            "standard": {"label": "Standard", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "standard", "timeout": 3600},
+            "workload": {"label": "High-RAM", "high_mem": True, "rate_cu_per_hour": 0.26, "session": "workload", "timeout": 18000},
+        },
+    }))
+    (cfg_dir / "lease.json").write_text(json.dumps({
+        "enabled": True, "daily_cu_budget": daily_cap, "monthly_cu_budget": 150, "max_hours": 8,
+        "keepalive": {"enabled": True, "interval_seconds": 60, "pulse_seconds": 600, "stale_seconds": 600},
+    }, sort_keys=True, separators=(",", ":")))
+    (tmp_path / "snippets").symlink_to(REPO / "snippets")
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    return tmp_path
+
+
+def test_instance_create_via_derived_profile(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+    lease_mod.set_parallel(repo, "standard", True)
+    fake = FakeColab()
+    out = lease_mod.acquire(fake, repo, "standard2", now_dt=PNOW)
+    assert out["action"] == "created"
+    assert ("new", "-s", "standard2") in fake.calls
+    rec = lease_mod.load_record(repo, "standard2")
+    assert rec["profile"] == "standard2" and rec["session"] == "standard2"
+    assert rec["deadline"] == (PNOW + timedelta(hours=8)).isoformat()
+    assert (tmp_path / "var" / "lease-standard2.json").exists()
+
+
+def test_instance_adopt_foreign_live_session(tmp_path, monkeypatch):
+    """The workload2 path: a live session created outside the lease is
+    adopted — record written, keepalive ensured, kernel pulsed — with
+    no `new` and no `stop` issued against it, ever."""
+    repo = parallel_repo(tmp_path, monkeypatch)
+    lease_mod.set_parallel(repo, "standard", True)
+    fake = FakeColab(alive={"standard2"})  # the foreign session, already running
+    out = lease_mod.acquire(fake, repo, "standard2", now_dt=PNOW)
+    assert out["action"] == "adopted-foreign"
+    # No session is created or stopped. (A `new --help` catalog probe
+    # is not a creation: it carries no -s and names no session.)
+    assert not [c for c in fake.calls if c[0] == "new" and "-s" in c]
+    assert "stop" not in fake.verbs()
+    rec = out["record"]
+    assert rec["adopted_foreign"] is True
+    assert rec["session"] == "standard2"
+    assert out["pulse"] == "ok"
+    assert out["keepalive"] == "launched"
+    assert lease_mod.load_record(repo, "standard2")["session"] == "standard2"
+
+
+def test_instance_acquire_refused_when_toggle_off(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    out = lease_mod.acquire(fake, repo, "standard2", now_dt=PNOW)
+    assert out["action"] == "unknown-profile"
+    assert not [c for c in fake.calls if c[0] in ("new", "stop") and "-s" in c]  # nothing created or stopped
+
+
+def test_reap_covers_instances_independently(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+    lease_mod.set_parallel(repo, "standard", True)
+    fake = FakeColab(alive={"standard", "standard2"})
+    for profile, deadline in (("standard", PNOW + timedelta(hours=8)), ("standard2", PNOW + timedelta(hours=8))):
+        lease_mod.save_record(repo, {"profile": profile, "session": profile, "acquired_at": PNOW.isoformat(), "deadline": deadline.isoformat(), "last_used_at": PNOW.isoformat(), "last_pulse_at": PNOW.isoformat(), "jobs": []})
+    out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    assert {r["profile"]: r["action"] for r in out["records"]} == {"standard": "kept", "standard2": "kept"}
+    # Expire only the instance: it alone is released at its deadline.
+    rec = lease_mod.load_record(repo, "standard2")
+    rec["deadline"] = (PNOW - timedelta(hours=1)).isoformat()
+    lease_mod.save_record(repo, rec)
+    out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    assert {r["profile"]: r["action"] for r in out["records"]} == {"standard": "kept", "standard2": "released-deadline"}
+    assert lease_mod.load_record(repo, "standard") is not None
+    # A confirmed-dead instance session is cleared, the base untouched.
+    lease_mod.save_record(repo, {"profile": "standard2", "session": "standard2", "acquired_at": PNOW.isoformat(), "deadline": (PNOW + timedelta(hours=8)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
+    out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    assert {r["profile"]: r["action"] for r in out["records"]} == {"standard": "kept", "standard2": "cleared-dead"}
+
+
+def test_budget_guard_prices_the_sibling_window(tmp_path, monkeypatch):
+    """Daily cap 1.0: one 8 h standard window projects 0.64 and fits;
+    with the sibling's identical window live, either side's acquire
+    is refused — the pair is priced as the sum it commits (1.28)."""
+    repo = parallel_repo(tmp_path, monkeypatch, daily_cap=1.0)
+    lease_mod.set_parallel(repo, "standard", True)
+    fake = FakeColab(alive={"standard"})
+    lease_mod.save_record(repo, {"profile": "standard", "session": "standard", "acquired_at": PNOW.isoformat(), "deadline": (PNOW + timedelta(hours=8)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
+    out = lease_mod.acquire(fake, repo, "standard2", now_dt=PNOW)
+    assert out["action"] == "refused-budget"
+    assert out["budget"]["reason"] == "daily-budget"
+    assert out["budget"]["sibling_projected"] == 0.64
+    # Control: with the sibling record gone the same acquire fits.
+    lease_mod.save_record(repo, None, profile="standard")
+    fake2 = FakeColab()
+    out = lease_mod.acquire(fake2, repo, "standard2", now_dt=PNOW)
+    assert out["action"] == "created"
+    # And the mirror direction: the base prices the instance's window.
+    rec = lease_mod.load_record(repo, "standard2")
+    assert rec["deadline"] == (PNOW + timedelta(hours=8)).isoformat()
+    out = lease_mod.acquire(FakeColab(alive={"standard2"}), repo, "standard", now_dt=PNOW)
+    assert out["action"] == "refused-budget"
+    assert out["budget"]["sibling_projected"] == 0.64
+
+
+def test_spend_journal_keys_instance_segments_by_session(tmp_path, monkeypatch):
+    """No journal change was needed: a released instance journals its
+    segment under its own profile and session at the shared rate."""
+    repo = parallel_repo(tmp_path, monkeypatch)
+    lease_mod.set_parallel(repo, "standard", True)
+    fake = FakeColab()
+    lease_mod.acquire(fake, repo, "standard2", now_dt=PNOW)
+    out = lease_mod.release(fake, repo, profile="standard2", now_dt=PNOW + timedelta(hours=1))
+    assert out["action"] == "released"
+    lines = (tmp_path / "var" / "lease-spend-journal.jsonl").read_text().strip().split("\n")
+    seg = json.loads(lines[-1])
+    assert seg["profile"] == "standard2" and seg["session"] == "standard2" and seg["rate"] == 0.08

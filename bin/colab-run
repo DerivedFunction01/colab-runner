@@ -194,8 +194,15 @@ def main() -> int:
     for f in findings:
         print(f"orphan sweep: {f['run_id']} ({f['job']}) — {f['action']}")
 
-    profile_name = job.get("profile", "workload")
-    profile = json.loads((REPO / "config" / "profiles.json").read_text())["profiles"][profile_name]
+    profiles_cfg = json.loads((REPO / "config" / "profiles.json").read_text())
+    # A manifest may name its profile; otherwise the config's
+    # default_profile is the only fallback — no workload name is
+    # hardcoded here.
+    profile_name = job.get("profile") or profiles_cfg.get("default_profile")
+    if not profile_name or profile_name not in profiles_cfg["profiles"]:
+        print(f"colab-run: job {job_name} names no usable profile (manifest profile or config default_profile required)", file=sys.stderr)
+        return 2
+    profile = profiles_cfg["profiles"][profile_name]
     session = profile["session"]
     run_id = resume or f"{job_name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     rec = {"run_id": run_id, "job": job_name, "session": session, "state": "starting", "started_at": now(), "resumed": bool(resume)}

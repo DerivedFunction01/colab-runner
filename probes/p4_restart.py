@@ -44,7 +44,7 @@ def main() -> int:
         sessions = home / ".config" / "colab-cli" / "sessions.json"
         token.parent.mkdir(parents=True)
         token.write_text('{"refresh": "survival-v1"}')
-        sessions.write_text('{"workload": {"id": "fake"}}')
+        sessions.write_text('{"fake-session": {"id": "fake"}}')
         mirror("capture", home)
         mirror_token = REPO / "state" / "transient" / "colab-cli" / "token.json"
         mirror_sessions = REPO / "state" / "transient" / "colab-cli" / "sessions.json"

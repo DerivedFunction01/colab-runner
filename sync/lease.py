@@ -54,14 +54,15 @@ def load_profiles(repo: Path) -> dict:
 
 def catalog_profiles(repo: Path, colab=None) -> dict:
     """The full spec catalog: the configured profiles merged with the
-    dynamic CLI shapes they do not cover (see _cli_shapes). Callers
-    without a colab callable get the configured profiles plus
-    whatever the cache holds."""
+    dynamic CLI shapes they do not cover (see _cli_shapes), plus the
+    derived parallel-instance profiles whose toggles are on (see the
+    parallel-instances section below). Callers without a colab
+    callable get the configured profiles plus whatever the cache
+    holds."""
     configured = load_profiles(repo)
     shapes, _err = _cli_shapes(repo, colab)
-    if not shapes:
-        return configured
-    return {**configured, **_dynamic_profiles(shapes, configured)}
+    merged = {**configured, **_dynamic_profiles(shapes, configured)} if shapes else dict(configured)
+    return _with_parallel_instances(repo, merged)
 
 
 # --- The dynamic spec catalog -------------------------------------------------
@@ -171,7 +172,129 @@ def _dynamic_profiles(shapes: dict, configured: dict) -> dict:
 
 
 def default_profile(repo: Path) -> str:
-    return load_json(repo / "config" / "profiles.json", {}).get("default_profile", "workload")
+    """The default profile id, resolved only from
+    config/profiles.json's `default_profile` — executable code
+    carries no workload-name fallback. A config without the key is
+    a configuration error and fails loudly here rather than
+    silently naming a workload."""
+    name = load_json(repo / "config" / "profiles.json", {}).get("default_profile")
+    if not name:
+        raise ValueError("config/profiles.json has no default_profile")
+    return name
+
+
+# --- Parallel instances ---------------------------------------------------------
+# A low-tier CPU profile may run ONE extra session next to its primary
+# (plan: .plans/2026-11-03-parallel-cpu-sessions.md). The instance is a
+# derived profile — base id + "2", base session + "2", same shape and
+# measured rate, its own per-profile record — so every profile-keyed
+# path (acquire, reap, keepalive, spend, state, panel start/stop)
+# covers it with no parallel code path. Eligibility is a backend
+# determination, served ready by specs(): CPU shapes only. GPU and
+# TPU shapes are excluded — per-account accelerator concurrency is
+# unverified and accelerator rates are unmeasured. The toggle is per
+# base profile in config/lease.json ("parallel": {profile: true}),
+# default off; toggling on registers the instance in the catalog and
+# starts nothing, and toggling off refuses while the instance lease
+# exists (the toggle never stops a session).
+
+
+def parallel_eligible(profile: dict) -> bool:
+    """CPU shapes only: no GPU, no TPU (see the section note above)."""
+    return not profile.get("gpu") and not profile.get("tpu")
+
+
+def instance_profile_id(base_profile: str) -> str:
+    return base_profile + "2"
+
+
+def parallel_toggles(repo: Path) -> dict:
+    raw = load_config(repo).get("parallel")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def parallel_enabled(repo: Path, profile_name: str) -> bool:
+    return bool(parallel_toggles(repo).get(profile_name))
+
+
+def _with_parallel_instances(repo: Path, profiles: dict) -> dict:
+    """Add the derived instance profile for every toggled-on eligible
+    base in `profiles`. An instance never derives further (one extra
+    per profile), and a pre-existing profile under the instance id
+    wins — derivation never shadows a configured profile."""
+    toggles = parallel_toggles(repo)
+    if not toggles:
+        return profiles
+    out = dict(profiles)
+    for base_id, profile in profiles.items():
+        if profile.get("parallel_of") or not toggles.get(base_id) or not parallel_eligible(profile):
+            continue
+        inst_id = instance_profile_id(base_id)
+        if inst_id in out:
+            continue
+        inst = dict(profile)
+        inst["session"] = (profile.get("session") or base_id) + "2"
+        inst["label"] = f"{profile.get('label') or base_id} (parallel)"
+        inst["parallel_of"] = base_id
+        out[inst_id] = inst
+    return out
+
+
+def parallel_sibling(repo: Path, profile_name: str) -> str | None:
+    """The other half of a parallel pair: for an instance profile its
+    base, for a base profile its registered instance, else None."""
+    catalog = catalog_profiles(repo)
+    profile = catalog.get(profile_name)
+    if profile is None:
+        return None
+    if profile.get("parallel_of"):
+        return profile["parallel_of"]
+    inst_id = instance_profile_id(profile_name)
+    return inst_id if inst_id in catalog else None
+
+
+def set_parallel(repo: Path, profile_name: str, enabled: bool) -> dict:
+    """Set one base profile's parallel toggle in config/lease.json —
+    the panel's per-profile switch (the budget caps' sibling seam:
+    validated here in the core, written atomically as a tmp sibling +
+    rename in the file's compact sorted style, every other key
+    preserved). Enabling registers the derived instance profile in
+    the served catalog; it starts nothing.
+
+    Refusals: parallel-invalid (config unreadable, or the parallel
+    section is not an object), parallel-unknown-profile (not in the
+    catalog), parallel-ineligible (an accelerator shape, or the
+    profile is itself an instance), parallel-instance-live
+    (disabling while the instance lease exists)."""
+    path = repo / "config" / "lease.json"
+    try:
+        cfg = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"action": "parallel-invalid", "error": "config/lease.json is unreadable"}
+    if not isinstance(cfg, dict):
+        return {"action": "parallel-invalid", "error": "config/lease.json is not a JSON object"}
+    raw = cfg.get("parallel")
+    if raw is not None and not isinstance(raw, dict):
+        return {"action": "parallel-invalid", "error": "config parallel section is not an object"}
+    profile = catalog_profiles(repo).get(profile_name)
+    if profile is None:
+        return {"action": "parallel-unknown-profile", "profile": profile_name}
+    inst_id = instance_profile_id(profile_name)
+    if profile.get("parallel_of") or not parallel_eligible(profile):
+        return {"action": "parallel-ineligible", "profile": profile_name}
+    if not enabled and load_record(repo, inst_id) is not None:
+        return {"action": "parallel-instance-live", "profile": profile_name, "instance": inst_id}
+    previous = bool((raw or {}).get(profile_name))
+    toggles = dict(raw or {})
+    if enabled:
+        toggles[profile_name] = True
+    else:
+        toggles.pop(profile_name, None)
+    cfg["parallel"] = toggles
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, sort_keys=True, separators=(",", ":")))
+    os.replace(tmp, path)
+    return {"action": "parallel-updated", "profile": profile_name, "enabled": bool(enabled), "instance": inst_id, "previous": previous}
 
 
 def record_path(repo: Path) -> Path:
@@ -446,6 +569,12 @@ def budget_check(colab, repo: Path, cfg: dict, profile: dict, hours: float | Non
     `caps_override` (a grant's snapshot caps, served shape) replaces
     the config caps for this check; without it the live config caps
     price the window, exactly as before the envelope.
+
+    Parallel instances: when the profile has a parallel sibling with
+    a live record, the sibling's remaining window (rate x time to
+    its deadline) is added to this window's projection for the
+    floor and the daily/monthly caps, and reported as
+    "sibling_projected" — the pair is priced as the sum it commits.
     Returns {"ok": bool, ...}."""
     try:
         usage_res = colab("usage", timeout=120)
@@ -487,25 +616,64 @@ def budget_check(colab, repo: Path, cfg: dict, profile: dict, hours: float | Non
         if profile_day_spent is not None:
             out["profile_day_spent"] = round(profile_day_spent, 2)
         return out
-    if projected > balance:
+    # Parallel instances: the sibling instance's remaining window is
+    # already committed burn, so it prices into this guard alongside
+    # the new window — two concurrent windows must not each pass a
+    # guard that their sum would fail. The sibling's elapsed burn is
+    # already inside day/month spent via its live record.
+    sibling_projected = _sibling_projection(repo, profile_name, now_dt or datetime.now(timezone.utc)) if profile_name is not None else 0.0
+    committed = projected + sibling_projected
+    if committed > balance:
         # The floor: caps throttle the repo's own burn, but no
         # window may promise more than the account actually holds.
-        return {"ok": False, "reason": "balance-insufficient", "projected": round(projected, 2), "balance": balance, "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
+        out = {"ok": False, "reason": "balance-insufficient", "projected": round(projected, 2), "balance": balance, "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
+        if sibling_projected:
+            out["sibling_projected"] = round(sibling_projected, 2)
+        return out
     daily_cap = cap("daily", cfg.get("daily_cu_budget"))
     monthly_cap = cap("monthly", cfg.get("monthly_cu_budget"))
-    if daily_cap is not None and day_spent + projected > daily_cap:
-        return {"ok": False, "reason": "daily-budget", "day_spent": round(day_spent, 2), "projected": round(projected, 2), "cap": daily_cap, "balance": balance}
-    if monthly_cap is not None and month_spent + projected > monthly_cap:
-        return {"ok": False, "reason": "monthly-budget", "month_spent": round(month_spent, 2), "projected": round(projected, 2), "cap": monthly_cap, "balance": balance}
+    if daily_cap is not None and day_spent + committed > daily_cap:
+        out = {"ok": False, "reason": "daily-budget", "day_spent": round(day_spent, 2), "projected": round(projected, 2), "cap": daily_cap, "balance": balance}
+        if sibling_projected:
+            out["sibling_projected"] = round(sibling_projected, 2)
+        return out
+    if monthly_cap is not None and month_spent + committed > monthly_cap:
+        out = {"ok": False, "reason": "monthly-budget", "month_spent": round(month_spent, 2), "projected": round(projected, 2), "cap": monthly_cap, "balance": balance}
+        if sibling_projected:
+            out["sibling_projected"] = round(sibling_projected, 2)
+        return out
     standing_cfg = cfg.get("standing", {})
     if profile_name is not None and profile_name == standing_cfg.get("profile", "lobby"):
         standing_cap = cap("standing_daily", standing_cfg.get("daily_cu_cap"))
         if standing_cap is not None and profile_day_spent is not None and profile_day_spent + projected > float(standing_cap):
             return {"ok": False, "reason": "standing-budget", "profile": profile_name, "profile_day_spent": round(profile_day_spent, 2), "projected": round(projected, 2), "cap": standing_cap, "balance": balance}
     out = {"ok": True, "balance": balance, "projected": round(projected, 2), "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
+    if sibling_projected:
+        out["sibling_projected"] = round(sibling_projected, 2)
     if profile_day_spent is not None:
         out["profile_day_spent"] = round(profile_day_spent, 2)
     return out
+
+
+def _sibling_projection(repo: Path, profile_name: str, now_dt: datetime) -> float:
+    """The parallel sibling's remaining committed window cost: its
+    catalog rate x the time left to its record's deadline. Zero when
+    there is no sibling, no sibling record, an expired sibling
+    window, or an unconfirmed sibling rate (nothing fabricated)."""
+    sibling = parallel_sibling(repo, profile_name)
+    if sibling is None:
+        return 0.0
+    rec = load_record(repo, sibling)
+    if rec is None:
+        return 0.0
+    try:
+        remaining_h = (parse_dt(rec["deadline"]) - now_dt).total_seconds() / 3600.0
+    except (KeyError, ValueError):
+        return 0.0
+    if remaining_h <= 0:
+        return 0.0
+    rate = _profile_rate(repo, sibling)
+    return rate * remaining_h if rate is not None else 0.0
 
 
 def local_sessions_path() -> Path:
@@ -749,12 +917,22 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     via of whoever created it. While a grant is active, an
     out-of-scope creation carries neither stamp — attribution is
     envelope-scoped, so a lease outside the envelope is
-    indistinguishable from an ordinary lease."""
+    indistinguishable from an ordinary lease.
+
+    Adopt-foreign (parallel instances): an instance profile with no
+    record whose session already exists live — created outside the
+    lease, e.g. by a direct CLI call — is adopted instead of created:
+    the budget check prices a fresh window from now, the record is
+    written against the existing session, and keepalive + pulse
+    prove it, with no `new` and no `stop` issued against it. An
+    unreadable session list refuses (acquire-unknown), never acts."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     if not cfg.get("enabled"):
         return {"action": "lease-disabled"}
     profiles = catalog_profiles(repo, colab)
+    if profile_name not in profiles:
+        return {"action": "unknown-profile", "profile": profile_name}
     profile = profiles[profile_name]
     session = profile["session"]
     grant = active_grant(repo, now_dt)
@@ -801,10 +979,19 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     budget = budget_check(colab, repo, cfg, profile, hours=effective_hours, profile_name=profile_name, caps_override=caps_override, now_dt=now_dt)
     if not budget["ok"]:
         return {"action": "refused-budget", "budget": budget}
-    args = ["new", "-s", session] + (["--high-mem"] if profile.get("high_mem") else []) + (["--gpu", profile["gpu"]] if profile.get("gpu") else []) + (["--tpu", profile["tpu"]] if profile.get("tpu") else [])
-    r = colab(*args, timeout=600)
-    if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
-        return {"action": "create-failed", "error": (r.stderr or r.stdout).strip()[-300:]}
+    # Adopt-foreign: an instance profile whose session is already
+    # live takes the record below without a `new` (see the docstring).
+    adopted_foreign = False
+    if profile.get("parallel_of"):
+        fstate = session_state(colab, session)
+        if fstate == "unknown":
+            return {"action": "acquire-unknown", "session": session}
+        adopted_foreign = fstate == "alive"
+    if not adopted_foreign:
+        args = ["new", "-s", session] + _session_shape_args(profile)
+        r = colab(*args, timeout=600)
+        if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
+            return {"action": "create-failed", "error": (r.stderr or r.stdout).strip()[-300:]}
     deadline = now_dt + timedelta(hours=effective_hours)
     rec = {
         "profile": profile_name,
@@ -815,6 +1002,8 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
         "jobs": [],
         "budget_at_acquire": budget,
     }
+    if adopted_foreign:
+        rec["adopted_foreign"] = True
     if in_scope:
         rec["envelope_id"] = grant["granted_at"]
     if via and (grant is None or in_scope):
@@ -830,7 +1019,7 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     rec["last_pulse_at"] = now_dt.isoformat()
     rec["last_pulse_result"] = pulse_result
     save_record(repo, rec)
-    out = {"action": "created", "record": rec, "pulse": pulse_result, **ka}
+    out = {"action": "adopted-foreign" if adopted_foreign else "created", "record": rec, "pulse": pulse_result, **ka}
     if rec.get("renew"):
         kit = install_renewal_kit(colab, repo, rec, now_dt)
         out["kit"] = kit
@@ -872,7 +1061,7 @@ def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime 
         return {"action": "extend-unknown", "session": rec["session"]}
     if state == "absent" and not rec.get("renew"):
         return {"action": "extend-no-lease", "session": rec["session"]}
-    profile = load_profiles(repo)[profile_name]
+    profile = catalog_profiles(repo)[profile_name]
     budget = budget_check(colab, repo, cfg, profile, hours=float(hours), profile_name=profile_name, now_dt=now_dt)
     if not budget["ok"]:
         return {"action": "refused-budget", "budget": budget}
@@ -1053,7 +1242,10 @@ def _renew_fresh_session(colab, repo: Path, cfg: dict, rec: dict, now_dt: dateti
     time and renewal never re-prices it. The fresh session gets the
     renewal kit, so the next renewal can be driver 1. The old session
     is stopped once the record has swapped."""
-    profile = load_profiles(repo).get(rec.get("profile"), {})
+    # The catalog, not the configured profiles alone: a parallel
+    # instance's shape (and its renewal session naming) derives from
+    # its base through the derived catalog entry.
+    profile = catalog_profiles(repo).get(rec.get("profile"), {})
     base = profile.get("session") or rec["session"]
     new_session = f"{base}-r{int(now_dt.timestamp())}"
     try:
@@ -1436,9 +1628,10 @@ def specs(repo: Path, colab=None) -> list[dict]:
     the display name from the catalog (a profile id is an internal
     name; the UI shows labels); a profile without one falls back to
     its id."""
+    toggles = parallel_toggles(repo)
     out = []
     for profile_id, profile in catalog_profiles(repo, colab).items():
-        out.append({
+        entry = {
             "id": profile_id,
             "label": profile.get("label") or profile_id,
             "session": profile.get("session"),
@@ -1447,7 +1640,17 @@ def specs(repo: Path, colab=None) -> list[dict]:
             "high_mem": bool(profile.get("high_mem", False)),
             "rate_cu_per_hour": profile.get("rate_cu_per_hour"),
             "timeout": profile.get("timeout"),
-        })
+        }
+        # The parallel block is served ready (eligibility, toggle
+        # state, instance id): the UI renders it and decides nothing.
+        # An instance spec names its base and is itself ineligible —
+        # one extra instance per profile.
+        base = profile.get("parallel_of")
+        if base:
+            entry["parallel"] = {"eligible": False, "enabled": True, "instance": None, "parallel_of": base}
+        else:
+            entry["parallel"] = {"eligible": parallel_eligible(profile), "enabled": bool(toggles.get(profile_id)), "instance": instance_profile_id(profile_id)}
+        out.append(entry)
     return out
 
 

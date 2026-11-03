@@ -307,7 +307,13 @@ def test_state_specs_and_shape(tmp_path):
     assert specs["lobby"]["rate_cu_per_hour"] == 0.08
     assert specs["lobby"]["session"] == "lobby"
     assert specs["t4"]["gpu"] == "T4"
-    assert set(specs["workload"]) == {"id", "label", "session", "gpu", "tpu", "high_mem", "rate_cu_per_hour", "timeout"}
+    assert set(specs["workload"]) == {"id", "label", "session", "gpu", "tpu", "high_mem", "rate_cu_per_hour", "timeout", "parallel"}
+    # The parallel block is served ready (parallel-instances plan):
+    # CPU eligible with the live toggle state (workload's is on in the
+    # live config), the T4 ineligible.
+    live_cfg = json.loads((REPO / "config" / "lease.json").read_text())
+    assert specs["workload"]["parallel"] == {"eligible": True, "enabled": bool((live_cfg.get("parallel") or {}).get("workload")), "instance": "workload2"}
+    assert specs["t4"]["parallel"]["eligible"] is False
     assert specs["workload"]["label"] == "High-RAM"
     assert st["records"] == []
     assert st["grant"] is None

@@ -3,6 +3,6 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
 wrap_enter
-PROFILE="${1:-workload}"
+PROFILE="${1:-$(default_profile)}"
 SESSION="$(profile_field "$PROFILE" session)"
 "$COLAB_BIN" --auth oauth2 stop -s "$SESSION"

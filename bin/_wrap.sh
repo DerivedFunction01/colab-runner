@@ -13,8 +13,19 @@ wrap_enter() { "$PY" "$REPO_ROOT/ops/mirror_transient.py" restore >/dev/null 2>&
 wrap_exit() { "$PY" "$REPO_ROOT/ops/mirror_transient.py" capture >/dev/null 2>&1 || true; }
 trap wrap_exit EXIT
 
+default_profile() { # -> the config's default profile id; fails loudly when absent
+  "$PY" - "$REPO_ROOT/config/profiles.json" <<'EOF'
+import json, sys
+name = json.load(open(sys.argv[1])).get("default_profile")
+if not name:
+    print("error: config/profiles.json has no default_profile", file=sys.stderr)
+    sys.exit(1)
+print(name)
+EOF
+}
+
 profile_args() { # profile name -> CLI args for `colab new`
-  "$PY" - "$REPO_ROOT/config/profiles.json" "${1:-workload}" <<'EOF'
+  "$PY" - "$REPO_ROOT/config/profiles.json" "${1:-$(default_profile)}" <<'EOF'
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 p = cfg["profiles"][sys.argv[2]]
@@ -26,5 +37,5 @@ print(" ".join(args))
 EOF
 }
 profile_field() { # profile name, field -> value
-  "$PY" -c "import json,sys; print(json.load(open('$REPO_ROOT/config/profiles.json'))['profiles'][sys.argv[1]][sys.argv[2]])" "${1:-workload}" "$2"
+  "$PY" -c "import json,sys; print(json.load(open('$REPO_ROOT/config/profiles.json'))['profiles'][sys.argv[1]][sys.argv[2]])" "${1:-$(default_profile)}" "$2"
 }

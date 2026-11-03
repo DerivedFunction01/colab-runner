@@ -26,7 +26,7 @@ def require_login(probe: str) -> None:
             f"{probe}: STAGED — no colab login on this machine yet.\n"
             "One-time setup (the operator):\n"
             "  bash ops/bootstrap_local.sh\n"
-            "  colab --auth oauth2 new -s workload --high-mem   # open the printed URL, paste the code back\n"
+            "  colab --auth oauth2 new -s <session> --high-mem   # open the printed URL, paste the code back\n"
             f"Then run: python3 probes/{probe}.py",
             file=sys.stderr,
         )

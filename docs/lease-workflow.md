@@ -447,3 +447,50 @@ child cap refused a fourth mint by name; an external kill was
 re-armed by the duty within one pass, sequence and registry
 intact. The generation-change drill was not run live (the lobby
 was the operator's live grant asset); its logic is unit-tested.
+
+## Parallel instances for low-tier CPU profiles (2026-11-03)
+
+An eligible profile may run one extra session next to its primary
+(plan: `.plans/2026-11-03-parallel-cpu-sessions.md`). Eligibility
+is the lease core's determination, served ready in each spec's
+`parallel` block: CPU shapes only — no GPU, no TPU (per-account
+accelerator concurrency is unverified and accelerator rates are
+unmeasured; widening is a rule change in `parallel_eligible`, not
+a rebuild). At most one extra instance per profile.
+
+The instance is a derived profile, not a new lease kind: its
+profile id and session name are the base's plus `2` (the High-RAM
+instance is profile `workload2`, session `workload2`), with the base's
+shape and measured rate and its own record
+(`var/lease-workload2.json`). Every profile-keyed path — acquire,
+reap, keepalive, kernel pulse, renewal, spend — covers it
+unchanged; spend segments journal under the instance's own
+profile and session at the shared rate.
+
+The toggle is per base profile in `config/lease.json`
+(`"parallel": {<profile>: true}`), default off, set from the
+panel (`POST /api/config/parallel`, riding `bin/colab-lease
+parallel <profile> --on|--off`) or the CLI verb directly.
+Toggling on registers the instance in the served catalog and
+starts nothing; toggling off refuses while the instance lease
+exists — the toggle never stops a session.
+
+Adopt-foreign: acquiring an instance whose session already
+exists live (created outside the lease, e.g. by a direct CLI
+call) writes the record against the existing session and proves
+it with keepalive + kernel pulse — no `new` and no `stop` are
+issued against it. An unreadable session list refuses
+(`acquire-unknown`), as everywhere. The budget guard prices the
+pair as the sum it commits: either side's check adds the
+sibling's remaining window (rate × time to its deadline,
+reported as `sibling_projected`) to its own projection for the
+balance floor and the daily/monthly caps.
+
+Live proof (2026-11-03): the CLI-created `workload2` High-RAM
+session was adopted in place (`adopted-foreign`, pulse ok,
+keepalive launched, sibling projection 1.59 CU priced against
+the primary's remaining window) with the primary workload lease's
+session and deadline untouched, and the reaper kept both across
+subsequent cycles. The stop path was proven on a standard-tier
+instance instead: `standard2` created, pulsed, released, and
+journaled at 0.08 CU/h, after which its toggle came off cleanly.

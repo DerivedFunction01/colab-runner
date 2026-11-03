@@ -9,6 +9,8 @@ $STUB_EXTEND_REFUSE=1 makes `extend` answer refused-budget and
 `extend-grant` answer grant-inactive, both with exit 1 (a core refusal).
 $STUB_CAPS_INVALID=1 makes `budget-caps` answer caps-invalid with
 exit 1 (the core rejecting a cap update).
+$STUB_PARALLEL_INELIGIBLE=1 makes `parallel` answer
+parallel-ineligible with exit 1 (the core refusing a toggle).
 
 The `state` shape mirrors sync/lease.py's state() exactly: records
 are status entries wrapping the lease record, the budget carries its
@@ -95,10 +97,10 @@ def main(argv):
             # t4's rate is null on purpose: the core's rate table prices
             # only the CPU tiers, so the UI must render "Cost unconfirmed".
             "specs": [
-                {"id": "workload", "label": "High-RAM", "session": "workload", "gpu": None, "high_mem": True, "rate_cu_per_hour": 0.26, "timeout": 18000},
-                {"id": "lobby", "label": "Lobby", "session": "lobby", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600},
-                {"id": "standard", "label": "Standard", "session": "standard", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600},
-                {"id": "t4", "label": "T4", "session": "t4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "timeout": 18000},
+                {"id": "workload", "label": "High-RAM", "session": "workload", "gpu": None, "high_mem": True, "rate_cu_per_hour": 0.26, "timeout": 18000, "parallel": {"eligible": True, "enabled": False, "instance": "workload2"}},
+                {"id": "lobby", "label": "Lobby", "session": "lobby", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "parallel": {"eligible": True, "enabled": False, "instance": "lobby2"}},
+                {"id": "standard", "label": "Standard", "session": "standard", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "parallel": {"eligible": True, "enabled": False, "instance": "standard2"}},
+                {"id": "t4", "label": "T4", "session": "t4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "timeout": 18000, "parallel": {"eligible": False, "enabled": False, "instance": "t42"}},
             ],
         }
     elif cmd == "acquire":
@@ -135,6 +137,11 @@ def main(argv):
                     value = float(raw)
                     caps[key] = int(value) if value.is_integer() else value
         out = {"action": "caps-updated", "caps": caps, "previous": previous}
+    elif cmd == "parallel":
+        if os.environ.get("STUB_PARALLEL_INELIGIBLE") == "1":
+            print(json.dumps({"action": "parallel-ineligible", "profile": argv[1] if len(argv) > 1 else None}))
+            return 1
+        out = {"action": "parallel-updated", "profile": argv[1], "enabled": "--on" in argv, "instance": argv[1] + "2", "previous": False}
     elif cmd == "ungrant":
         out = {"action": "grant-ended"}
     else:
