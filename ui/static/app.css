@@ -493,6 +493,14 @@ button.block { display: block; width: 100%; min-height: 40px; font-size: var(--w
 .log-empty { padding: var(--wb-space-12) 0; font-size: var(--wb-font-size-sm); }
 #logs-foot { margin-top: var(--wb-space-8); }
 
+/* Per-portion load state (progressive loading): a small line in
+   each section naming its own loading / stale / error state. */
+.part-status { margin: 0 0 var(--wb-space-8); font-size: var(--wb-font-size-sm); color: var(--wb-content-muted); }
+.part-status:empty { display: none; }
+.part-status.inline { margin: 0 0 0 var(--wb-space-8); }
+.part-status.err { color: var(--wb-status-error, #b3261e); }
+.part-retry { background: none; border: none; padding: 0; font: inherit; color: inherit; text-decoration: underline; cursor: pointer; }
+
 @media (max-width: 640px) {
   .tl-row { grid-template-columns: 68px 16px 1fr; }
 }

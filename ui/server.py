@@ -41,6 +41,8 @@ FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error",
 BUDGET_CAP_FIELDS = {"daily_cu_budget": "--daily", "monthly_cu_budget": "--monthly", "standing_daily_cu_cap": "--standing-daily"}
 CORE_TIMEOUT_S = 1800
 
+STATE_PARTS = ("records", "specs", "budget", "grant", "meta")
+
 
 def lease_bin() -> str:
     return os.environ.get("COLAB_LEASE_BIN", str(REPO / "bin" / "colab-lease"))
@@ -273,6 +275,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/state":
             return self.api_state()
+        if parsed.path.startswith("/api/state/"):
+            part = parsed.path[len("/api/state/"):]
+            if part in STATE_PARTS:
+                return self.api_state_part(part)
+            return self.send_json(404, {"error": f"unknown state part {part!r}"})
         if parsed.path == "/api/outbox":
             return self.api_outbox(parsed)
         return self.serve_static(parsed.path)
@@ -286,6 +293,24 @@ class Handler(BaseHTTPRequestHandler):
         payload = dict(result)
         payload["profiles"] = profiles
         payload["caps"] = caps
+        return self.send_json(200, payload)
+
+    def api_state_part(self, part: str) -> None:
+        """One portion of the state read. Portions fail alone: a
+        502 here names only its own portion, and no other portion's
+        endpoint is affected."""
+        drain_reaper_events()
+        rc, result, err = run_core("state", "--part", part)
+        if not isinstance(result, dict):
+            return self.send_json(502, {"error": f"lease core state {part} unavailable", "detail": err, "rc": rc})
+        payload = dict(result)
+        if part in ("specs", "budget"):
+            # The repo-file config rides the portions whose sections
+            # render it (control renders profiles, budget renders
+            # caps) — both are instant local reads.
+            profiles, caps = repo_config()
+            payload["profiles"] = profiles
+            payload["caps"] = caps
         return self.send_json(200, payload)
 
     def api_outbox(self, parsed) -> None:

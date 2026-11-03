@@ -55,7 +55,9 @@ def main(argv):
     if not argv:
         return 2
     cmd = argv[0]
-    if os.environ.get("STUB_LEASE_FAIL") == cmd:
+    fail = os.environ.get("STUB_LEASE_FAIL")
+    part = argv[argv.index("--part") + 1] if "--part" in argv else None
+    if fail == cmd or (part is not None and fail == f"{cmd}:{part}"):
         print("stub failure", file=sys.stderr)
         return 3
     if cmd == "state":
@@ -102,7 +104,17 @@ def main(argv):
                 {"id": "standard", "label": "Standard", "session": "standard", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "parallel": {"eligible": True, "enabled": False, "instance": "standard2"}},
                 {"id": "t4", "label": "T4", "session": "t4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "timeout": 18000, "parallel": {"eligible": False, "enabled": False, "instance": "t42"}},
             ],
+            "bridge": None,
         }
+        if part is not None:
+            slices = {
+                "records": {"records": out["records"]},
+                "specs": {"specs": out["specs"]},
+                "budget": {"budget": out["budget"]},
+                "grant": {"grant": out["grant"], "envelope": out["envelope"]},
+                "meta": {"bridge": out["bridge"]},
+            }
+            out = slices[part]
     elif cmd == "acquire":
         out = {"action": "acquired", "record": record(argv[1] if len(argv) > 1 else "workload")}
     elif cmd == "extend":

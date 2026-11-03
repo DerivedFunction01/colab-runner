@@ -61,7 +61,8 @@
     <b>Lease server unreachable</b>
     <p class="kvline">The panel can’t reach the lease server on this machine.
       Any running lease is unaffected — its deadline is enforced whether or not
-      this page loads. The panel never shows stale state as live.</p>
+      this page loads. Sections that already loaded keep their last data,
+      labeled with its age.</p>
     <div class="degraded-actions">
       <button id="retry-btn" class="primary" type="button">Try again</button>
       <button id="restart-btn" class="ghost" type="button">Restart lease server</button>
@@ -71,13 +72,16 @@
   <div id="layout" class="layout">
     <div class="col-main">
       <section id="slot-leases">
+        <p class="part-status" data-part-status="grant">Loading…</p>
         <div id="grant-card"></div>
-        <div id="lease-cards" class="cards"></div>
+        <p class="part-status" data-part-status="records">Loading…</p>
+        <div id="lease-cards" class="cards"><p class="kvline muted">Loading leases…</p></div>
       </section>
       <section id="slot-events">
         <div class="card">
           <div class="logs-head">
             <b>Logs</b>
+            <span class="part-status inline" data-part-status="logs">Loading…</span>
           </div>
           <div id="logs-legend" class="logs-legend"></div>
           <div class="chips logs-filters" id="logs-filters">
@@ -87,24 +91,26 @@
             <button type="button" data-lfilter="budget">Budget</button>
             <button type="button" data-lfilter="errors">Errors</button>
           </div>
-          <div id="logs-body"></div>
+          <div id="logs-body"><p class="kvline muted">Loading logs…</p></div>
           <p id="logs-foot" class="kvline muted"></p>
         </div>
       </section>
     </div>
     <div class="col-rail">
       <section id="slot-budget">
-        <div id="budget-card"></div>
+        <p class="part-status" data-part-status="budget">Loading…</p>
+        <div id="budget-card"><div class="card"><p class="kvline muted">Loading budget…</p></div></div>
       </section>
       <section id="slot-control">
         <div class="card">
+          <p class="part-status" data-part-status="specs">Loading…</p>
           <div class="seg" role="tablist">
             <button id="mode-normal" class="selected" type="button">Normal lease</button>
             <button id="mode-grant" type="button">Two-tier grant</button>
           </div>
 
           <div id="normal-controls">
-            <div id="profile-specs" class="spec-list"></div>
+            <div id="profile-specs" class="spec-list"><p class="kvline muted">Loading specs…</p></div>
             <div class="chips" id="normal-presets">
               <button type="button" data-hours="1">1h</button>
               <button type="button" data-hours="2">2h</button>
@@ -124,7 +130,7 @@
 
           <div id="grant-controls" hidden>
             <div id="grant-form">
-              <div id="burst-specs" class="spec-list"></div>
+              <div id="burst-specs" class="spec-list"><p class="kvline muted">Loading specs…</p></div>
               <div class="chips" id="grant-presets">
                 <button type="button" data-hours="1">1h</button>
                 <button type="button" data-hours="2">2h</button>

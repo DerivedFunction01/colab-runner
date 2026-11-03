@@ -169,7 +169,21 @@ def main() -> int:
         result = lease.standing_duty(cr.colab, REPO)
         result["bridge"] = lease.bridge_duty(cr.colab, REPO)
     elif cmd == "state":
-        result = lease.state(cr.colab, REPO)
+        rest = args[1:]
+        portions = {
+            "records": lease.state_records,
+            "specs": lease.state_specs,
+            "budget": lease.state_budget,
+            "grant": lease.state_grant,
+            "meta": lease.state_meta,
+        }
+        if not rest:
+            result = lease.state(cr.colab, REPO)
+        elif len(rest) == 2 and rest[0] == "--part" and rest[1] in portions:
+            result = portions[rest[1]](cr.colab, REPO)
+        else:
+            print("colab-lease: state takes [--part records|specs|budget|grant|meta]", file=sys.stderr)
+            return 2
     elif cmd == "budget-caps":
         updates = {}
         err = None

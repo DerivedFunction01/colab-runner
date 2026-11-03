@@ -140,6 +140,63 @@ def test_state_passes_core_json_through(ui):
     assert "state" in ui.invocations()
 
 
+def test_state_part_endpoints_serve_their_slice(ui):
+    """Progressive loading: each portion endpoint invokes only its
+    own core portion and returns only its slice (plus the repo-file
+    config on the portions whose sections render it)."""
+    records = ui.get_json("/api/state/records")
+    assert records["records"][0]["profile"] == "workload"
+    assert "budget" not in records and "specs" not in records
+
+    specs = ui.get_json("/api/state/specs")
+    assert {s["id"] for s in specs["specs"]} == {"workload", "lobby", "standard", "t4"}
+    assert specs["profiles"]["default_profile"] == "workload"
+    assert "caps" in specs
+
+    budget = ui.get_json("/api/state/budget")
+    assert budget["budget"]["balance"] == 571.7
+    assert "caps" in budget and "profiles" in budget
+
+    grant = ui.get_json("/api/state/grant")
+    assert grant["grant"] is None and grant["envelope"] is None
+
+    meta = ui.get_json("/api/state/meta")
+    assert meta == {"bridge": None}
+
+    invocations = ui.invocations()
+    for part in ("records", "specs", "budget", "grant", "meta"):
+        assert f"state --part {part}" in invocations
+    assert "state" not in invocations  # the composed read was never used
+
+
+def test_state_part_failure_is_isolated(tmp_path):
+    """One portion's core failure 502s only its own endpoint."""
+    server = UiServer(tmp_path, extra_env={"STUB_LEASE_FAIL": "state:records"})
+    try:
+        try:
+            server.get("/api/state/records")
+            raise AssertionError("records endpoint should have failed")
+        except urllib.error.HTTPError as err:
+            assert err.code == 502
+        budget = server.get_json("/api/state/budget")
+        assert budget["budget"]["balance"] == 571.7
+    finally:
+        server.close()
+
+
+def test_frontend_loads_state_in_portions(ui):
+    """The panel never makes the composed read: app.js polls the
+    portion endpoints, and every section carries its own load-state
+    line in the served page."""
+    _, js = ui.get("/static/app.js")
+    for part in ("records", "specs", "budget", "grant"):
+        assert f"/api/state/{part}" in js
+    assert 'api("/api/state")' not in js
+    _, html = ui.get("/")
+    for part in ("records", "specs", "budget", "grant", "logs"):
+        assert f'data-part-status="{part}"' in html
+
+
 def test_state_serves_specs_including_null_rate(ui):
     data = ui.get_json("/api/state")
     specs = {s["id"]: s for s in data["specs"]}

@@ -301,6 +301,40 @@ def test_budget_guard_prices_the_sibling_window(tmp_path, monkeypatch):
     assert out["budget"]["sibling_projected"] == 0.64
 
 
+def test_state_portions_and_composition(tmp_path, monkeypatch):
+    """Progressive loading: each portion of the composed state read
+    stands alone with its own keys, and state() composes them into
+    exactly the payload it served before the split."""
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    lease_mod.acquire(fake, repo, "standard", now_dt=PNOW)
+    lease_mod.acquire(fake, repo, "workload", now_dt=PNOW)
+
+    records = lease_mod.state_records(fake, repo)
+    assert [r["profile"] for r in records["records"]] == ["standard", "workload"]
+
+    specs = lease_mod.state_specs(fake, repo)
+    assert "specs" in specs and isinstance(specs["specs"], list)
+
+    budget = lease_mod.state_budget(fake, repo)
+    assert "budget" in budget and "balance" in budget["budget"]
+
+    grant = lease_mod.state_grant(fake, repo)
+    assert "grant" in grant and "envelope" in grant
+
+    meta = lease_mod.state_meta(fake, repo)
+    assert "bridge" in meta
+
+    composed = lease_mod.state(fake, repo)
+    # The fake's help output parses as no catalog, so the specs
+    # portion's catalog_error rides the composed payload exactly as
+    # it did before the split.
+    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error"}
+    assert composed["catalog_error"] == specs["catalog_error"]
+    assert composed["records"] == records["records"]
+    assert composed["budget"] == budget["budget"]
+
+
 def test_spend_journal_keys_instance_segments_by_session(tmp_path, monkeypatch):
     """No journal change was needed: a released instance journals its
     segment under its own profile and session at the shared rate."""

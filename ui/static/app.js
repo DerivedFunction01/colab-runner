@@ -5,7 +5,7 @@
  * the served rate table. Layout and content follow the approved
  * mockup (ui/mockups/2026-11-01-lease-lifecycle-mockup.html). */
 
-let S = null; // last /api/state payload
+let S = null; // merge of the state portions landed so far
 const sel = {
   mode: "normal",
   profile: null, // chosen spec id, normal mode
@@ -100,7 +100,7 @@ async function act(btn, fn) {
     notice(String(err.message || err));
   } finally {
     btn.disabled = false;
-    await poll();
+    await poll(true);
   }
 }
 
@@ -680,11 +680,17 @@ $("logs-filters").addEventListener("click", (e) => {
   renderLogs(logsEvents);
 });
 
-function render(events) {
-  renderBudget();
-  renderLeases();
-  renderControls();
-  if (events) renderLogs(events);
+function renderSections(names) {
+  // Sections render the moment their own portion lands; renders
+  // are idempotent reads of the merged S, so a cross-dependent
+  // section (controls read records + specs, leases read specs for
+  // labels) simply re-renders when the other portion arrives.
+  if (names.includes("budget")) renderBudget();
+  if (names.includes("records") || names.includes("specs")) {
+    renderLeases();
+    renderControls();
+  }
+  if (names.includes("grant")) renderGrant();
 }
 
 /* ---------- controls wiring ---------- */
@@ -754,28 +760,105 @@ $("grant-btn").addEventListener("click", (e) => {
   act(e.currentTarget, () => api("/api/grant", { hours: sel.grantHours, burst: sel.burst }));
 });
 
-/* ---------- polling & the degraded state ---------- */
-
-function setDegraded(on) {
-  $("degraded").hidden = !on;
-  $("layout").hidden = on;
-  if (on) $("balance-chip").hidden = true;
+/* ---------- progressive loading ----------
+ * Each portion of the state read loads, fails and retries on its
+ * own cadence; S is the merge of the portions landed so far, and a
+ * section renders the moment its portion lands — no section waits
+ * on another portion's read. A failed refresh after a successful
+ * load keeps the section's data with an age label (labeled
+ * staleness, never stale-as-live); a portion that has never loaded
+ * shows its own error with a retry. The degraded card is only the
+ * everything-down state, and it no longer hides the layout. */
+const PARTS = {
+  records: { url: "/api/state/records", cadence: 15000 },
+  specs: { url: "/api/state/specs", cadence: 60000 },
+  budget: { url: "/api/state/budget", cadence: 30000 },
+  grant: { url: "/api/state/grant", cadence: 60000 },
+  logs: { url: "/api/outbox?after=0", cadence: 15000 },
+};
+const partState = {};
+for (const name of Object.keys(PARTS)) {
+  partState[name] = { data: null, loadedAt: 0, failed: false, due: 0 };
 }
 
-async function poll() {
+function mergeParts() {
+  const merged = {};
+  for (const name of ["records", "specs", "budget", "grant"]) {
+    if (partState[name].data) Object.assign(merged, partState[name].data);
+  }
+  S = merged;
+}
+
+function renderPartStatuses() {
+  let anyLoaded = false;
+  let allFailed = true;
+  for (const name of Object.keys(PARTS)) {
+    const st = partState[name];
+    if (st.loadedAt) { anyLoaded = true; allFailed = false; }
+    if (!st.failed) allFailed = false;
+    const el = document.querySelector(`[data-part-status="${name}"]`);
+    if (!el) continue;
+    let html = "";
+    let stamp = "";
+    if (!st.loadedAt && st.failed) {
+      stamp = "error";
+      html = `Couldn’t load. <button type="button" class="part-retry" data-part-retry="${name}">Retry</button>`;
+    } else if (st.loadedAt && st.failed) {
+      stamp = `stale-${Math.floor((Date.now() - st.loadedAt) / 60000)}`;
+      html = `Update failed — last updated ${fmtAge(new Date(st.loadedAt).toISOString())}`;
+    } else if (!st.loadedAt) {
+      stamp = "loading";
+      html = "Loading…";
+    }
+    if (el.getAttribute("data-stamp") !== stamp) {
+      el.setAttribute("data-stamp", stamp);
+      el.innerHTML = html;
+      el.classList.toggle("err", stamp === "error" || stamp.startsWith("stale"));
+    }
+  }
+  $("degraded").hidden = !(allFailed && !anyLoaded);
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-part-retry]");
+  if (btn) fetchPart(btn.getAttribute("data-part-retry"));
+});
+
+async function fetchPart(name) {
+  const st = partState[name];
   try {
-    const [state, outbox] = await Promise.all([api("/api/state"), api("/api/outbox?after=0")]);
-    S = state;
-    setDegraded(false);
-    render(outbox.events || []);
+    const data = await api(PARTS[name].url);
+    st.data = data;
+    st.loadedAt = Date.now();
+    st.failed = false;
+    if (name === "logs") {
+      logsEvents = data.events || [];
+      renderLogs(logsEvents);
+    } else {
+      mergeParts();
+      renderSections([name]);
+    }
+    renderPartStatuses();
     return true;
   } catch (err) {
-    setDegraded(true);
+    st.failed = true;
+    renderPartStatuses();
     return false;
   }
 }
 
-$("retry-btn").addEventListener("click", (e) => act(e.currentTarget, () => poll()));
+async function poll(force) {
+  const now = Date.now();
+  const due = Object.keys(PARTS).filter((name) => force || now >= partState[name].due);
+  const results = await Promise.all(due.map(async (name) => {
+    const ok = await fetchPart(name);
+    partState[name].due = Date.now() + PARTS[name].cadence;
+    return ok;
+  }));
+  return results.some(Boolean);
+}
+
+$("retry-btn").addEventListener("click", (e) => act(e.currentTarget, () => poll(true)));
 
 $("restart-btn").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
@@ -786,7 +869,7 @@ $("restart-btn").addEventListener("click", async (e) => {
     await api("/api/server/restart", {}).catch(() => {});
     for (let i = 0; i < 20; i++) {
       await sleep(1500);
-      if (await poll()) break;
+      if (await poll(true)) break;
     }
   } finally {
     btn.disabled = false;
@@ -880,9 +963,10 @@ wireSpecList("profile-specs", "profile");
 wireSpecList("burst-specs", "burst");
 wirePresets("normal-presets", "normal-custom", "normalHours");
 wirePresets("grant-presets", "grant-custom", "grantHours");
-poll();
-setInterval(poll, 15000);
+poll(true);
+setInterval(() => poll(false), 5000);
 setInterval(() => {
+  renderPartStatuses();
   document.querySelectorAll("[data-countdown]").forEach((el) => {
     el.textContent = countdownText(el.getAttribute("data-countdown"));
   });

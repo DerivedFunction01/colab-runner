@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2128,25 +2129,74 @@ def _bridge_block(colab, repo: Path) -> dict | None:
     }
 
 
-def state(colab, repo: Path) -> dict:
-    """The UI's single read: every lease record's status, the two-tier
-    grant, the spec catalog, and the budget snapshot. All derivation
-    lives here in the core; the UI only renders."""
-    records = []
-    for rec in all_records(repo):
-        entry = status(colab, repo, profile=rec["profile"])
-        entry["profile"] = rec["profile"]
-        entry["warm"] = rec.get("warm")
-        records.append(entry)
+def state_records(colab, repo: Path) -> dict:
+    """Portion: every lease record's status. The per-record reads
+    are independent and I/O-bound (session probes, heartbeat
+    reads), so they run threaded — the portion's wall time is its
+    slowest record, not their sum."""
+    recs = all_records(repo)
+
+    def entry(rec):
+        e = status(colab, repo, profile=rec["profile"])
+        e["profile"] = rec["profile"]
+        e["warm"] = rec.get("warm")
+        return e
+
+    if len(recs) <= 1:
+        records = [entry(rec) for rec in recs]
+    else:
+        with ThreadPoolExecutor(max_workers=min(4, len(recs))) as pool:
+            records = list(pool.map(entry, recs))
+    return {"records": records}
+
+
+def state_specs(colab, repo: Path) -> dict:
+    """Portion: the spec catalog (CLI shapes read from the day
+    cache; a portion read never triggers a fresh catalog parse
+    beyond what specs() itself already does)."""
     _shapes, catalog_error = _cli_shapes(repo, colab)
-    grant = load_grant(repo)
-    budget = budget_snapshot(colab, repo)
-    out = {"records": records, "grant": grant, "specs": specs(repo, colab), "budget": budget, "envelope": _envelope_block(colab, repo, grant, budget), "bridge": _bridge_block(colab, repo)}
+    out = {"specs": specs(repo, colab)}
     if catalog_error:
         out["catalog_error"] = catalog_error
+    return out
+
+
+def state_budget(colab, repo: Path) -> dict:
+    """Portion: the budget snapshot, including the balance read."""
+    return {"budget": budget_snapshot(colab, repo)}
+
+
+def state_grant(colab, repo: Path, budget: dict | None = None) -> dict:
+    """Portion: the two-tier grant and its envelope block. The
+    envelope prices on a budget snapshot; composed reads pass
+    theirs in so the balance is read once."""
+    grant = load_grant(repo)
+    if budget is None:
+        budget = budget_snapshot(colab, repo)
+    return {"grant": grant, "envelope": _envelope_block(colab, repo, grant, budget)}
+
+
+def state_meta(colab, repo: Path) -> dict:
+    """Portion: the bridge block and any outstanding auth need."""
+    out = {"bridge": _bridge_block(colab, repo)}
     auth = auth_required(repo)
     if auth:
         out["auth_required"] = auth
+    return out
+
+
+def state(colab, repo: Path) -> dict:
+    """The UI's composed read: every lease record's status, the
+    two-tier grant, the spec catalog, and the budget snapshot,
+    assembled from the portion reads above. All derivation lives
+    here in the core; the UI only renders."""
+    budget = budget_snapshot(colab, repo)
+    out = {}
+    out.update(state_records(colab, repo))
+    out.update(state_specs(colab, repo))
+    out["budget"] = budget
+    out.update(state_grant(colab, repo, budget))
+    out.update(state_meta(colab, repo))
     return out
 
 
