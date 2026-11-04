@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -873,10 +874,40 @@ def created_shape_mismatch(session: str, profile: dict) -> dict | None:
     return {"action": "shape-mismatch", "session": session, "declared_high_mem": bool(profile.get("high_mem")), "actual_class": "high_ram" if actual_high else "standard", "host": host}
 
 
+# The fallback's unassign replay, run under the CLI's own interpreter.
+# The client's unassign is a two-step flow — GET the unassign URL for an
+# XSRF token, then POST that URL with the token header — but the stock
+# call sends the POST with no body, and the tunnel endpoint answers
+# 411 Length Required (diagnosed 2026-11-04; `colab stop` carries the
+# same defect, which is why this fallback exists at all). Replaying the
+# client's own two steps with an explicit empty-JSON body attached
+# (data=b"{}") is the form that succeeds.
+UNASSIGN_FALLBACK_SCRIPT = """
+import os
+from urllib.parse import urljoin
+
+from pydantic import BaseModel
+
+from colab_cli.client import COLAB_XSRF_TOKEN_HEADER, TUN_ENDPOINT, GetUnassignRequest
+from colab_cli.common import state
+
+endpoint = os.environ["UNASSIGN_ENDPOINT"]
+client = state.client
+url = urljoin(client.colab_domain, f"{TUN_ENDPOINT}/unassign/{endpoint}")
+resp = client._issue_request(url, schema=GetUnassignRequest)
+headers = {COLAB_XSRF_TOKEN_HEADER["key"]: resp.token}
+client._issue_request(url, method="POST", headers=headers, schema=BaseModel, data=b"{}")
+"""
+
+
 def stop_session_safe(colab, session: str) -> str:
     """Stop a session; never raise. `colab stop` hangs on a wedged kernel
-    (measured), so fall back to a direct server-side unassign through the
-    CLI's own library using the endpoint in the local binding."""
+    (measured) and its own unassign POST is bodiless (411, above), so
+    fall back to a direct server-side unassign through the CLI's own
+    library using the endpoint in the local binding. The fallback's
+    verdict is verified against the server-side sessions read, never
+    assumed from the call: "unassigned-fallback" is returned only once
+    the session no longer reads alive."""
     try:
         r = colab("stop", "-s", session, timeout=120)
         if r.returncode == 0 and not session_alive(colab, session):
@@ -892,13 +923,22 @@ def stop_session_safe(colab, session: str) -> str:
         for key in ("NO_PROXY", "no_proxy"):
             suffix = "google.com,googleapis.com,googleusercontent.com,colab.dev"
             env[key] = f"{env[key]},{suffix}" if env.get(key) else suffix
-        subprocess.run(
-            [str(venv_py), "-c", "import os; from colab_cli.common import state; state.client.unassign(os.environ['UNASSIGN_ENDPOINT'])"],
+        r = subprocess.run(
+            [str(venv_py), "-c", UNASSIGN_FALLBACK_SCRIPT],
             capture_output=True, text=True, timeout=120, env=env,
         )
-        return "unassigned-fallback"
+        if r.returncode == 0:
+            # A landed unassign can take a few seconds to disappear
+            # from the assignments read; confirm over a short window
+            # before reporting either way.
+            for attempt in range(3):
+                if not session_alive(colab, session):
+                    return "unassigned-fallback"
+                if attempt < 2:
+                    time.sleep(2)
     except Exception:  # noqa: BLE001
-        return "stop-failed"
+        pass
+    return "stop-failed"
 
 
 # The heartbeat read is deliberately short-bounded: a healthy download
@@ -1727,6 +1767,21 @@ def reap(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     if not recs:
         return {"action": "none", "records": []}
     grant = load_grant(repo)
+    for rec in recs:
+        # Host reconcile (initiation-time approval follow-up,
+        # 2026-11-04): a birth capture is not the last word — the
+        # record's first saves and the capture save are seconds
+        # apart (keepalive + pulse run between them), and a
+        # concurrent writer holding a pre-capture copy (a keepwarm
+        # pulse, a reap save) restores a hostless record; the
+        # adopt-foreign workload2 lease ran exactly that race and the
+        # reaper's approval gate stayed blind to its host for hours
+        # while the acquire output reported the capture fine.
+        # Re-derive the host from the local binding every pass: a
+        # fill is silent (the birth event already spooled), a real
+        # change spools as origin "reconcile".
+        if _capture_session_host(repo, rec, "reconcile", spool_on_first=False):
+            save_record(repo, rec)
     results = [{"profile": rec.get("profile"), **_reap_record(colab, repo, cfg, rec, grant, now_dt)} for rec in recs]
     top = next((r for r in results if r["profile"] == default_profile(repo)), None)
     if top is None and len(results) == 1:

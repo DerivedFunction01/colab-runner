@@ -17,6 +17,25 @@ import sys
 from pathlib import Path
 
 
+def unassign_with_body(client, endpoint: str) -> None:
+    """The client's unassign flow with a body on the POST. The stock
+    call sends the POST bodiless and the tunnel endpoint answers
+    411 Length Required (diagnosed 2026-11-04), so the client's own
+    two steps — GET the unassign URL for an XSRF token, then POST it
+    with the token header — are replayed here with an explicit
+    empty-JSON body attached (data=b"{}"), the form that succeeds."""
+    from urllib.parse import urljoin
+
+    from pydantic import BaseModel
+
+    from colab_cli.client import COLAB_XSRF_TOKEN_HEADER, TUN_ENDPOINT, GetUnassignRequest
+
+    url = urljoin(client.colab_domain, f"{TUN_ENDPOINT}/unassign/{endpoint}")
+    resp = client._issue_request(url, schema=GetUnassignRequest)
+    headers = {COLAB_XSRF_TOKEN_HEADER["key"]: resp.token}
+    client._issue_request(url, method="POST", headers=headers, schema=BaseModel, data=b"{}")
+
+
 def main() -> int:
     apply = "--apply" in sys.argv
     from colab_cli.common import state
@@ -33,7 +52,7 @@ def main() -> int:
     print(json.dumps({"assignments": [a.endpoint for a in assignments], "orphans": [a.endpoint for a in orphans], "applied": False}, indent=2))
     if apply:
         for a in orphans:
-            state.client.unassign(a.endpoint)
+            unassign_with_body(state.client, a.endpoint)
             print(f"unassigned {a.endpoint}")
         print(json.dumps({"remaining": [a.endpoint for a in state.client.list_assignments()]}))
     return 0

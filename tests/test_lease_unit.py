@@ -1154,3 +1154,131 @@ def test_adopted_host_change_spools_once_and_unchanged_is_silent(tmp_path, monke
     out2 = lease.acquire(stub, REPO, "standard", now_dt=NOW)
     assert out2["action"] == "adopted"
     assert len(_approval_events(tmp_path)) == 1  # unchanged host: no second event
+
+
+def _foreign_stub(*a, **k):
+    if a and a[0] == "usage":
+        return cp("balance: 500 CU (stub)")
+    if a and a[0] == "sessions":
+        return cp("workload2")
+    if a and a[0] == "download":
+        return cp("", rc=1)
+    return cp("")
+
+
+def test_adopt_foreign_acquire_persists_the_host(tmp_path, monkeypatch):
+    """The workload2 adoption of 2026-11-04: the acquire output carried
+    the captured host, so the birth path itself must persist it —
+    pin the persisted record, not just the result (the live loss
+    came later; see the reap reconcile tests)."""
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    home = _write_sessions_binding(tmp_path, {"workload2": {"url": f"https://{HOST_B}"}})
+    monkeypatch.setenv("HOME", str(home))
+    out = lease.acquire(_foreign_stub, REPO, "workload2", now_dt=NOW)
+    assert out["action"] == "adopted-foreign"
+    assert out["host_changed"] is True and out["host"] == HOST_B
+    assert lease.load_record(REPO, "workload2")["host"] == HOST_B
+    events = _approval_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["origin"] == "adopt-foreign" and events[0]["session"] == "workload2"
+
+
+def test_reap_reconciles_a_missing_host_silently(tmp_path, monkeypatch):
+    """Regression (2026-11-04): a concurrent writer holding a
+    pre-capture copy of the record restored a hostless record after
+    the adopt-foreign capture saved — the acquire output was fine
+    and nothing re-asserted the host, so the approval gate never
+    saw the adopted host. Reap re-derives it from the binding; a
+    fill baselines silently (the birth event already spooled)."""
+    seed_record(tmp_path, monkeypatch)  # no host key
+    home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}})
+    monkeypatch.setenv("HOME", str(home))
+
+    def stub(*a, **k):
+        if a and a[0] == "sessions":
+            return cp('["standard"]')
+        if a and a[0] == "download":
+            return cp("", rc=1)
+        return cp("")
+
+    lease.reap(stub, REPO, now_dt=NOW)
+    assert lease.load_record(REPO, "standard")["host"] == HOST_A
+    assert _approval_events(tmp_path) == []
+
+
+def test_reap_reconciles_a_changed_host_and_spools(tmp_path, monkeypatch):
+    rec = seed_record(tmp_path, monkeypatch)
+    rec["host"] = HOST_A
+    lease.save_record(REPO, rec)
+    home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_B}"}})
+    monkeypatch.setenv("HOME", str(home))
+
+    def stub(*a, **k):
+        if a and a[0] == "sessions":
+            return cp('["standard"]')
+        if a and a[0] == "download":
+            return cp("", rc=1)
+        return cp("")
+
+    lease.reap(stub, REPO, now_dt=NOW)
+    assert lease.load_record(REPO, "standard")["host"] == HOST_B
+    events = _approval_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["origin"] == "reconcile" and events[0]["previous_host"] == HOST_A
+
+
+def _stop_harness(monkeypatch, tmp_path, *, stop_rc, alive, unassign_rc):
+    """Wire stop_session_safe's seams to stubs: the colab callable,
+    the local binding, the fallback subprocess, and the server-side
+    alive read. Returns (colab, fallback_argv_list)."""
+    from types import SimpleNamespace
+
+    binding = tmp_path / "sessions.json"
+    binding.write_text(json.dumps({"sess": {"endpoint": "m-s-fake-endpoint"}}))
+    monkeypatch.setattr(lease, "local_sessions_path", lambda: binding)
+    monkeypatch.setattr(lease, "session_alive", lambda c, s: alive)
+    monkeypatch.setattr(lease, "time", SimpleNamespace(sleep=lambda s: None))
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return cp(rc=unassign_rc)
+
+    monkeypatch.setattr(lease, "subprocess", SimpleNamespace(run=fake_run))
+
+    def colab(*args, **kwargs):
+        return cp(rc=stop_rc)
+
+    return colab, calls
+
+
+def test_stop_session_safe_stopped_via_cli(monkeypatch, tmp_path):
+    colab, calls = _stop_harness(monkeypatch, tmp_path, stop_rc=0, alive=False, unassign_rc=0)
+    assert lease.stop_session_safe(colab, "sess") == "stopped"
+    assert calls == []
+
+
+def test_stop_session_safe_fallback_verdict_verified(monkeypatch, tmp_path):
+    colab, calls = _stop_harness(monkeypatch, tmp_path, stop_rc=1, alive=False, unassign_rc=0)
+    assert lease.stop_session_safe(colab, "sess") == "unassigned-fallback"
+    script = calls[0][2]
+    assert 'data=b"{}"' in script and "GetUnassignRequest" in script
+
+
+def test_stop_session_safe_fallback_still_alive_is_failed(monkeypatch, tmp_path):
+    colab, _ = _stop_harness(monkeypatch, tmp_path, stop_rc=1, alive=True, unassign_rc=0)
+    assert lease.stop_session_safe(colab, "sess") == "stop-failed"
+
+
+def test_stop_session_safe_fallback_call_failed_is_failed(monkeypatch, tmp_path):
+    colab, _ = _stop_harness(monkeypatch, tmp_path, stop_rc=1, alive=False, unassign_rc=1)
+    assert lease.stop_session_safe(colab, "sess") == "stop-failed"
+
+
+def test_no_raw_unassign_call_remains():
+    """The bodiless-POST defect (411, 2026-11-04) lived in three raw
+    call sites; none may return. The sanctioned form replays the
+    client's two-step flow with a body attached."""
+    for rel in ("sync/lease.py", "probes/_driver.py", "snippets/unassign_orphans.py"):
+        assert "client.unassign(" not in (REPO / rel).read_text(), rel
+    assert 'data=b"{}"' in lease.UNASSIGN_FALLBACK_SCRIPT

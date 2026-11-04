@@ -60,6 +60,30 @@ def record(probe: str, data: dict) -> Path:
     return out
 
 
+# The fallback's unassign replay, run under the CLI's own interpreter:
+# the client's stock unassign POST carries no body and the tunnel
+# endpoint answers 411 Length Required (diagnosed 2026-11-04), so the
+# client's own two steps (GET for the XSRF token, then POST) are
+# replayed with an explicit empty-JSON body attached. Same form as
+# sync/lease.py's UNASSIGN_FALLBACK_SCRIPT.
+_UNASSIGN_SCRIPT = """
+import os
+from urllib.parse import urljoin
+
+from pydantic import BaseModel
+
+from colab_cli.client import COLAB_XSRF_TOKEN_HEADER, TUN_ENDPOINT, GetUnassignRequest
+from colab_cli.common import state
+
+endpoint = os.environ["UNASSIGN_ENDPOINT"]
+client = state.client
+url = urljoin(client.colab_domain, f"{TUN_ENDPOINT}/unassign/{endpoint}")
+resp = client._issue_request(url, schema=GetUnassignRequest)
+headers = {COLAB_XSRF_TOKEN_HEADER["key"]: resp.token}
+client._issue_request(url, method="POST", headers=headers, schema=BaseModel, data=b"{}")
+"""
+
+
 def stop_session(name: str) -> None:
     """Stop a session; never raise. `colab stop` hangs when the kernel is
     wedged (measured after the OOM probe: 120 s timeout, session leaked),
@@ -81,7 +105,7 @@ def stop_session(name: str) -> None:
         env = colab_env()
         env["UNASSIGN_ENDPOINT"] = endpoint
         subprocess.run(
-            [str(venv_py), "-c", "import os; from colab_cli.common import state; state.client.unassign(os.environ['UNASSIGN_ENDPOINT'])"],
+            [str(venv_py), "-c", _UNASSIGN_SCRIPT],
             capture_output=True, text=True, timeout=120, env=env,
         )
     except Exception:
