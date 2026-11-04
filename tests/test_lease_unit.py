@@ -1038,3 +1038,109 @@ def test_default_profile_fails_loudly_without_the_config_key(tmp_path):
         lease.default_profile(tmp_path)
     (cfg_dir / "profiles.json").write_text(json.dumps({"default_profile": "someprofile", "profiles": {}}))
     assert lease.default_profile(tmp_path) == "someprofile"
+
+
+# --- Initiation-time approval (plan 2026-11-03): host on the record ---
+
+HOST_A = "8080-x-a.us-east1.prod.r.colab.dev"
+HOST_B = "8080-y-b.asia-east1.prod.r.colab.dev"
+
+
+def _write_sessions_binding(tmp_path, bindings):
+    """A fake local sessions file under a tmp HOME: session name ->
+    binding whose url carries the tunnel host (the production shape)."""
+    home = tmp_path / "home"
+    f = home / ".config" / "colab-cli" / "sessions.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(bindings))
+    return home
+
+
+def _approval_events(tmp_path):
+    spool = Path(tmp_path / "var" / "reaper-events.jsonl")
+    if not spool.exists():
+        return []
+    return [e for e in (json.loads(l) for l in spool.read_text().splitlines() if l.strip()) if e.get("kind") == "approval-needed"]
+
+
+def test_acquire_records_host_and_spools_approval_needed(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}})
+    monkeypatch.setenv("HOME", str(home))
+    out = lease.acquire(_acquire_stub, REPO, "standard", now_dt=NOW)
+    assert out["action"] == "created"
+    assert out["host_changed"] is True and out["host"] == HOST_A
+    rec = lease.load_record(REPO, "standard")
+    assert rec["host"] == HOST_A
+    events = _approval_events(tmp_path)
+    assert len(events) == 1
+    assert events[0] == {"kind": "approval-needed", "profile": "standard", "session": "standard", "host": HOST_A, "previous_host": None, "origin": "acquire"}
+
+
+def test_acquire_without_binding_records_no_host_and_no_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    monkeypatch.setenv("HOME", str(tmp_path))  # no sessions file at all
+    out = lease.acquire(_acquire_stub, REPO, "standard", now_dt=NOW)
+    assert out["action"] == "created"
+    assert "host_changed" not in out
+    assert "host" not in lease.load_record(REPO, "standard")
+    assert _approval_events(tmp_path) == []
+
+
+def test_renewal_swap_records_new_host_and_spools(tmp_path, monkeypatch):
+    child = f"standard-r{int(NOW.timestamp())}"
+    home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}, child: {"url": f"https://{HOST_B}"}})
+    monkeypatch.setenv("HOME", str(home))
+    seed_window_record(tmp_path, monkeypatch, host=HOST_A)
+    alive, calls = {"standard"}, []
+    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    assert out["action"] == "renewed" and out["driver"] == 2
+    rec = lease.load_record(REPO, "standard")
+    assert rec["session"] == child and rec["host"] == HOST_B
+    events = _approval_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["origin"] == "renewal" and events[0]["host"] == HOST_B
+    assert events[0]["previous_host"] == HOST_A and events[0]["session"] == child
+
+
+def test_adopted_baselines_host_without_an_event(tmp_path, monkeypatch):
+    seed_record(tmp_path, monkeypatch)  # a pre-feature record: no host key
+    home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}})
+    monkeypatch.setenv("HOME", str(home))
+
+    def stub(*a, **k):
+        if a and a[0] == "sessions":
+            return cp('["standard"]')
+        if a and a[0] == "download":
+            return cp("", rc=1)
+        return cp("")
+
+    out = lease.acquire(stub, REPO, "standard", now_dt=NOW)
+    assert out["action"] == "adopted"
+    assert lease.load_record(REPO, "standard")["host"] == HOST_A
+    assert _approval_events(tmp_path) == []
+
+
+def test_adopted_host_change_spools_once_and_unchanged_is_silent(tmp_path, monkeypatch):
+    rec = seed_record(tmp_path, monkeypatch)
+    rec["host"] = HOST_A
+    lease.save_record(REPO, rec)
+    home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_B}"}})
+    monkeypatch.setenv("HOME", str(home))
+
+    def stub(*a, **k):
+        if a and a[0] == "sessions":
+            return cp('["standard"]')
+        if a and a[0] == "download":
+            return cp("", rc=1)
+        return cp("")
+
+    out = lease.acquire(stub, REPO, "standard", now_dt=NOW)
+    assert out["action"] == "adopted"
+    assert lease.load_record(REPO, "standard")["host"] == HOST_B
+    events = _approval_events(tmp_path)
+    assert len(events) == 1
+    assert events[0]["origin"] == "adopted" and events[0]["previous_host"] == HOST_A
+    out2 = lease.acquire(stub, REPO, "standard", now_dt=NOW)
+    assert out2["action"] == "adopted"
+    assert len(_approval_events(tmp_path)) == 1  # unchanged host: no second event

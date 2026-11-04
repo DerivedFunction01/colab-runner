@@ -20,7 +20,8 @@ running segment, so spend counts only this repo's own leases.
 Config:
 config/lease.json + profiles from config/profiles.json. Nothing here
 prints file contents from the transient registry; the sessions binding
-is read only for its endpoint on the release fallback path.
+is read for its endpoint on the release fallback path, and for its
+tunnel host when a session is born (acquire / renewal swap / adoption).
 """
 
 import json
@@ -32,6 +33,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def var_dir(repo: Path) -> Path:
@@ -684,6 +686,28 @@ def local_sessions_path() -> Path:
     return Path.home() / ".config" / "colab-cli" / "sessions.json"
 
 
+def session_host(session: str) -> str | None:
+    """The tunnel host a session is reached at, read from the local
+    binding — no network call, so no approval is minted by reading it.
+    The binding's `url` carries the host; a binding whose endpoint is
+    itself a URL (older shapes, test fakes) parses the same way. None
+    when the binding or a parseable host is absent: absence is not an
+    error and never blocks the lifecycle."""
+    binding = load_json(local_sessions_path(), {})
+    if not isinstance(binding, dict):
+        return None
+    entry = binding.get(session)
+    if not isinstance(entry, dict):
+        return None
+    for key in ("url", "endpoint"):
+        raw = entry.get(key)
+        if isinstance(raw, str) and raw:
+            host = urlparse(raw).hostname
+            if host:
+                return host
+    return None
+
+
 def stop_session_safe(colab, session: str) -> str:
     """Stop a session; never raise. `colab stop` hangs on a wedged kernel
     (measured), so fall back to a direct server-side unassign through the
@@ -957,6 +981,8 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
             save_record(repo, rec)
             if newly_attributed:
                 _note_envelope_lease_started(repo, rec)
+            if _capture_session_host(repo, rec, "adopted", spool_on_first=False):
+                save_record(repo, rec)
             fresh, _age = keepalive_fresh(colab, repo, session)
             ka = {"keepalive": "ok"} if fresh else ensure_keepalive(colab, repo, session)
             return {"action": "adopted", "record": rec, **ka}
@@ -1020,7 +1046,13 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     rec["last_pulse_at"] = now_dt.isoformat()
     rec["last_pulse_result"] = pulse_result
     save_record(repo, rec)
+    host_changed = _capture_session_host(repo, rec, "adopt-foreign" if adopted_foreign else "acquire", spool_on_first=True)
+    if host_changed:
+        save_record(repo, rec)
     out = {"action": "adopted-foreign" if adopted_foreign else "created", "record": rec, "pulse": pulse_result, **ka}
+    if host_changed:
+        out["host_changed"] = True
+        out["host"] = rec["host"]
     if rec.get("renew"):
         kit = install_renewal_kit(colab, repo, rec, now_dt)
         out["kit"] = kit
@@ -1189,6 +1221,8 @@ def _swap_session(colab, repo: Path, rec: dict, new_session: str, acquired_at: s
     rec["acquired_at"] = acquired_at
     rec["last_used_at"] = now_dt.isoformat()
     save_record(repo, rec)
+    if _capture_session_host(repo, rec, "renewal", spool_on_first=True):
+        save_record(repo, rec)
     ensure_keepalive(colab, repo, new_session)
     rec["last_pulse_at"] = now_dt.isoformat()
     rec["last_pulse_result"] = kernel_pulse(colab, repo, new_session)
@@ -1323,6 +1357,34 @@ def load_grant_ledger(repo: Path) -> list[dict]:
         if isinstance(event, dict):
             out.append(event)
     return out
+
+
+def _capture_session_host(repo: Path, rec: dict, origin: str, spool_on_first: bool) -> bool:
+    """Record the session's current tunnel host on the lease record
+    (initiation-time approval plan, .plans/2026-11-03-initiation-time-
+    approval.md). A host is born at exactly three moments — a fresh
+    acquire, a renewal swap, an adoption — and network approvals are
+    granted per exact host per caller scope, so each birth must
+    surface at initiation instead of being discovered by a background
+    caller's retries. When the host differs from the one on the
+    record, spool an approval-needed event through the reaper-events
+    spool (the companion drains it; the notify hook announces it).
+
+    A record with no host yet baselines silently unless
+    spool_on_first: a fresh acquire's host is a birth, while an
+    existing lease met by the adopted path was approved in its own
+    time and must not mint a false batch. Returns True when the host
+    changed — the caller saves the record."""
+    host = session_host(rec.get("session") or "")
+    if not host:
+        return False
+    previous = rec.get("host")
+    if previous == host:
+        return False
+    rec["host"] = host
+    if previous is not None or spool_on_first:
+        append_reaper_event(repo, {"kind": "approval-needed", "profile": rec.get("profile"), "session": rec.get("session"), "host": host, "previous_host": previous, "origin": origin})
+    return True
 
 
 def _note_envelope_lease_started(repo: Path, rec: dict) -> None:
