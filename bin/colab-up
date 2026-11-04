@@ -6,3 +6,12 @@ wrap_enter
 PROFILE="${1:-$(default_profile)}"
 # shellcheck disable=SC2046
 "$COLAB_BIN" --auth oauth2 new $(profile_args "$PROFILE")
+# Prime this scope's approval for the new tunnel host (initiation-time
+# approval plan, Step 2): one cheap, bounded download attempt against
+# the session — the attempt itself surfaces the card in this minute,
+# while the operator is present. Its result is irrelevant and never
+# fails the up.
+SESSION="$(profile_field "$PROFILE" session)"
+PRIME_DEST="$(mktemp)"
+timeout 30 "$COLAB_BIN" --auth oauth2 download -s "$SESSION" /content/keepalive.log "$PRIME_DEST" >/dev/null 2>&1 || true
+rm -f "$PRIME_DEST"

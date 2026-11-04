@@ -761,6 +761,24 @@ def heartbeat_age(colab, repo: Path, session: str) -> float | None:
         return None
 
 
+def prime_session_host(colab, repo: Path, session: str) -> dict:
+    """One cheap session-targeting call through the funnel, made by an
+    initiating entry point right after an acquire changed the host
+    (initiation-time approval plan, Step 2): the attempt itself is
+    the product — it surfaces this caller scope's approval card for
+    the new tunnel host in the same minute as the initiation, while
+    the operator is present, instead of the scope discovering the
+    host on its next background call. The probe is the heartbeat
+    download (bounded, already the lease's liveness read); its
+    outcome is reported, never raised, and never blocks the acquire
+    result it rides on."""
+    try:
+        age = heartbeat_age(colab, repo, session)
+    except Exception:  # noqa: BLE001
+        return {"primed": False}
+    return {"primed": True, "heartbeat_age_s": round(age, 1) if age is not None else None}
+
+
 # The keepalive launch is bounded and non-raising for the same reason
 # as the heartbeat read: its upload rides the file channel that can
 # stall indefinitely (2026-11-01: a 300 s upload stall failed the

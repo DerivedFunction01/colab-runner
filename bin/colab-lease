@@ -121,6 +121,12 @@ def main() -> int:
             print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
             return 2
         result = lease.acquire(cr.colab, REPO, profile, hours=hours, via=via)
+        if result.get("host_changed") and result.get("record"):
+            # Initiation-time approval, Step 2: this entry point just
+            # birthed (or adopted) a session on a new tunnel host —
+            # prime this scope's own approval card now, in the same
+            # minute, rather than letting it surface on a later call.
+            result["prime"] = lease.prime_session_host(cr.colab, REPO, result["record"]["session"])
     elif cmd == "extend":
         hours, rest, err = parse_hours(args[1:])
         if err is None and hours is None:

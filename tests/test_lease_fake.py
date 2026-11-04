@@ -347,3 +347,24 @@ def test_spend_journal_keys_instance_segments_by_session(tmp_path, monkeypatch):
     lines = (tmp_path / "var" / "lease-spend-journal.jsonl").read_text().strip().split("\n")
     seg = json.loads(lines[-1])
     assert seg["profile"] == "standard2" and seg["session"] == "standard2" and seg["rate"] == 0.08
+
+
+def test_acquire_primes_the_initiating_scope_on_a_new_host(tmp_path):
+    """Initiation-time approval, Step 2: when the acquire births a
+    session on a tunnel host, bin/colab-lease primes its own scope
+    with one cheap call and says so in the result."""
+    env = lease_env(tmp_path)
+    home = tmp_path / "home"
+    sessions = home / ".config" / "colab-cli" / "sessions.json"
+    sessions.parent.mkdir(parents=True)
+    host = "8080-fake-a.us-east1.prod.r.colab.dev"
+    sessions.write_text(json.dumps({"standard": {"url": f"https://{host}"}}))
+    env["HOME"] = str(home)
+    first = run_lease(env, "acquire", "standard")
+    assert first["action"] == "created"
+    assert first["host_changed"] is True and first["host"] == host
+    assert first["prime"]["primed"] is True
+    assert record(env)["host"] == host
+    second = run_lease(env, "acquire", "standard")
+    assert second["action"] == "adopted"
+    assert "prime" not in second  # host unchanged: nothing to prime
