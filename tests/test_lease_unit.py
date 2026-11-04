@@ -263,11 +263,16 @@ def test_extend_happy_path_moves_deadline_and_prices_delta(tmp_path, monkeypatch
 
 def test_extend_refused_budget_changes_nothing(tmp_path, monkeypatch):
     seed_record(tmp_path, monkeypatch)
-    # 200 h x 0.08 = 16 CU against the 10 CU daily cap.
-    out = lease.extend(make_extend_stub(["standard"]), REPO, "standard", 200, now_dt=NOW)
+    # Sized off the live daily cap so the refusal holds whatever cap
+    # the operator has set: the extension's projection alone (hours x
+    # the standard rate 0.08) clears the cap. (The fixed 200 h form
+    # silently stopped refusing when the live cap rose past 16 CU.)
+    cap = lease.load_config(REPO)["daily_cu_budget"]
+    hours = int(cap / 0.08) + 50
+    out = lease.extend(make_extend_stub(["standard"]), REPO, "standard", hours, now_dt=NOW)
     assert out["action"] == "refused-budget"
     assert out["budget"]["reason"] == "daily-budget"
-    assert out["budget"]["projected"] == 16.0
+    assert out["budget"]["projected"] == round(hours * 0.08, 2)
     rec = lease.load_record(REPO, "standard")
     assert rec["deadline"] == "2026-10-30T01:00:00+00:00"
     assert "renew" not in rec

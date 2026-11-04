@@ -159,5 +159,10 @@ def test_duty_armed_ferries_acks_and_folds(tmp_path):
 
 def test_bridge_block_serves_agent_status(tmp_path):
     repo, fake = armed_setup(tmp_path)
+    # _bridge_block reads the wall clock (it is called from the state
+    # assembly), so the grant must be live at wall-now: armed_setup's
+    # grant is written against the file's frozen NOW for the duty
+    # tests, which pass their clock in explicitly.
+    lease.write_grant(repo, 3)
     block = lease._bridge_block(fake, repo)
     assert block["armed"] is True and block["generation"] == "gen-test" and block["children"] == []
