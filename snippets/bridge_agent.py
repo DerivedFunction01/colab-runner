@@ -350,6 +350,18 @@ class Agent:
         self.child_max_s = float(limits.get("child_max_hours", 4)) * 3600
         self.default_timeout = float(limits.get("command_timeout_seconds", 300))
         self.profiles = cfg.get("profiles", {})
+        # Session shape gate: the profiles an agent-driven mint may
+        # create, stamped into this config at kit install. A config
+        # without the stamp (a bridge armed before the gate) derives
+        # the same set from the snapshot's own shapes, restating the
+        # core's classifier: gpu/tpu are their own classes, high_mem
+        # is high-RAM, the rest standard — and only high-RAM is
+        # agent-allowed.
+        stamped = cfg.get("agent_allowed_profiles")
+        if isinstance(stamped, list):
+            self.mint_allowed = {str(n) for n in stamped}
+        else:
+            self.mint_allowed = {name for name, p in self.profiles.items() if not p.get("gpu") and not p.get("tpu") and p.get("high_mem")}
         for d in (QUEUE, LOGDIR, RESULTS):
             d.mkdir(parents=True, exist_ok=True)
         self.log = BridgeLog(LOGDIR, self.generation)
@@ -507,6 +519,9 @@ class Agent:
         profile = self.profiles.get(cmd["profile"])
         if profile is None:
             self._error_line(cmd, "unknown-profile")
+            return
+        if cmd["profile"] not in self.mint_allowed:
+            self._error_line(cmd, "shape-refused", profile=cmd["profile"])
             return
         if self.auth_down:
             self._error_line(cmd, "auth-failed")

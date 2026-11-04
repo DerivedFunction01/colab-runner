@@ -21,6 +21,16 @@ spec.loader.exec_module(lease)
 NOW = datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def gate_permissive(monkeypatch):
+    """Session shape gate: these units pin lease mechanics against
+    the repo's live config (only var is redirected), so they
+    declare the permissive fixture state explicitly — the same
+    explicit disable a fixture-owned config would carry. The
+    gate's own tests live in test_lease_fake."""
+    monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
+
+
 def cp(stdout="", rc=0):
     return subprocess.CompletedProcess([], rc, stdout, "")
 

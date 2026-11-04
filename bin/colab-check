@@ -102,7 +102,7 @@ def main() -> int:
     lease_id = f"check-{int(time.time())}"
     if use_lease:
         got = lease.acquire(cr.colab, REPO, profile_name, via="runner")
-        if got["action"] in ("refused-budget", "create-failed"):
+        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch"):
             print(json.dumps({"gate": "lease-failed", "detail": got}))
             return 1
         lease.touch_job(REPO, lease_id)

@@ -4,6 +4,13 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
 wrap_enter
 PROFILE="${1:-$(default_profile)}"
+# Session shape gate: this creation path bypasses the lease core,
+# so it consults the core's admission verdict first; a refusal
+# prints the verdict and fails the up before any CLI call.
+if ! GATE_VERDICT="$(gate_check "$PROFILE")"; then
+  printf '%s\n' "$GATE_VERDICT"
+  exit 1
+fi
 # shellcheck disable=SC2046
 "$COLAB_BIN" --auth oauth2 new $(profile_args "$PROFILE")
 # Prime this scope's approval for the new tunnel host (initiation-time

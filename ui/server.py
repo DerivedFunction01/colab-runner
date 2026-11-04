@@ -89,6 +89,12 @@ def run_core(*args: str) -> tuple[int, dict | None, str]:
             capture_output=True,
             text=True,
             timeout=CORE_TIMEOUT_S,
+            # The panel's actor identity for the core's session
+            # shape gate: claimed in the child env on every call
+            # (unconditionally — a stale inherited value must never
+            # speak for the panel), paired with the --via panel tag
+            # on the action calls. The core's bypass requires both.
+            env={**os.environ, "COLAB_LEASE_ACTOR": "panel"},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, None, f"{type(exc).__name__}: {exc}"

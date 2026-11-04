@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin CLI over sync/lease.py — the shared-session lease.
 
-Usage: colab-lease status|acquire [profile] [--hours H] [--via TAG]|extend [profile] --hours H|release [profile]|reap|keepalive|auto|request [profile] [--reason TEXT] [--via TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst PROFILE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|parallel PROFILE --on|--off
+Usage: colab-lease status|acquire [profile] [--hours H] [--via TAG]|extend [profile] --hours H|release [profile]|reap|keepalive|auto|request [profile] [--reason TEXT] [--via TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst PROFILE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|parallel PROFILE --on|--off|admission [profile] [--via TAG]
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
 orphan reconciliation across all profile records); `auto` is the
 hook's auto-acquire duty (inert unless enabled in config/lease.json);
@@ -17,7 +17,10 @@ budget). `budget-caps` updates the budget caps in config/lease.json
 or `none` for no cap, and an omitted flag leaves its cap untouched.
 `parallel` sets a base profile's parallel-instance toggle in
 config/lease.json (the panel's per-profile switch rides it); exactly
-one of --on/--off is required.
+one of --on/--off is required. `admission` is the session shape
+gate's verdict for one profile (the session-creating wrappers that
+bypass the lease core consult it): prints admitted, or the
+shape-refused verdict with exit 1.
 """
 
 import importlib.util
@@ -97,7 +100,7 @@ def configured_default_profile() -> str | None:
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args or args[0] not in ("status", "acquire", "extend", "release", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "parallel"):
+    if not args or args[0] not in ("status", "acquire", "extend", "release", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "parallel", "admission"):
         print(__doc__.strip().split("\n")[2], file=sys.stderr)
         return 2
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
@@ -224,6 +227,21 @@ def main() -> int:
             print("colab-lease: parallel needs exactly one profile and one of --on/--off", file=sys.stderr)
             return 2
         result = lease.set_parallel(REPO, positional[0], flags[0] == "--on")
+    elif cmd == "admission":
+        via, rest, err = parse_flag(args[1:], "--via")
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        positional = [t for t in rest if not t.startswith("--")]
+        profile = positional[0] if positional else configured_default_profile()
+        if profile is None:
+            print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
+            return 2
+        if profile not in lease.catalog_profiles(REPO):
+            result = {"action": "unknown-profile", "profile": profile}
+        else:
+            refusal = lease.enforce_session_admission(REPO, profile, via=via, seam="wrapper")
+            result = refusal if refusal is not None else {"action": "admitted", "profile": profile}
     elif cmd == "keepalive":
         rec = lease.load_record(REPO)
         if not rec:
@@ -265,7 +283,7 @@ def main() -> int:
         result = lease.reap(cr.colab, REPO)
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
-    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live") else 1
+    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live", "shape-refused", "shape-mismatch") else 1
 
 
 if __name__ == "__main__":

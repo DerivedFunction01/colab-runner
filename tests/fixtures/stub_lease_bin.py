@@ -52,6 +52,10 @@ def main(argv):
     if log:
         with open(log, "a") as fh:
             fh.write(" ".join(argv) + "\n")
+            if argv and argv[0] == "acquire":
+                # The actor claim the server passed in the child env
+                # (session shape gate: the panel claims "panel").
+                fh.write(f"actor:{os.environ.get('COLAB_LEASE_ACTOR') or 'absent'}\n")
     if not argv:
         return 2
     cmd = argv[0]
@@ -99,17 +103,18 @@ def main(argv):
             # t4's rate is null on purpose: the core's rate table prices
             # only the CPU tiers, so the UI must render "Cost unconfirmed".
             "specs": [
-                {"id": "workload", "label": "High-RAM", "session": "workload", "gpu": None, "high_mem": True, "rate_cu_per_hour": 0.26, "timeout": 18000, "parallel": {"eligible": True, "enabled": False, "instance": "workload2"}},
-                {"id": "lobby", "label": "Lobby", "session": "lobby", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "parallel": {"eligible": True, "enabled": False, "instance": "lobby2"}},
-                {"id": "standard", "label": "Standard", "session": "standard", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "parallel": {"eligible": True, "enabled": False, "instance": "standard2"}},
-                {"id": "t4", "label": "T4", "session": "t4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "timeout": 18000, "parallel": {"eligible": False, "enabled": False, "instance": "t42"}},
+                {"id": "workload", "label": "High-RAM", "session": "workload", "gpu": None, "high_mem": True, "rate_cu_per_hour": 0.26, "timeout": 18000, "agent_startable": True, "parallel": {"eligible": True, "enabled": False, "instance": "workload2"}},
+                {"id": "lobby", "label": "Lobby", "session": "lobby", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "agent_startable": False, "parallel": {"eligible": True, "enabled": False, "instance": "lobby2"}},
+                {"id": "standard", "label": "Standard", "session": "standard", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "agent_startable": False, "parallel": {"eligible": True, "enabled": False, "instance": "standard2"}},
+                {"id": "t4", "label": "T4", "session": "t4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "timeout": 18000, "agent_startable": False, "parallel": {"eligible": False, "enabled": False, "instance": "t42"}},
             ],
+            "session_gate": {"enabled": True, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"},
             "bridge": None,
         }
         if part is not None:
             slices = {
                 "records": {"records": out["records"]},
-                "specs": {"specs": out["specs"]},
+                "specs": {"specs": out["specs"], "session_gate": out["session_gate"]},
                 "budget": {"budget": out["budget"]},
                 "grant": {"grant": out["grant"], "envelope": out["envelope"]},
                 "meta": {"bridge": out["bridge"]},

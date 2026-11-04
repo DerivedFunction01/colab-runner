@@ -16,15 +16,37 @@ FAKE = REPO / "tests" / "fixtures" / "fake_colab.py"
 
 
 def lease_env(tmp_path):
+    # Scratch HOME with a dummy token (see test_lease_fake.lease_env:
+    # the post-start shape assertion reads the binding under HOME).
+    home = tmp_path / "home"
+    token = home / ".config" / "colab-cli" / "token.json"
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text('{"refresh_token": "fake-test-token"}')
+    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
     return dict(
         os.environ,
+        HOME=str(home),
         COLAB_BIN=str(FAKE),
         FAKE_COLAB_STATE=str(tmp_path / "fake"),
         COLAB_RUNNER_VAR=str(tmp_path / "var"),
+        # Session shape gate: the suite's test actor claim (see
+        # test_lease_fake.lease_env); the standing-duty tests use
+        # standing_env instead, so lobby admission rides the gate's
+        # infra exemption exactly as the hook runs it.
+        COLAB_LEASE_ACTOR="test",
         KEEPALIVE_MAX_CYCLES="2",
         KEEPALIVE_INTERVAL_SECONDS="0",
         KEEPALIVE_ALLOW_NONCOLAB="1",
     )
+
+
+def standing_env(tmp_path):
+    """lease_env without the test actor claim: the standing duty's
+    admission is the infra exemption (actor standing + the
+    configured standing profile), never a bypass."""
+    env = lease_env(tmp_path)
+    env.pop("COLAB_LEASE_ACTOR", None)
+    return env
 
 
 def run_lease(env, *args, expect_rc=0):
@@ -134,7 +156,7 @@ def test_grant_burst_profile_recorded(tmp_path):
 
 
 def test_grant_then_standing_acquires_lobby(tmp_path):
-    env = lease_env(tmp_path)
+    env = standing_env(tmp_path)
     assert run_lease(env, "standing")["action"] == "no-grant"
     granted = run_lease(env, "grant", "--hours", "4")
     g = granted["grant"]
@@ -156,7 +178,7 @@ def test_grant_then_standing_acquires_lobby(tmp_path):
 
 
 def test_grant_expiry_standing_releases_lobby(tmp_path):
-    env = lease_env(tmp_path)
+    env = standing_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     assert run_lease(env, "standing")["action"] == "standing-acquired"
     expire_grant(env)
@@ -172,7 +194,7 @@ def test_grant_expiry_standing_releases_lobby(tmp_path):
 
 
 def test_grant_expiry_reap_releases_lobby(tmp_path):
-    env = lease_env(tmp_path)
+    env = standing_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     assert run_lease(env, "standing")["action"] == "standing-acquired"
     expire_grant(env)
@@ -185,7 +207,7 @@ def test_grant_expiry_reap_releases_lobby(tmp_path):
 
 
 def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
-    env = lease_env(tmp_path)
+    env = standing_env(tmp_path)
     var(env).mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     # Seed attributed lobby spend at (standing cap - 0.1): a
@@ -208,7 +230,7 @@ def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
 
 
 def test_ungrant_releases_lobby(tmp_path):
-    env = lease_env(tmp_path)
+    env = standing_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     assert run_lease(env, "standing")["action"] == "standing-acquired"
     out = run_lease(env, "ungrant")
@@ -307,7 +329,7 @@ def test_state_specs_and_shape(tmp_path):
     assert specs["lobby"]["rate_cu_per_hour"] == 0.08
     assert specs["lobby"]["session"] == "lobby"
     assert specs["t4"]["gpu"] == "T4"
-    assert set(specs["workload"]) == {"id", "label", "session", "gpu", "tpu", "high_mem", "rate_cu_per_hour", "timeout", "parallel"}
+    assert set(specs["workload"]) == {"id", "label", "session", "gpu", "tpu", "high_mem", "rate_cu_per_hour", "timeout", "parallel", "agent_startable"}
     # The parallel block is served ready (parallel-instances plan):
     # CPU eligible with the live toggle state (workload's is on in the
     # live config), the T4 ineligible.

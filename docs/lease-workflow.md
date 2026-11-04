@@ -494,3 +494,90 @@ session and deadline untouched, and the reaper kept both across
 subsequent cycles. The stop path was proven on a standard-tier
 instance instead: `standard2` created, pulsed, released, and
 journaled at 0.08 CU/h, after which its toggle came off cleanly.
+
+
+## Session shape gate (2026-11-04)
+
+Agent actors may create only High-RAM CPU sessions. The incident
+behind the gate: a session bound under a High-RAM profile name
+proved to be a Standard assignment (endpoint prefix `m-s-`), and
+Standard-tier work ground serially on it for hours — the profile a
+caller names is not proof of the shape the server assigns. The
+gate is a creation-time policy, not a lifecycle policy: adopting
+or reusing a live session, `extend`, and `release` are never
+gated.
+
+### Lifecycle
+
+- **Birth:** the policy is born as the `session_gate` block in
+  `config/lease.json` (`enabled`, `agent_classes`,
+  `bypass_actors`, `infra_actor`). An absent block enforces the
+  built-in defaults — High-RAM only, panel bypass, standing infra
+  actor — so deleting the block never opens the gate.
+- **Reads:** the core reads the block fresh on every invocation;
+  there is no cached or compiled copy to go stale.
+- **Change:** edit the block. Widening `agent_classes` or
+  `bypass_actors` is a config edit, reviewed like any other.
+- **Death:** only an explicit `"enabled": false` disables the
+  gate. Nothing else — no env var, no flag — turns it off, and a
+  disabled gate still resolves through the same code path
+  (fixtures use the explicit disable to state their intent).
+
+### Where it sits
+
+- `acquire()`'s creation branch (the adopt/reuse paths above it
+  are untouched), including the demand path: `request` refuses an
+  attributed, catalogued, blocked demand at write time, and
+  `auto` consumption clears a refused demand (`skipped-shape`)
+  instead of retrying it forever.
+- Renewal re-creation, as a bare class check — no actor bypass
+  ever applies to a renewal. A refused renewal recreates nothing;
+  the record persists and the reap surfaces `renewal-failed`.
+- The wrappers that create sessions outside the lease core
+  (`bin/colab-up`, `bin/colab-run`'s lease-disabled fallback)
+  consult the core's single verdict seam, `bin/colab-lease
+  admission [profile] [--via TAG]`, before any CLI call.
+- The bridge agent's mint: kit install stamps
+  `agent_allowed_profiles` into the bridge config, and the agent
+  refuses any other profile at mint time (a config without the
+  stamp derives the same set from its snapshot's shapes).
+- A post-start assertion on every fresh create in `acquire()`:
+  the local binding's endpoint host class (`m-hm-` / `m-s-`) is
+  compared with the profile's declared RAM class. A proven
+  mismatch is stopped via `stop_session_safe` and refused as
+  `shape-mismatch` — no lease record is written. Unreadable or
+  unparseable evidence never triggers the assertion.
+
+### Actors
+
+A requester's identity is the pair (via tag, `COLAB_LEASE_ACTOR`
+env claim). A bare via tag is caller-asserted and never sufficient
+for a bypass.
+
+- **Agent** (anything else): may create only `agent_classes`
+  shapes (High-RAM). GPU/TPU profiles are their own classes and
+  are agent-blocked.
+- **Panel:** bypasses only with both halves — the server sets
+  `COLAB_LEASE_ACTOR=panel` in the child env on every core call
+  (and the unit/ui.sh carry the same claim), and the action calls
+  pass `--via panel`. Either half alone is refused.
+- **Standing infra:** the infra actor (`standing`) admitting
+  exactly the configured standing profile (the Standard lobby)
+  rides the exemption; the same actor is gated like any agent on
+  every other profile.
+- **Probe door:** `COLAB_LEASE_ACTOR=test` is whitelisted in
+  `bypass_actors` for deliberate live probes of Standard/GPU
+  shapes. It is set in the probe's own command environment only,
+  never exported into a shell or a unit, and every use is
+  journaled as a bypass.
+
+### Journal and surface
+
+Refusals, load-bearing bypasses, infra admissions, refused-demand
+dispositions, and shape mismatches are appended to
+`var/session-gate-journal.jsonl` (kinds `shape-refused`,
+`shape-bypass`, `shape-infra`, `demand-shape-refused`,
+`shape-mismatch`, each naming the seam, profile, and shape class).
+`state` serves the resolved policy as `session_gate` and each
+spec's `agent_startable`, so the panel renders the gate's effect
+from served data.

@@ -249,6 +249,16 @@ def test_start_invokes_acquire_and_appends_event(ui):
     assert events[0]["detail"]["hours"] == 2
 
 
+def test_start_carries_panel_actor_claim(ui):
+    # Session shape gate: the server claims the panel actor in the
+    # child env on every core call, so a panel start can ride the
+    # core's bypass (env claim + --via panel together).
+    status, _result = ui.post("/api/lease/start", {"profile": "standard", "hours": 1})
+    assert status == 200
+    assert "acquire standard --hours 1 --via panel" in ui.invocations()
+    assert "actor:panel" in ui.invocations()
+
+
 def test_stop_grant_ungrant_flow_and_seqs(ui):
     status, result = ui.post("/api/lease/stop", {"profile": "workload"})
     assert status == 200 and result["action"] == "released"

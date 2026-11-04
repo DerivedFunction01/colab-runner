@@ -12,6 +12,9 @@ set -euo pipefail
 
 UI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$UI_DIR")"
+# The panel's actor identity for the core's session shape gate
+# (the systemd unit carries the same claim in its Environment).
+export COLAB_LEASE_ACTOR=panel
 VAR_DIR="${COLAB_RUNNER_VAR:-$REPO/var}"
 PIDFILE="$VAR_DIR/lease-ui.pid"
 LOG="$VAR_DIR/lease-ui.log"

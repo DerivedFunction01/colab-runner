@@ -39,3 +39,10 @@ EOF
 profile_field() { # profile name, field -> value
   "$PY" -c "import json,sys; print(json.load(open('$REPO_ROOT/config/profiles.json'))['profiles'][sys.argv[1]][sys.argv[2]])" "${1:-$(default_profile)}" "$2"
 }
+
+gate_check() { # profile name -> the session shape gate's admission verdict JSON; exit 0 admitted, 1 refused
+  # The wrappers that create sessions bypass the lease core, so they
+  # consult its single admission seam (bin/colab-lease) before any
+  # CLI call. Prints the verdict JSON either way.
+  "$REPO_ROOT/bin/colab-lease" admission "${1:-$(default_profile)}"
+}

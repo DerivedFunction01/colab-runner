@@ -10,6 +10,7 @@ Type=simple
 WorkingDirectory=@ROOT@
 Environment=HOME=@HOME@
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=COLAB_LEASE_ACTOR=panel
 ExecStart=@PYTHON@ @ROOT@/ui/server.py
 Restart=always
 RestartSec=2

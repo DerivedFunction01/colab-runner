@@ -300,6 +300,149 @@ def set_parallel(repo: Path, profile_name: str, enabled: bool) -> dict:
     return {"action": "parallel-updated", "profile": profile_name, "enabled": bool(enabled), "instance": inst_id, "previous": previous}
 
 
+# --- Session shape gate -------------------------------------------------------
+# Admission control over session creation (plan:
+# .plans/2026-11-04-agent-session-shape-gate.md). An agent-side actor
+# may start or request only High-RAM CPU sessions; the lease UI is
+# the sole bypass, identified by the via tag "panel" AND the env
+# claim COLAB_LEASE_ACTOR=panel, which only the UI server's process
+# tree carries — a bare --via panel flag is not a bypass. Other
+# whitelisted claims (the repo's own live probes use "test") ride
+# the env claim alone and are journaled like any bypass. Policy
+# lives in config/lease.json's session_gate block; an absent or
+# partial block enforces the built-in defaults (fail-closed), and
+# only an explicit "enabled": false inside the block turns the gate
+# off. The core re-reads the config on every invocation, so a policy
+# edit takes effect on the next start attempt everywhere.
+#
+# The gate is admission, not eviction: it is consulted only where a
+# session is about to be created (acquire's creation branch, the
+# demand path, renewal re-creation, the session-creating wrappers),
+# never on adopt, extend, or release. Refusals and bypass/infra
+# admissions are journaled to var/session-gate-journal.jsonl. Like
+# the budget guard, this is a guardrail against accidents and drift
+# at the same trust level — not a security boundary against a
+# determined operator-level agent: its strength is that every
+# legitimate path is funneled and every bypass is deliberate and
+# journaled.
+
+ACTOR_ENV_CLAIM = "COLAB_LEASE_ACTOR"
+PANEL_ACTOR = "panel"
+GATE_DEFAULT_AGENT_CLASSES = ("high_ram",)
+GATE_DEFAULT_BYPASS_ACTORS = (PANEL_ACTOR,)
+GATE_DEFAULT_INFRA_ACTOR = "standing"
+
+
+def shape_class(profile: dict) -> str:
+    """A catalog entry's shape class: "gpu" / "tpu" for accelerator
+    shapes (an accelerator is its own class even with high_mem),
+    else "high_ram" for a high-memory CPU shape, else "standard"."""
+    if profile.get("gpu"):
+        return "gpu"
+    if profile.get("tpu"):
+        return "tpu"
+    return "high_ram" if profile.get("high_mem") else "standard"
+
+
+def session_gate_policy(repo: Path) -> dict:
+    """The effective session_gate policy: config/lease.json's block
+    over the built-in defaults. The defaults enforce — an absent or
+    partial block never opens access."""
+    raw = load_config(repo).get("session_gate")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def str_list(key, default):
+        value = raw.get(key)
+        if isinstance(value, list) and value and all(isinstance(v, str) and v for v in value):
+            return list(value)
+        return list(default)
+
+    infra = raw.get("infra_actor")
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "agent_classes": str_list("agent_classes", GATE_DEFAULT_AGENT_CLASSES),
+        "bypass_actors": str_list("bypass_actors", GATE_DEFAULT_BYPASS_ACTORS),
+        "infra_actor": infra if isinstance(infra, str) and infra else GATE_DEFAULT_INFRA_ACTOR,
+    }
+
+
+def gate_journal_path(repo: Path) -> Path:
+    return var_dir(repo) / "session-gate-journal.jsonl"
+
+
+def append_gate_journal(repo: Path, event: dict) -> bool:
+    """Append one gate event (a refusal, a bypass or infra
+    admission, a shape mismatch) to var/session-gate-journal.jsonl.
+    Best-effort like the grant ledger — a failed journal write
+    never breaks the admission decision it records."""
+    try:
+        p = gate_journal_path(repo)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **event}) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def check_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None) -> dict:
+    """Admission verdict for creating a session for `profile_name`
+    (pure: no journaling, no colab calls). The verdict names the
+    profile, its shape class, the actor evidence, and the basis:
+    disabled / agent-allowed / bypass / infra / refused.
+
+    Bypass: the env claim names a whitelisted bypass actor; the
+    panel claim additionally requires the via tag to corroborate
+    it (the panel's two halves — see the section note). Infra: the
+    standing exemption — the infra actor admitting exactly the
+    configured standing profile, nothing else."""
+    if profile is None:
+        profile = catalog_profiles(repo).get(profile_name) or {}
+    policy = session_gate_policy(repo)
+    cls = shape_class(profile)
+    env = os.environ.get(ACTOR_ENV_CLAIM) or None
+    verdict = {"allowed": False, "profile": profile_name, "shape_class": cls, "via": via, "env_actor": env, "bypass": False}
+    if not policy["enabled"]:
+        return {**verdict, "allowed": True, "basis": "disabled"}
+    if cls in policy["agent_classes"]:
+        return {**verdict, "allowed": True, "basis": "agent-allowed"}
+    if env is not None and env in policy["bypass_actors"] and (env != PANEL_ACTOR or via == PANEL_ACTOR):
+        return {**verdict, "allowed": True, "basis": "bypass", "bypass": True}
+    standing_profile = load_config(repo).get("standing", {}).get("profile", "lobby")
+    if via is not None and via == policy["infra_actor"] and profile_name == standing_profile:
+        return {**verdict, "allowed": True, "basis": "infra"}
+    return {**verdict, "basis": "refused", "action": "shape-refused", "actor": via or env or "agent", "agent_classes": policy["agent_classes"]}
+
+
+def enforce_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None, seam: str = "acquire") -> dict | None:
+    """check_session_admission plus journaling, for the creation
+    seams: a refusal returns the verdict (action shape-refused) for
+    the caller to surface; an admission returns None, journaling
+    first when it rode a bypass or the infra exemption —
+    agent-allowed admissions are the common case and stay
+    unjournaled."""
+    verdict = check_session_admission(repo, profile_name, via=via, profile=profile)
+    if not verdict["allowed"]:
+        append_gate_journal(repo, {"kind": "shape-refused", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "agent_classes": verdict.get("agent_classes")})
+        return verdict
+    if verdict["basis"] in ("bypass", "infra"):
+        append_gate_journal(repo, {"kind": f"shape-{verdict['basis']}", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"]})
+    return None
+
+
+def renewal_admission(repo: Path, profile_name: str | None, profile: dict) -> dict:
+    """Admission for a renewal re-creation: no actor bypass applies
+    (a renewal is the system's continuation of an existing window,
+    never a panel or probe act) and standing records never reach
+    the renewal drivers, so this is the bare class check under the
+    policy."""
+    policy = session_gate_policy(repo)
+    cls = shape_class(profile)
+    allowed = not policy["enabled"] or cls in policy["agent_classes"]
+    return {"allowed": allowed, "profile": profile_name, "shape_class": cls, "agent_classes": policy["agent_classes"]}
+
+
 def record_path(repo: Path) -> Path:
     """The legacy single-lease record path. Current records live per
     profile (profile_record_path); this file is only the migration
@@ -708,6 +851,28 @@ def session_host(session: str) -> str | None:
     return None
 
 
+def created_shape_mismatch(session: str, profile: dict) -> dict | None:
+    """Post-start shape assertion (session shape gate): the shape
+    the server actually assigned, read from the local binding's
+    endpoint host (an m-hm- host is high-RAM, an m-s- host is
+    standard), against the profile's declared RAM class — the RAM
+    dimension only, the one the incident proved can silently differ
+    from the name the session was created under. A dict naming the
+    mismatch, or None — including when the evidence is unreadable
+    or unparseable: the assertion never acts on evidence it cannot
+    read."""
+    host = session_host(session)
+    if not host:
+        return None
+    m = re.match(r"m-(hm|s)-", host)
+    if not m:
+        return None
+    actual_high = m.group(1) == "hm"
+    if actual_high == bool(profile.get("high_mem")):
+        return None
+    return {"action": "shape-mismatch", "session": session, "declared_high_mem": bool(profile.get("high_mem")), "actual_class": "high_ram" if actual_high else "standard", "host": host}
+
+
 def stop_session_safe(colab, session: str) -> str:
     """Stop a session; never raise. `colab stop` hangs on a wedged kernel
     (measured), so fall back to a direct server-side unassign through the
@@ -1033,10 +1198,30 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
             return {"action": "acquire-unknown", "session": session}
         adopted_foreign = fstate == "alive"
     if not adopted_foreign:
+        # Session shape gate: the creation branch only — adopting
+        # or reusing a live session above is never gated.
+        refusal = enforce_session_admission(repo, profile_name, via=via, profile=profile, seam="acquire")
+        if refusal is not None:
+            return refusal
         args = ["new", "-s", session] + _session_shape_args(profile)
         r = colab(*args, timeout=600)
         if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
             return {"action": "create-failed", "error": (r.stderr or r.stdout).strip()[-300:]}
+        if r.returncode == 0 and session_gate_policy(repo)["enabled"]:
+            # Post-start shape assertion: the profile the CLI was
+            # handed is not proof of the shape the server assigned
+            # (the 2026-11-04 Standard session bound under a
+            # High-RAM profile name). Only a fresh create is
+            # asserted — the "already" path above is a reuse, which
+            # is never gated. A proven mismatch is stopped and
+            # refused: no lease record is written for a session of
+            # the wrong shape. The assertion is part of the gate: a
+            # policy disabled in config stands it down too.
+            mismatch = created_shape_mismatch(session, profile) if session_state(colab, session) == "alive" else None
+            if mismatch is not None:
+                stop = stop_session_safe(colab, session)
+                append_gate_journal(repo, {"kind": "shape-mismatch", "seam": "acquire", "profile": profile_name, "declared_high_mem": mismatch["declared_high_mem"], "actual_class": mismatch["actual_class"], "stop": stop})
+                return {**mismatch, "profile": profile_name, "stop": stop}
     deadline = now_dt + timedelta(hours=effective_hours)
     rec = {
         "profile": profile_name,
@@ -1299,6 +1484,16 @@ def _renew_fresh_session(colab, repo: Path, cfg: dict, rec: dict, now_dt: dateti
     # instance's shape (and its renewal session naming) derives from
     # its base through the derived catalog entry.
     profile = catalog_profiles(repo).get(rec.get("profile"), {})
+    # Session shape gate: a renewal re-creates the session, so the
+    # record's shape is re-checked (renewal_admission — no actor
+    # bypass). A refusal recreates nothing: returning None keeps
+    # the record for the next cycle, whose reap surfaces
+    # renewal-failed until the window's end releases it — the shape
+    # is surfaced, never silently perpetuated.
+    gate = renewal_admission(repo, rec.get("profile"), profile)
+    if not gate["allowed"]:
+        append_gate_journal(repo, {"kind": "shape-refused", "seam": "renewal", "profile": rec.get("profile"), "shape_class": gate["shape_class"], "agent_classes": gate["agent_classes"]})
+        return None
     base = profile.get("session") or rec["session"]
     new_session = f"{base}-r{int(now_dt.timestamp())}"
     try:
@@ -1710,6 +1905,7 @@ def specs(repo: Path, colab=None) -> list[dict]:
     name; the UI shows labels); a profile without one falls back to
     its id."""
     toggles = parallel_toggles(repo)
+    gate = session_gate_policy(repo)
     out = []
     for profile_id, profile in catalog_profiles(repo, colab).items():
         entry = {
@@ -1721,6 +1917,10 @@ def specs(repo: Path, colab=None) -> list[dict]:
             "high_mem": bool(profile.get("high_mem", False)),
             "rate_cu_per_hour": profile.get("rate_cu_per_hour"),
             "timeout": profile.get("timeout"),
+            # Session shape gate, served ready: whether an agent
+            # actor may start this profile (the panel itself is a
+            # bypass actor and can start any of them).
+            "agent_startable": not gate["enabled"] or shape_class(profile) in gate["agent_classes"],
         }
         # The parallel block is served ready (eligibility, toggle
         # state, instance id): the UI renders it and decides nothing.
@@ -1987,8 +2187,14 @@ def install_bridge_kit(colab, repo: Path, rec: dict, generation: str) -> dict:
         profiles[name] = {"high_mem": bool(prof.get("high_mem")), "gpu": prof.get("gpu"), "tpu": prof.get("tpu"), "rate_cu_per_hour": prof.get("rate_cu_per_hour")}
     var = var_dir(repo)
     var.mkdir(parents=True, exist_ok=True)
+    # Session shape gate: the bridge agent mints children in-VM,
+    # beyond the core's reach, so the install stamps the profiles
+    # an agent mint may create under the current policy; the agent
+    # refuses any other profile at mint time.
+    gate = session_gate_policy(repo)
+    agent_allowed = sorted(name for name, prof in profiles.items() if not gate["enabled"] or shape_class(prof) in gate["agent_classes"])
     cfg_local = var / "bridge-config.json"
-    cfg_local.write_text(json.dumps({"session": session, "generation": generation, "limits": bridge_limits(cfg), "profiles": profiles}, indent=2))
+    cfg_local.write_text(json.dumps({"session": session, "generation": generation, "limits": bridge_limits(cfg), "profiles": profiles, "agent_allowed_profiles": agent_allowed}, indent=2))
     if not _ensure_remote_dirs(colab, repo, session, [BRIDGE_KIT_REMOTE, f"{BRIDGE_REMOTE}/queue", f"{BRIDGE_REMOTE}/log", f"{BRIDGE_REMOTE}/results"], "bridge"):
         return {"bridge_install": "install-failed", "stage": "mkdir"}
     uploads = [
@@ -2235,7 +2441,7 @@ def state_specs(colab, repo: Path) -> dict:
     cache; a portion read never triggers a fresh catalog parse
     beyond what specs() itself already does)."""
     _shapes, catalog_error = _cli_shapes(repo, colab)
-    out = {"specs": specs(repo, colab)}
+    out = {"specs": specs(repo, colab), "session_gate": session_gate_policy(repo)}
     if catalog_error:
         out["catalog_error"] = catalog_error
     return out
@@ -2294,6 +2500,16 @@ def write_request(repo: Path, reason: str = "", profile: str | None = None, now_
     (two-tier envelope plan — a timed start is data the hook consumes,
     never an agent-fired command)."""
     now_dt = now_dt or datetime.now(timezone.utc)
+    # Session shape gate, early refusal: a demand whose requester
+    # is identified (a via tag) and whose profile is catalogued is
+    # checked now, so a refused demand never sits in the file for
+    # the duty to retry. An unattributed demand (no via) defers to
+    # the consumption check in auto_acquire, which re-checks with
+    # the demand's via — possibly none — before acquiring.
+    if via is not None and profile is not None and profile in catalog_profiles(repo):
+        refusal = enforce_session_admission(repo, profile, via=via, seam="request")
+        if refusal is not None:
+            return refusal
     req = {"requested_at": now_dt.isoformat(), "reason": reason, "profile": profile}
     if via:
         req["via"] = via
@@ -2372,6 +2588,15 @@ def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     if action == "adopted":
         clear_request(repo)
         return {"action": "satisfied-live", "session": result["record"]["session"]}
+    if action == "shape-refused":
+        # A shape refusal is permanent for this demand (unlike a
+        # budget refusal, which a later poll may outgrow): clear
+        # the demand so the duty never retries it forever. The
+        # refusal itself is journaled at the acquire seam; this
+        # entry records the demand's disposition.
+        clear_request(repo)
+        append_gate_journal(repo, {"kind": "demand-shape-refused", "seam": "auto", "profile": profile_name, "via": req.get("via"), "shape_class": result.get("shape_class")})
+        return {"action": "skipped-shape", "profile": profile_name, "shape_class": result.get("shape_class")}
     if action == "refused-budget":
         return {"action": "skipped-budget", "budget": result.get("budget")}
     if action == "acquire-unknown":

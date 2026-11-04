@@ -103,6 +103,20 @@ def test_duty_installs_then_cools_down(tmp_path, monkeypatch):
     assert len([c for c in fake.calls if c[0] == "upload"]) == uploads
 
 
+def test_install_stamps_agent_allowed_profiles(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".config" / "colab-cli").mkdir(parents=True)
+    (tmp_path / ".config" / "colab-cli" / "token.json").write_text("{}")
+    lease.write_grant(repo, 3, now_dt=NOW)
+    seed_lobby(repo)
+    out = lease.bridge_duty(Fake(), repo, NOW)
+    assert out["bridge_install"] == "installed"
+    cfg = json.loads((repo / "var" / "bridge-config.json").read_text())
+    # Session shape gate: only the High-RAM profile is agent-mintable.
+    assert cfg["agent_allowed_profiles"] == ["workload"]
+
+
 def armed_setup(tmp_path):
     repo = make_repo(tmp_path)
     lease.write_grant(repo, 3, now_dt=NOW)

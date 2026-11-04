@@ -22,6 +22,15 @@ spec = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py
 lease = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lease)
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def gate_permissive(monkeypatch):
+    """Session shape gate: permissive fixture state, declared
+    explicitly (see test_lease_unit.gate_permissive)."""
+    monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
+
 
 def cp(stdout="", rc=0):
     return subprocess.CompletedProcess([], rc, stdout, "")

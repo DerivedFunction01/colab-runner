@@ -17,11 +17,29 @@ FAKE = REPO / "tests" / "fixtures" / "fake_colab.py"
 
 
 def lease_env(tmp_path):
+    # A scratch HOME with a dummy token: the post-start shape
+    # assertion reads the local sessions binding under HOME, and
+    # the real binding belongs to live sessions — a CLI test's
+    # fresh create must never be judged against it. The empty
+    # binding file also blocks the transient mirror's
+    # restore-if-missing from planting the real binding here;
+    # tests that exercise the assertion write their own binding.
+    home = tmp_path / "home"
+    token = home / ".config" / "colab-cli" / "token.json"
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text('{"refresh_token": "fake-test-token"}')
+    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
     return dict(
         os.environ,
+        HOME=str(home),
         COLAB_BIN=str(FAKE),
         FAKE_COLAB_STATE=str(tmp_path / "fake"),
         COLAB_RUNNER_VAR=str(tmp_path / "var"),
+        # Session shape gate: the suite's door is the whitelisted
+        # test actor claim (the live config's session_gate block
+        # lists it); gate-specific tests pop it to run as a plain
+        # agent actor.
+        COLAB_LEASE_ACTOR="test",
         # Keepalive: two instant cycles in the sandbox, then exit — an
         # unbounded loop here would leak a process onto this machine.
         KEEPALIVE_MAX_CYCLES="2",
@@ -100,7 +118,7 @@ def dummy_home_env(env, tmp_path):
     renewal kit's token staging never touches the real login."""
     home = tmp_path / "home"
     token = home / ".config" / "colab-cli" / "token.json"
-    token.parent.mkdir(parents=True)
+    token.parent.mkdir(parents=True, exist_ok=True)
     token.write_text('{"refresh_token": "fake-test-token"}')
     env["HOME"] = str(home)
     return env
@@ -130,23 +148,28 @@ def test_extend_cli_rejects_bad_hours(tmp_path):
 
 
 def test_reap_renews_window_lease_with_fresh_session(tmp_path):
+    # The subject profile is the High-RAM one: renewal re-checks
+    # the shape with no actor bypass (session shape gate), so a
+    # Standard window lease's renewal is refused by design — that
+    # refusal is covered in the gate tests below.
     env = dummy_home_env(lease_env(tmp_path), tmp_path)
-    run_lease(env, "acquire", "standard", "--hours", "2")
-    rec = record(env)
+    run_lease(env, "acquire", "workload", "--hours", "2")
+    rec_path = Path(env["COLAB_RUNNER_VAR"]) / "lease-workload.json"
+    rec = json.loads(rec_path.read_text())
     now = datetime.now(timezone.utc)
     rec["renew"] = True
     rec["acquired_at"] = (now - timedelta(hours=12)).isoformat()  # past the threshold
     rec["deadline"] = (now + timedelta(hours=12)).isoformat()
-    record_path(env).write_text(json.dumps(rec))
+    rec_path.write_text(json.dumps(rec))
     out = run_lease(env, "reap")
     assert out["action"] == "renewed"
     assert out["driver"] == 2  # no kit in the fake world: reaper fallback
-    after = record(env)
-    assert after["session"].startswith("standard-r")
+    after = json.loads(rec_path.read_text())
+    assert after["session"].startswith("workload-r")
     assert after["deadline"] == rec["deadline"]  # the window end never moves
     sessions = Path(env["FAKE_COLAB_STATE"]) / "sessions"
     assert (sessions / after["session"] / "ACTIVE").exists()
-    assert not (sessions / "standard" / "ACTIVE").exists()
+    assert not (sessions / "workload" / "ACTIVE").exists()
 
 
 # --- Parallel instances (plan: .plans/2026-11-03-parallel-cpu-sessions.md) -----
@@ -207,9 +230,17 @@ def parallel_repo(tmp_path, monkeypatch, daily_cap=15):
     (cfg_dir / "lease.json").write_text(json.dumps({
         "enabled": True, "daily_cu_budget": daily_cap, "monthly_cu_budget": 150, "max_hours": 8,
         "keepalive": {"enabled": True, "interval_seconds": 60, "pulse_seconds": 600, "stale_seconds": 600},
+        # Permissive fixture state for the session shape gate: the
+        # general suite predates it; the gate's own tests below run
+        # under an enforcing fixture (gate_repo).
+        "session_gate": {"enabled": False},
     }, sort_keys=True, separators=(",", ":")))
     (tmp_path / "snippets").symlink_to(REPO / "snippets")
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    # A scratch HOME keeps the local sessions binding (which the
+    # post-start shape assertion reads) out of these in-process
+    # tests: the real binding belongs to live sessions.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return tmp_path
 
 
@@ -329,7 +360,7 @@ def test_state_portions_and_composition(tmp_path, monkeypatch):
     # The fake's help output parses as no catalog, so the specs
     # portion's catalog_error rides the composed payload exactly as
     # it did before the split.
-    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error"}
+    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate"}
     assert composed["catalog_error"] == specs["catalog_error"]
     assert composed["records"] == records["records"]
     assert composed["budget"] == budget["budget"]
@@ -356,7 +387,7 @@ def test_acquire_primes_the_initiating_scope_on_a_new_host(tmp_path):
     env = lease_env(tmp_path)
     home = tmp_path / "home"
     sessions = home / ".config" / "colab-cli" / "sessions.json"
-    sessions.parent.mkdir(parents=True)
+    sessions.parent.mkdir(parents=True, exist_ok=True)
     host = "8080-fake-a.us-east1.prod.r.colab.dev"
     sessions.write_text(json.dumps({"standard": {"url": f"https://{host}"}}))
     env["HOME"] = str(home)
@@ -368,3 +399,224 @@ def test_acquire_primes_the_initiating_scope_on_a_new_host(tmp_path):
     second = run_lease(env, "acquire", "standard")
     assert second["action"] == "adopted"
     assert "prime" not in second  # host unchanged: nothing to prime
+
+
+# --- Session shape gate (plan: .plans/2026-11-04-agent-session-shape-gate.md) --
+# The gate's own tests run in-process under an ENFORCING fixture
+# config (gate_repo), unlike the general suite's permissive doors.
+# One CLI test pins the refusal's exit code and the panel bypass
+# against the live config.
+
+
+def gate_repo(tmp_path, monkeypatch, gate=None):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "profiles.json").write_text(json.dumps({
+        "default_profile": "workload",
+        "profiles": {
+            "workload": {"label": "High-RAM", "high_mem": True, "rate_cu_per_hour": 0.26, "session": "workload", "timeout": 18000},
+            "standard": {"label": "Standard", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "standard", "timeout": 3600},
+            "lobby": {"label": "Lobby", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "lobby", "timeout": 3600},
+            "t4": {"label": "T4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "session": "t4", "timeout": 18000},
+        },
+    }))
+    (cfg_dir / "lease.json").write_text(json.dumps({
+        "enabled": True, "daily_cu_budget": 15, "monthly_cu_budget": 150, "max_hours": 8,
+        "keepalive": {"enabled": True, "interval_seconds": 60, "pulse_seconds": 600, "stale_seconds": 600},
+        "standing": {"profile": "lobby", "daily_cu_cap": 4, "max_session_hours": 12},
+        "session_gate": gate if gate is not None else {"enabled": True, "bypass_actors": ["panel", "test"], "agent_classes": ["high_ram"], "infra_actor": "standing"},
+    }, sort_keys=True, separators=(",", ":")))
+    (tmp_path / "snippets").symlink_to(REPO / "snippets")
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("COLAB_LEASE_ACTOR", raising=False)
+    return tmp_path
+
+
+def gate_journal(repo):
+    p = Path(repo) / "var" / "session-gate-journal.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+
+
+def test_gate_refuses_agent_on_standard_and_gpu(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    out = lease_mod.acquire(fake, repo, "standard", now_dt=PNOW)
+    assert out["action"] == "shape-refused"
+    assert out["shape_class"] == "standard" and out["actor"] == "agent"
+    out = lease_mod.acquire(fake, repo, "t4", now_dt=PNOW)
+    assert out["action"] == "shape-refused"
+    assert out["shape_class"] == "gpu"
+    # No creation was ever attempted for a refused pair.
+    assert not [c for c in fake.calls if c[0] == "new" and "-s" in c]
+    assert lease_mod.load_record(repo, "standard") is None
+    assert lease_mod.load_record(repo, "t4") is None
+    journal = gate_journal(repo)
+    assert [e["kind"] for e in journal] == ["shape-refused", "shape-refused"]
+    assert [e["profile"] for e in journal] == ["standard", "t4"]
+    assert all(e["seam"] == "acquire" for e in journal)
+
+
+def test_gate_allows_agent_high_ram(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    out = lease_mod.acquire(fake, repo, "workload", now_dt=PNOW)
+    assert out["action"] == "created"
+    assert [c for c in fake.calls if c[0] == "new" and "-s" in c] == [("new", "-s", "workload", "--high-mem")]
+    assert gate_journal(repo) == []  # agent-allowed admissions are not journaled
+
+
+def test_gate_panel_bypass_needs_via_and_env(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    # The env claim alone, without the panel via, is not a bypass.
+    monkeypatch.setenv("COLAB_LEASE_ACTOR", "panel")
+    out = lease_mod.acquire(fake, repo, "standard", now_dt=PNOW)
+    assert out["action"] == "shape-refused"
+    # Both halves together bypass, and the bypass is journaled.
+    out = lease_mod.acquire(fake, repo, "standard", now_dt=PNOW, via="panel")
+    assert out["action"] == "created"
+    journal = gate_journal(repo)
+    assert [e["kind"] for e in journal] == ["shape-refused", "shape-bypass"]
+    assert journal[1]["via"] == "panel" and journal[1]["env_actor"] == "panel"
+
+
+def test_gate_via_panel_alone_is_not_a_bypass(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    out = lease_mod.acquire(FakeColab(), repo, "standard", now_dt=PNOW, via="panel")
+    assert out["action"] == "shape-refused"
+
+
+def test_gate_test_claim_bypasses_and_journals(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("COLAB_LEASE_ACTOR", "test")
+    out = lease_mod.acquire(FakeColab(), repo, "standard", now_dt=PNOW)
+    assert out["action"] == "created"
+    journal = gate_journal(repo)
+    assert [e["kind"] for e in journal] == ["shape-bypass"]
+    assert journal[0]["env_actor"] == "test"
+
+
+def test_gate_standing_exemption_is_exact(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    # The infra actor admitting the configured standing profile.
+    out = lease_mod.acquire(fake, repo, "lobby", now_dt=PNOW, via="standing")
+    assert out["action"] == "created"
+    assert [e["kind"] for e in gate_journal(repo)] == ["shape-infra"]
+    # The same actor is gated like any agent on any other profile.
+    out = lease_mod.acquire(fake, repo, "standard", now_dt=PNOW, via="standing")
+    assert out["action"] == "shape-refused"
+
+
+def test_gate_disabled_opens_everything(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch, gate={"enabled": False})
+    out = lease_mod.acquire(FakeColab(), repo, "standard", now_dt=PNOW)
+    assert out["action"] == "created"
+    assert gate_journal(repo) == []
+
+
+def test_gate_absent_block_enforces_defaults(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch, gate=None)
+    # Rewrite the fixture config without the block at all: the
+    # built-in defaults enforce (fail-closed).
+    cfg_path = repo / "config" / "lease.json"
+    cfg = json.loads(cfg_path.read_text())
+    del cfg["session_gate"]
+    cfg_path.write_text(json.dumps(cfg, sort_keys=True, separators=(",", ":")))
+    out = lease_mod.acquire(FakeColab(), repo, "standard", now_dt=PNOW)
+    assert out["action"] == "shape-refused"
+
+
+def test_gate_demand_refusal_clears_and_journals(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("COLAB_RUNNER_AUTO_ACQUIRE", "1")
+    fake = FakeColab()
+    # An attributed demand for a blocked shape is refused at write.
+    out = lease_mod.write_request(repo, reason="burst", profile="standard", via="xbrl-thread", now_dt=PNOW)
+    assert out["action"] == "shape-refused"
+    assert lease_mod.load_request(repo) is None
+    # An unattributed demand defers to consumption, which refuses,
+    # clears the demand, and journals the disposition.
+    out = lease_mod.write_request(repo, reason="burst", profile="standard", now_dt=PNOW)
+    assert out["action"] == "requested"
+    out = lease_mod.auto_acquire(fake, repo, now_dt=PNOW)
+    assert out["action"] == "skipped-shape"
+    assert lease_mod.load_request(repo) is None
+    assert lease_mod.load_record(repo, "standard") is None
+    kinds = [e["kind"] for e in gate_journal(repo)]
+    assert kinds == ["shape-refused", "shape-refused", "demand-shape-refused"]
+
+
+def test_gate_renewal_refuses_standard_window(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    fake = FakeColab()  # nothing alive: both sessions read absent
+    for profile in ("standard", "workload"):
+        lease_mod.save_record(repo, {"profile": profile, "session": profile, "acquired_at": (PNOW - timedelta(hours=12)).isoformat(), "deadline": (PNOW + timedelta(hours=12)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": [], "renew": True})
+    out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    actions = {r["profile"]: r["action"] for r in out["records"]}
+    # The Standard window is not recreated; its record is kept and
+    # the reap surfaces renewal-failed. The High-RAM window renews.
+    assert actions == {"standard": "renewal-failed", "workload": "renewed"}
+    assert lease_mod.load_record(repo, "standard")["session"] == "standard"
+    assert lease_mod.load_record(repo, "workload")["session"].startswith("workload-r")
+    journal = gate_journal(repo)
+    assert [e["kind"] for e in journal] == ["shape-refused"]
+    assert journal[0]["seam"] == "renewal" and journal[0]["profile"] == "standard"
+
+
+def test_gate_cli_refusal_exit_code_and_panel_bypass(tmp_path):
+    """Against the live config: an agent actor (no claim in env) is
+    refused with exit 1 on Standard and GPU profiles; the panel's
+    two halves together start the Standard profile."""
+    env = lease_env(tmp_path)
+    env.pop("COLAB_LEASE_ACTOR", None)
+
+    def run(*args):
+        return subprocess.run([sys.executable, str(REPO / "bin" / "colab-lease"), *args], capture_output=True, text=True, env=env, timeout=300)
+
+    r = run("acquire", "standard")
+    assert r.returncode == 1
+    out = json.loads(r.stdout)
+    assert out["action"] == "shape-refused" and out["shape_class"] == "standard"
+    r = run("acquire", "t4")
+    assert r.returncode == 1
+    assert json.loads(r.stdout)["shape_class"] == "gpu"
+    assert not (Path(env["COLAB_RUNNER_VAR"]) / "lease-standard.json").exists()
+    # A bare --via panel, still without the env claim, is refused.
+    r = run("acquire", "standard", "--via", "panel")
+    assert r.returncode == 1
+    assert json.loads(r.stdout)["action"] == "shape-refused"
+    # Both halves: created.
+    env["COLAB_LEASE_ACTOR"] = "panel"
+    r = run("acquire", "standard", "--via", "panel")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(r.stdout)["action"] == "created"
+
+
+def test_gate_post_start_shape_mismatch_stops_and_refuses(tmp_path):
+    """Step 5: the binding says the fresh workload session came up on a
+    Standard endpoint (m-s-) under a High-RAM profile — the acquire
+    stops it, writes no lease record, and reports shape-mismatch."""
+    env = lease_env(tmp_path)
+    binding = Path(env["HOME"]) / ".config" / "colab-cli" / "sessions.json"
+    binding.write_text(json.dumps({"workload": {"endpoint": "https://m-s-usw3b6-fake.prod.r.colab.dev"}}))
+    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-lease"), "acquire", "workload"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["action"] == "shape-mismatch"
+    assert out["actual_class"] == "standard" and out["declared_high_mem"] is True
+    assert out["stop"] == "stopped"
+    assert not (Path(env["COLAB_RUNNER_VAR"]) / "lease-workload.json").exists()
+    assert not (Path(env["FAKE_COLAB_STATE"]) / "sessions" / "workload" / "ACTIVE").exists()
+    journal = [json.loads(line) for line in (Path(env["COLAB_RUNNER_VAR"]) / "session-gate-journal.jsonl").read_text().splitlines() if line.strip()]
+    assert [e["kind"] for e in journal] == ["shape-mismatch"]
+    assert journal[0]["seam"] == "acquire" and journal[0]["profile"] == "workload"
+    # The agreeing binding (m-hm- for the High-RAM profile) lets
+    # the next acquire through untouched.
+    binding.write_text(json.dumps({"workload": {"endpoint": "https://m-hm-usw3b6-fake.prod.r.colab.dev"}}))
+    out = run_lease(env, "acquire", "workload")
+    assert out["action"] == "created"
+    assert (Path(env["COLAB_RUNNER_VAR"]) / "lease-workload.json").exists()

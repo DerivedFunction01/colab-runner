@@ -19,12 +19,23 @@ FAKE = REPO / "tests" / "fixtures" / "fake_colab.py"
 
 
 def auto_env(tmp_path, enabled):
+    # Scratch HOME with a dummy token (see test_lease_fake.lease_env:
+    # the post-start shape assertion reads the binding under HOME).
+    home = tmp_path / "home"
+    token = home / ".config" / "colab-cli" / "token.json"
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text('{"refresh_token": "fake-test-token"}')
+    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
     return dict(
         os.environ,
+        HOME=str(home),
         COLAB_BIN=str(FAKE),
         FAKE_COLAB_STATE=str(tmp_path / "fake"),
         COLAB_RUNNER_VAR=str(tmp_path / "var"),
         COLAB_RUNNER_AUTO_ACQUIRE="1" if enabled else "0",
+        # Session shape gate: the suite's test actor claim (see
+        # test_lease_fake.lease_env); gate tests pop it.
+        COLAB_LEASE_ACTOR="test",
         KEEPALIVE_MAX_CYCLES="2",
         KEEPALIVE_INTERVAL_SECONDS="0",
         KEEPALIVE_ALLOW_NONCOLAB="1",
@@ -122,3 +133,32 @@ def test_unrequest(tmp_path):
     run_lease(env, "request", "standard")
     assert run_lease(env, "unrequest")["action"] == "request-cleared"
     assert run_lease(env, "auto")["action"] == "no-demand"
+
+
+# --- Session shape gate (plan: .plans/2026-11-04-agent-session-shape-gate.md) --
+# These tests pop the suite's test actor claim so the demand path
+# runs as a plain agent actor, exactly as a thread's demand does.
+
+
+def test_request_refused_at_write_for_agent_standard(tmp_path):
+    env = auto_env(tmp_path, enabled=True)
+    env.pop("COLAB_LEASE_ACTOR", None)
+    out = run_lease(env, "request", "standard", "--reason", "burst", "--via", "xbrl-thread", expect_rc=1)
+    assert out["action"] == "shape-refused"
+    assert out["shape_class"] == "standard"
+    assert not request_file(env).exists()  # a refused demand is never recorded
+
+
+def test_auto_shape_refusal_clears_demand(tmp_path):
+    env = auto_env(tmp_path, enabled=True)
+    env.pop("COLAB_LEASE_ACTOR", None)
+    # No via: the write defers, and consumption refuses + clears,
+    # so the duty never retries a permanently refused demand.
+    run_lease(env, "request", "standard", "--reason", "unattributed")
+    out = run_lease(env, "auto")
+    assert out["action"] == "skipped-shape"
+    assert not request_file(env).exists()
+    assert run_lease(env, "status")["action"] == "no-lease"
+    journal = Path(env["COLAB_RUNNER_VAR"]) / "session-gate-journal.jsonl"
+    kinds = [json.loads(line)["kind"] for line in journal.read_text().splitlines() if line.strip()]
+    assert kinds == ["shape-refused", "demand-shape-refused"]
