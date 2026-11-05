@@ -17,6 +17,11 @@
 # config/callers.example.json — never committed.
 /config/callers.json
 
+# Local lease config: caps, gate policy, and the standing block are
+# operator state for this machine, seeded from the tracked
+# config/lease.example.json — never committed.
+/config/lease.json
+
 # Job results: manifests are tracked under jobs/; payload bytes are not.
 /results/*
 !/results/.gitkeep
