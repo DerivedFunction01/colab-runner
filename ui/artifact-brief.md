@@ -12,19 +12,20 @@ Companion base: `http://127.0.0.1:8793` (ui/server.py in the
 colab-runner repo; always-on while a lease matters, started by
 `ui/ui.sh`). One artifact action per endpoint, JSON in/out:
 
-- `state` — GET /api/state -> {records: [{profile, session, action,
-  record: {deadline, acquired_at, last_used_at, jobs, ...},
-  keepalive_heartbeat_age_s}], grant: {kind, granted_at, until,
-  lobby_profile, burst_profile, scope: {caps, lobby_profile,
-  burst_profile, profiles}} | null, envelope: {id, scope, caps,
+- `state` — GET /api/state -> {records: [{session, action,
+  record: {deadline, acquired_at, last_used_at, jobs, shape, caller,
+  ...}, keepalive_heartbeat_age_s}], grant: {kind, granted_at, until,
+  scope: {caps, standing_shape, burst_shape, shapes}} | null,
+  envelope: {id, scope, caps,
   records: [attributed lease records with envelope_id and via],
   spend: {balance, day_spent, month_spent, standing_day_spent},
-  profile_spend} | null, specs: [{id, label, session,
-  gpu, tpu, high_mem, rate_cu_per_hour (may be null), timeout}], budget:
+  session_spend} | null, specs: [{id, label,
+  gpu, tpu, high_mem, rate_cu_per_hour (may be null),
+  agent_startable}], budget:
   {balance, day_spent, month_spent, standing_day_spent, caps:
-  {daily, monthly, standing_daily}}, profiles, caps}
-- `start` {profile, hours} — POST /api/lease/start -> core result JSON
-- `stop` {profile} — POST /api/lease/stop -> core result JSON
+  {daily, monthly, standing_daily}}, caps}
+- `start` {shape, hours} — POST /api/lease/start -> core result JSON
+- `stop` {session} — POST /api/lease/stop -> core result JSON
 - `grant` {hours, burst?} — POST /api/grant -> core result JSON
 - `ungrant` {} — POST /api/ungrant -> core result JSON
 - `budgetcaps` {daily_cu_budget?, monthly_cu_budget?,

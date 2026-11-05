@@ -53,21 +53,15 @@ def make_repo(tmp_path):
     (repo / "config").mkdir(parents=True)
     (repo / "var").mkdir(parents=True)
     (repo / "snippets").mkdir(parents=True)
-    (repo / "config" / "lease.json").write_text(json.dumps({"enabled": True, "standing": {"profile": "lobby"}}))
-    (repo / "config" / "profiles.json").write_text(json.dumps({
-        "default_profile": "workload",
-        "profiles": {
-            "workload": {"session": "workload", "spec": "high-ram", "rate_cu_per_hour": 0.26, "high_mem": True},
-            "lobby": {"session": "lobby", "spec": "standard", "rate_cu_per_hour": 0.08},
-        },
-    }))
+    (repo / "config" / "lease.json").write_text(json.dumps({"enabled": True, "standing": {"caller": "standing", "shape": "cpu"}}))
+    (repo / "var" / "shape-rates.json").write_text(json.dumps({"cpu": 0.08, "cpu-highram": 0.26}))
     for name in ("bridge_agent.py", "_remote_guard.py"):
         (repo / "snippets" / name).write_text("# test stand-in\n")
     return repo
 
 
 def seed_lobby(repo, now=NOW):
-    rec = {"profile": "lobby", "session": "lobby", "acquired_at": now.isoformat(), "deadline": (now + timedelta(hours=3)).isoformat()}
+    rec = {"session": "lobby", "shape": "cpu", "shape_spec": {"gpu": None, "tpu": None, "high_mem": False}, "rate_cu_per_hour": 0.08, "standing": True, "acquired_at": now.isoformat(), "deadline": (now + timedelta(hours=3)).isoformat()}
     (repo / "var" / "lease-lobby.json").write_text(json.dumps(rec))
     return rec
 
@@ -127,9 +121,9 @@ def armed_setup(tmp_path):
     fake = Fake()
     minted = (NOW - timedelta(hours=1)).isoformat()
     lines = [
-        {"v": 1, "gen": "gen-test-1", "seq": 1, "ts": minted, "kind": "mint", "id": "m1", "name": "bridge-workload-x1", "profile": "workload", "rate": 0.26},
+        {"v": 1, "gen": "gen-test-1", "seq": 1, "ts": minted, "kind": "mint", "id": "m1", "name": "bridge-workload-x1", "shape": "cpu-highram", "rate": 0.26},
         {"v": 1, "gen": "gen-test-1", "seq": 2, "ts": NOW.isoformat(), "kind": "result", "id": "r1", "target": "self", "rc": 0, "out": "hi"},
-        {"v": 1, "gen": "gen-test-1", "seq": 3, "ts": NOW.isoformat(), "kind": "stop", "id": "s1", "name": "bridge-workload-x1", "profile": "workload", "minted_at": minted, "reason": "requested"},
+        {"v": 1, "gen": "gen-test-1", "seq": 3, "ts": NOW.isoformat(), "kind": "stop", "id": "s1", "name": "bridge-workload-x1", "shape": "cpu-highram", "minted_at": minted, "reason": "requested"},
     ]
     fake.remote["/content/bridge/log/bridge-000001.jsonl"] = ("\n".join(json.dumps(x) for x in lines) + "\n").encode()
     status = {"v": 1, "gen": "gen-test-1", "ts": datetime.now(timezone.utc).isoformat(), "session": "lobby", "auth_down": False, "children": [], "queue": 0, "processed": 3, "log_segment": "bridge-000001.jsonl"}
@@ -151,9 +145,8 @@ def test_duty_armed_ferries_acks_and_folds(tmp_path):
     assert (outbox / "u1.json").exists()
     assert fake.remote["/content/bridge/queue/u1.json"] == b"{}"
     journal = [json.loads(x) for x in (repo / "var" / "lease-spend-journal.jsonl").read_text().splitlines()]
-    # The armed fixture's log lines predate the retirement (they
-    # name the child by its legacy profile); the fold translates
-    # the shape from the legacy entry and journals the new keys.
+    # The fold journals the stopped child's segment under its
+    # session and shape at the mint line's rate.
     assert len(journal) == 1 and journal[0]["session"] == "bridge-workload-x1" and journal[0]["shape"] == "cpu-highram"
     # A second pass mirrors nothing new and never double-folds.
     out2 = lease.bridge_duty(fake, repo, NOW)

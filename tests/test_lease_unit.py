@@ -38,8 +38,10 @@ def cp(stdout="", rc=0):
 def seed_record(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     rec = {
-        "profile": "standard",
         "session": "standard",
+        "shape": "cpu",
+        "shape_spec": {"gpu": None, "tpu": None, "high_mem": False},
+        "rate_cu_per_hour": 0.08,
         "acquired_at": "2026-10-29T17:00:00+00:00",
         "deadline": "2026-10-30T01:00:00+00:00",
         "last_used_at": "2026-10-29T17:30:00+00:00",
@@ -367,8 +369,10 @@ def test_release_guard_aborts_when_deadline_moved_on_disk(tmp_path, monkeypatch)
 def seed_window_record(tmp_path, monkeypatch, **over):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     rec = {
-        "profile": "standard",
         "session": "standard",
+        "shape": "cpu",
+        "shape_spec": {"gpu": None, "tpu": None, "high_mem": False},
+        "rate_cu_per_hour": 0.08,
         # 12 h before NOW: at the renewal threshold (cap 12 h - 30 min).
         "acquired_at": "2026-10-29T06:00:00+00:00",
         "deadline": "2026-10-30T06:00:00+00:00",  # window still open
@@ -488,7 +492,7 @@ def test_renewal_skips_unflagged_records(tmp_path, monkeypatch):
 
 
 def test_renewal_skips_standing_records(tmp_path, monkeypatch):
-    seed_window_record(tmp_path, monkeypatch, profile="lobby", session="lobby", standing=True)
+    seed_window_record(tmp_path, monkeypatch, session="lobby", standing=True)
     lease.write_grant(REPO, 24, now_dt=NOW)
     alive, calls = {"lobby"}, []
     out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
@@ -517,7 +521,7 @@ def test_failed_renewal_retries_next_cycle_deadline_untouched(tmp_path, monkeypa
 
 def test_budget_snapshot_serves_standing_day_spend(tmp_path, monkeypatch):
     """The grant card renders standing spend vs cap (mock Panel C), so
-    state must serve the standing profile's day spend — the guard's
+    state must serve the standing caller's day spend — the guard's
     own attributed figure (journaled segments + live records), never
     a balance delta: the same spend must be served whatever the
     balance did in between (external usage, expirations)."""
@@ -528,7 +532,7 @@ def test_budget_snapshot_serves_standing_day_spend(tmp_path, monkeypatch):
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     hours = max((now - day_start).total_seconds() / 3600.0, 1 / 60)
     # One lobby segment covering today so far, rated to total 2.42 CU.
-    seg = {"profile": "lobby", "session": "lobby", "start": day_start.isoformat(), "end": now.isoformat(), "rate": 2.42 / hours}
+    seg = {"caller": "standing", "session": "lobby", "start": day_start.isoformat(), "end": now.isoformat(), "rate": 2.42 / hours}
     (var / "lease-spend-journal.jsonl").write_text(json.dumps(seg) + "\n")
 
     out = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), REPO)
@@ -561,14 +565,14 @@ def test_attributed_spend_splits_segments_at_period_boundaries(tmp_path, monkeyp
     now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
     segs = [
         # Spans midnight into today: 2 h count today (and this month).
-        {"profile": "workload", "session": "workload", "start": "2026-10-31T22:00:00+00:00", "end": "2026-11-01T02:00:00+00:00", "rate": 1.0},
+        {"shape": "cpu-highram", "session": "workload", "start": "2026-10-31T22:00:00+00:00", "end": "2026-11-01T02:00:00+00:00", "rate": 1.0},
         # Last month only: counts for neither period.
-        {"profile": "workload", "session": "workload", "start": "2026-10-15T00:00:00+00:00", "end": "2026-10-15T10:00:00+00:00", "rate": 1.0},
+        {"shape": "cpu-highram", "session": "workload", "start": "2026-10-15T00:00:00+00:00", "end": "2026-10-15T10:00:00+00:00", "rate": 1.0},
         # Unconfirmed rate: journaled, never priced.
-        {"profile": "standard", "session": "s", "start": "2026-11-01T00:00:00+00:00", "end": "2026-11-01T05:00:00+00:00", "rate": None},
+        {"shape": "cpu", "session": "s", "start": "2026-11-01T00:00:00+00:00", "end": "2026-11-01T05:00:00+00:00", "rate": None},
     ]
     (var / "lease-spend-journal.jsonl").write_text("".join(json.dumps(s) + "\n" for s in segs))
-    lease.save_record(REPO, {"profile": "standard", "session": "standard", "acquired_at": "2026-11-01T10:00:00+00:00", "deadline": "2026-11-01T20:00:00+00:00", "last_used_at": "2026-11-01T10:00:00+00:00", "jobs": []})
+    lease.save_record(REPO, {"session": "standard", "shape": "cpu", "shape_spec": {"gpu": None, "tpu": None, "high_mem": False}, "rate_cu_per_hour": 0.08, "acquired_at": "2026-11-01T10:00:00+00:00", "deadline": "2026-11-01T20:00:00+00:00", "last_used_at": "2026-11-01T10:00:00+00:00", "jobs": []})
     out = lease.attributed_spend(REPO, now)
     # Live standard record: 2 h x 0.08 = 0.16 on top of the workload session's 2.0.
     assert out["day_spent"] == 2.16
@@ -613,7 +617,7 @@ def test_release_journals_the_completed_segment(tmp_path, monkeypatch):
 
 # --- The dynamic spec catalog (2026-11-01) ------------------------------------
 # The picker options are parsed from `colab new --help`, never
-# hand-listed; config/profiles.json holds only named profiles.
+# hand-listed; measured rates live in var/shape-rates.json.
 
 HELP_TEXT = """
  Usage: colab new [OPTIONS]
@@ -662,25 +666,20 @@ def _help_stub(help_text=HELP_TEXT):
 
 
 def _tmp_catalog(tmp_path, monkeypatch):
-    cfg = tmp_path / "config"
-    cfg.mkdir(parents=True)
-    (cfg / "profiles.json").write_text(json.dumps({
-        "default_profile": "workload",
-        "profiles": {
-            "workload": {"label": "High-RAM", "high_mem": True, "rate_cu_per_hour": 0.26, "session": "workload", "timeout": 18000},
-            "t4": {"label": "T4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "session": "t4", "timeout": 18000},
-        },
-    }))
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    # The measured-rate table is the catalog's only rate source:
+    # cpu-highram carries its measured 0.26; every other shape is
+    # absent, hence unconfirmed.
+    var = tmp_path / "var"
+    var.mkdir(parents=True)
+    (var / "shape-rates.json").write_text(json.dumps({"cpu-highram": 0.26}))
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(var))
 
 
 def test_specs_dynamic_catalog_covers_the_cli_space(tmp_path, monkeypatch):
     _tmp_catalog(tmp_path, monkeypatch)
     specs = {s["id"]: s for s in lease.specs(tmp_path, _help_stub())}
-    # The catalog is the CLI space itself, keyed by shape. The
-    # legacy profiles file contributes only measured rates, derived
-    # per shape from each entry's own fields: the High-RAM CPU
-    # entry's rate lands on cpu-highram.
+    # The catalog is the CLI space itself, keyed by shape; the
+    # measured-rate table prices cpu-highram and nothing else here.
     assert specs["cpu-highram"]["label"] == "CPU High-RAM"
     assert specs["cpu-highram"]["rate_cu_per_hour"] == 0.26
     assert specs["t4"]["rate_cu_per_hour"] is None

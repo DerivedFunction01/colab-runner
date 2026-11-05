@@ -16,12 +16,11 @@ generated at creation (sync/naming.py) and never reused, the caller
 is the governed attribution claim, and the shape is a catalog shape
 descriptor from the CLI-parsed catalog. State: one record per
 lease, var/lease-<session>.json (override the var dir with
-$COLAB_RUNNER_VAR, used by tests). Records written before the
-profile retirement (keyed per profile, carrying a profile id) are
-translated on read — shape and rate derived from the legacy catalog
-entry the profile named — and a save migrates the record to its
-session path, so no session is ever stopped or recreated by the
-migration. A two-tier grant lives in var/grant.json. The budget
+$COLAB_RUNNER_VAR, used by tests). There is no legacy model: a
+record, grant, or journal segment is read exactly as written, in
+the current shape/caller vocabulary, and anything written in the
+retired profile vocabulary is simply not interpreted. A two-tier
+grant lives in var/grant.json. The budget
 guard's spend is attributed: completed session segments are
 journaled to var/lease-spend-journal.jsonl and live records
 contribute their running segment, so spend counts only this repo's
@@ -64,42 +63,11 @@ def load_config(repo: Path) -> dict:
     return load_json(repo / "config" / "lease.json", {"enabled": False})
 
 
-def _legacy_profiles(repo: Path) -> dict:
-    """The pre-retirement named profiles from config/profiles.json
-    — a LEGACY read, kept only so records and grants written under
-    the profile model can be translated (their shape and rate
-    derived from the entry the profile named) and so a legacy
-    profile's measured rate can seed its shape's rate while the
-    file still exists. New code never resolves work through this;
-    the file is deleted at the retirement's landing, after which
-    this returns {} and translation has nothing left to translate."""
-    return load_json(repo / "config" / "profiles.json", {"profiles": {}}).get("profiles", {})
-
-
-def _legacy_profile_entry(repo: Path, profile_id: str | None) -> dict | None:
-    """One legacy profile's catalog entry, from data alone: the
-    configured entry when the id names one, else the derived
-    parallel instance's entry — an instance was its base's entry
-    under the base id + "2" (the derivation rule, applied to the
-    data), so the instance's shape and rate are its base's. None
-    when the id names nothing the legacy catalog knew."""
-    if not profile_id:
-        return None
-    configured = _legacy_profiles(repo)
-    if profile_id in configured:
-        return configured[profile_id]
-    if profile_id.endswith("2") and profile_id[:-1] in configured:
-        return configured[profile_id[:-1]]
-    return None
-
-
 def shape_id_for(gpu, tpu, high_mem) -> str:
     """The mechanical catalog id for a shape's fields — the same
     derivation the dynamic catalog always used (a GPU variant's
     lowercased name, a TPU's prefixed name, "cpu" for plain CPU;
-    "-highram" appended for a high-memory variant). Translation
-    derives a legacy record's shape through this, from the legacy
-    entry's own fields — never from the profile's name."""
+    "-highram" appended for a high-memory variant)."""
     if gpu:
         return str(gpu).lower() + ("-highram" if high_mem else "")
     if tpu:
@@ -217,12 +185,10 @@ def _shape_entries(shapes: dict | None) -> dict:
 # --- Per-shape measured rates ---------------------------------------------------
 # A shape's rate lives in the measured-rate table
 # (var/shape-rates.json: {shape_id: CU/hour}) — runtime state, the
-# catalog cache's home. A shape absent from the table falls back,
-# while the legacy config still exists, to a legacy profile's
-# measured rate for the same shape, and a CPU shape falls back to
-# config/lease.json's per-tier rate map (the map the budget guard
-# always carried). Anything else is null: unconfirmed, and no cost
-# projection is fabricated for it.
+# catalog cache's home. A CPU shape absent from the table falls
+# back to config/lease.json's per-tier rate map (the map the budget
+# guard always carried). Anything else is null: unconfirmed, and
+# no cost projection is fabricated for it.
 
 
 def shape_rates_path(repo: Path) -> Path:
@@ -236,33 +202,13 @@ def load_shape_rates(repo: Path) -> dict:
     return {k: v for k, v in raw.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
-def _legacy_shape_rate(repo: Path, shape_id: str):
-    """A legacy profile's measured rate for this shape, derived
-    from the legacy entries' own fields (see _legacy_profile_entry)
-    — the transition path that carries the workspace's measured
-    rates across the profiles config's deletion. The first legacy
-    entry whose fields derive this shape and that carries a rate
-    wins."""
-    for entry in _legacy_profiles(repo).values():
-        if not isinstance(entry, dict):
-            continue
-        if shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem"))) == shape_id:
-            rate = entry.get("rate_cu_per_hour")
-            if rate is not None:
-                return rate
-    return None
-
-
 def shape_rate(repo: Path, shape_id: str):
     """A shape's measured CU/hour rate, or None (unconfirmed):
-    the measured-rate table first, then the legacy overlay, then
-    the config tier map for the CPU shapes."""
+    the measured-rate table first, then the config tier map for
+    the CPU shapes."""
     table = load_shape_rates(repo)
     if shape_id in table:
         return table[shape_id]
-    legacy = _legacy_shape_rate(repo, shape_id)
-    if legacy is not None:
-        return legacy
     if shape_id in ("cpu", "cpu-highram"):
         tier = load_config(repo).get("rate_cu_per_hour")
         if isinstance(tier, dict):
@@ -302,17 +248,10 @@ def standing_caller(repo: Path) -> str:
 
 def standing_shape(repo: Path) -> str:
     """The standing lease's shape: config/lease.json's
-    standing.shape when set; while the legacy config still names
-    the standing profile, that profile's derived shape; else the
-    plain CPU shape (the standing lease's historical tier)."""
-    cfg = load_config(repo)
-    raw = cfg.get("standing", {}).get("shape")
+    standing.shape when set, else the plain CPU shape."""
+    raw = load_config(repo).get("standing", {}).get("shape")
     if isinstance(raw, str) and raw:
         return raw
-    legacy_id = cfg.get("standing", {}).get("profile")
-    entry = _legacy_profile_entry(repo, legacy_id) if legacy_id else None
-    if entry is not None:
-        return shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
     return "cpu"
 
 
@@ -503,7 +442,7 @@ def renewal_admission(repo: Path, shape_id: str | None, shape: dict) -> dict:
 # calls (legible on the runtime's approval card, which shows the
 # command line) or as $COLAB_CALLER for drivers and machinery.
 # Thread callers are governed by the local, untracked registry
-# config/callers.json (the config/profiles.json pattern; schema in
+# config/callers.json (an untracked local registry; schema in
 # tracked config/callers.example.json), read fresh at every
 # resolution like the gate policy. The machinery callers are code
 # constants, always valid, so a missing local registry never breaks
@@ -615,13 +554,6 @@ def load_caller_claims(repo: Path) -> dict:
     return out
 
 
-def record_path(repo: Path) -> Path:
-    """The legacy single-lease record path. Current records live
-    per session (session_record_path); this file is only the
-    migration fallback."""
-    return var_dir(repo) / "lease.json"
-
-
 def session_record_path(repo: Path, session: str) -> Path:
     return var_dir(repo) / f"lease-{session}.json"
 
@@ -630,36 +562,10 @@ def _valid_record(data) -> dict | None:
     return data if isinstance(data, dict) and data.get("session") else None
 
 
-def _translate_record(repo: Path, rec: dict) -> dict:
-    """Translate a pre-retirement record in memory: a record that
-    carries a profile id but no shape gains its shape, its shape
-    descriptor, and its rate snapshot from the legacy catalog entry
-    the profile named (derived from the entry's own fields — see
-    shape_id_for), and the profile id is dropped. The caller stamp
-    is kept exactly as written (an unstamped record stays
-    unstamped). A record whose profile names nothing the legacy
-    catalog knew is returned untranslated — its shape stays absent
-    and every consumer treats it on its unknown paths, never on a
-    guessed shape. Idempotent: a translated record has a shape and
-    is never re-derived."""
-    if rec.get("shape") or not rec.get("profile"):
-        return rec
-    entry = _legacy_profile_entry(repo, rec.get("profile"))
-    if entry is None:
-        return rec
-    rec["shape"] = shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
-    rec["shape_spec"] = {"gpu": entry.get("gpu"), "tpu": entry.get("tpu"), "high_mem": bool(entry.get("high_mem"))}
-    if "rate_cu_per_hour" not in rec:
-        rec["rate_cu_per_hour"] = entry.get("rate_cu_per_hour")
-    del rec["profile"]
-    return rec
-
-
 def _record_files(repo: Path) -> list[Path]:
     """Every file that may hold a lease record: the per-session
-    files, the retired per-profile files (same glob — the name a
-    file carries says nothing; its record's session is the key),
-    and the legacy single-record file."""
+    files under var/ (the name a file carries says nothing; its
+    record's session is the key)."""
     var = var_dir(repo)
     files = []
     if var.exists():
@@ -667,17 +573,13 @@ def _record_files(repo: Path) -> list[Path]:
             if path.name in ("lease-spend.json", "lease-request.json"):
                 continue
             files.append(path)
-    legacy = record_path(repo)
-    if legacy.exists():
-        files.append(legacy)
     return files
 
 
 def all_records(repo: Path) -> list[dict]:
-    """Every lease record on disk, translated to the current model.
-    One record per session: when two files hold the same session
-    (a per-session file and its legacy predecessor, mid-migration),
-    the session-keyed file wins. Order: acquisition order."""
+    """Every lease record on disk, exactly as written. One record
+    per session: when two files hold the same session, the
+    session-keyed file wins. Order: acquisition order."""
     by_session: dict[str, dict] = {}
     canonical: set[str] = set()
     for path in _record_files(repo):
@@ -690,7 +592,7 @@ def all_records(repo: Path) -> list[dict]:
             canonical.add(session)
         elif session not in canonical:
             by_session.setdefault(session, rec)
-    recs = [_translate_record(repo, rec) for rec in by_session.values()]
+    recs = list(by_session.values())
     recs.sort(key=lambda r: (r.get("acquired_at") or "", r.get("session") or ""))
     return recs
 
@@ -708,10 +610,9 @@ def load_record(repo: Path, session: str | None = None) -> dict | None:
 
 
 def save_record(repo: Path, rec: dict) -> None:
-    """Write one lease's record at its session path. A save
-    migrates: any other file holding a record for the same session
-    (a per-profile predecessor, the legacy single file) is removed,
-    so a stale copy can never resurrect the lease's old shape."""
+    """Write one lease's record at its session path. Any other
+    file holding a record for the same session is removed, so a
+    stale copy can never resurrect the lease's old shape."""
     session = rec["session"]
     p = session_record_path(repo, session)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -725,10 +626,9 @@ def save_record(repo: Path, rec: dict) -> None:
 
 
 def delete_record(repo: Path, session: str) -> None:
-    """Remove a lease's record, wherever it lives (its session
-    file, a per-profile predecessor, or the legacy single file) —
-    for the same reason save migrates: no stale copy may resurrect
-    a released lease."""
+    """Remove a lease's record, wherever it lives — for the same
+    reason save cleans up: no stale copy may resurrect a released
+    lease."""
     for path in _record_files(repo):
         held = _valid_record(load_json(path, None))
         if held is not None and held.get("session") == session:
@@ -883,7 +783,7 @@ def _journal_segments(repo: Path) -> list[dict]:
             continue
         try:
             seg = json.loads(line)
-            out.append({"session": seg.get("session"), "caller": seg.get("caller"), "shape": seg.get("shape"), "profile": seg.get("profile"), "start": parse_dt(seg["start"]), "end": parse_dt(seg["end"]), "rate": seg.get("rate")})
+            out.append({"session": seg.get("session"), "caller": seg.get("caller"), "shape": seg.get("shape"), "start": parse_dt(seg["start"]), "end": parse_dt(seg["end"]), "rate": seg.get("rate")})
         except (json.JSONDecodeError, KeyError, ValueError):
             continue
     return out
@@ -901,19 +801,15 @@ def attributed_spend(repo: Path, now_dt: datetime | None = None) -> dict:
     {"day_spent", "month_spent", "sessions": {name: {...}},
     "callers": {caller: {...}}}, derived from the segment journal
     plus live records' running segments (see the accounting note
-    above). A pre-retirement segment carries its profile instead of
-    a shape; it still counts toward its session and caller, and a
-    caller-less segment from the legacy standing profile's leases
-    counts toward the standing caller — the sub-cap's history
-    survives translation."""
+    above). A segment counts toward the session and caller it was
+    written with; a caller-less segment counts toward its session
+    and the totals only."""
     now = now_dt or datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = day_start.replace(day=1)
     totals = {"day": 0.0, "month": 0.0}
     per_session: dict[str, dict] = {}
     per_caller: dict[str, dict] = {}
-    legacy_standing_profile = load_config(repo).get("standing", {}).get("profile")
-    standing = standing_caller(repo)
 
     def add(session, caller, start, end, rate):
         d = _overlap_cu(start, end, rate, day_start, now)
@@ -932,10 +828,7 @@ def attributed_spend(repo: Path, now_dt: datetime | None = None) -> dict:
             entry["month_spent"] += m
 
     for seg in _journal_segments(repo):
-        caller = seg["caller"]
-        if caller is None and legacy_standing_profile and seg.get("profile") == legacy_standing_profile:
-            caller = standing
-        add(seg["session"], caller, seg["start"], seg["end"], seg["rate"])
+        add(seg["session"], seg["caller"], seg["start"], seg["end"], seg["rate"])
     for rec in all_records(repo):
         try:
             start = parse_dt(rec["acquired_at"])
@@ -2173,27 +2066,13 @@ def grant_scope(cfg: dict, standing: str, burst: str) -> dict:
 
 
 def grant_shapes(repo: Path, grant: dict) -> list:
-    """The shapes inside a grant's scope. A grant written before
-    the retirement carried no shapes list; its sanctioned shapes
-    are derived from the profile ids its scope named, through the
-    legacy catalog."""
+    """The shapes inside a grant's scope: the scope's own shapes
+    list, exactly as written. A scope that names no shapes
+    sanctions none."""
     scope = grant.get("scope")
     if isinstance(scope, dict) and isinstance(scope.get("shapes"), list) and scope["shapes"]:
         return list(scope["shapes"])
-    out = []
-    candidates = []
-    if isinstance(scope, dict):
-        candidates = [scope.get("lobby_profile"), scope.get("burst_profile")]
-    candidates += [grant.get("lobby_profile"), grant.get("burst_profile")]
-    for pid in candidates:
-        if not pid:
-            continue
-        entry = _legacy_profile_entry(repo, pid)
-        if entry is not None:
-            sid = shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
-            if sid not in out:
-                out.append(sid)
-    return out
+    return []
 
 
 def grant_caps(grant: dict) -> dict | None:
@@ -2270,18 +2149,6 @@ def standing_record(repo: Path) -> dict | None:
     for rec in recs:
         if rec.get("caller") == caller:
             return rec
-    # Legacy tier: a record written before the standing flag and
-    # caller stamps existed is identified by its file's own legacy
-    # profile id matching the config's legacy standing profile —
-    # read from the data, never from a hardcoded name.
-    legacy_id = load_config(repo).get("standing", {}).get("profile")
-    if legacy_id:
-        for path in _record_files(repo):
-            raw = _valid_record(load_json(path, None))
-            if raw is not None and raw.get("profile") == legacy_id:
-                match = next((r for r in recs if r.get("session") == raw.get("session")), None)
-                if match is not None:
-                    return match
     return None
 
 
@@ -2669,17 +2536,11 @@ def _bridge_fold_stop(repo: Path, line: dict, folded: set) -> bool:
     """Fold one completed bridge-child segment into the attributed
     spend journal, once per child stop line (the ferry's folded set
     is the guard). The stop line carries its shape + minted_at,
-    which is everything the journal's segment writer needs; an
-    agent that predates the retirement names the child's shape by
-    its legacy profile id, translated through the legacy catalog —
-    a line naming neither folds nothing."""
+    which is everything the journal's segment writer needs; a line
+    naming no shape folds nothing."""
     if line.get("kind") != "stop" or not line.get("minted_at") or not line.get("name"):
         return False
     shape_id = line.get("shape")
-    if not shape_id and line.get("profile"):
-        entry = _legacy_profile_entry(repo, line["profile"])
-        if entry is not None:
-            shape_id = shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
     if not shape_id:
         return False
     key = f"{line.get('gen')}:{line.get('seq')}"

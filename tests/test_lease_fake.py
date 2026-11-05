@@ -227,16 +227,11 @@ class FakeColab:
 def scratch_repo(tmp_path, monkeypatch, daily_cap=15):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
-    # The legacy profiles file seeds only measured rates now: its
-    # Standard entry's rate lands on the cpu shape, its High-RAM
-    # entry's on cpu-highram (derived from the entries' fields).
-    (cfg_dir / "profiles.json").write_text(json.dumps({
-        "default_profile": "standard",
-        "profiles": {
-            "standard": {"label": "Standard", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "standard", "timeout": 3600},
-            "workload": {"label": "High-RAM", "high_mem": True, "rate_cu_per_hour": 0.26, "session": "workload", "timeout": 18000},
-        },
-    }))
+    # The measured-rate table seeds the shape rates: cpu at the
+    # Standard rate, cpu-highram at the High-RAM rate.
+    var_dir = tmp_path / "var"
+    var_dir.mkdir(parents=True, exist_ok=True)
+    (var_dir / "shape-rates.json").write_text(json.dumps({"cpu": 0.08, "cpu-highram": 0.26}))
     (cfg_dir / "lease.json").write_text(json.dumps({
         "enabled": True, "daily_cu_budget": daily_cap, "monthly_cu_budget": 150, "max_hours": 8,
         "keepalive": {"enabled": True, "interval_seconds": 60, "pulse_seconds": 600, "stale_seconds": 600},
@@ -411,19 +406,10 @@ def test_acquire_primes_the_initiating_scope_on_a_new_host(tmp_path, monkeypatch
 def gate_repo(tmp_path, monkeypatch, gate=None):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
-    (cfg_dir / "profiles.json").write_text(json.dumps({
-        "default_profile": "workload",
-        "profiles": {
-            "workload": {"label": "High-RAM", "high_mem": True, "rate_cu_per_hour": 0.26, "session": "workload", "timeout": 18000},
-            "standard": {"label": "Standard", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "standard", "timeout": 3600},
-            "lobby": {"label": "Lobby", "high_mem": False, "rate_cu_per_hour": 0.08, "session": "lobby", "timeout": 3600},
-            "t4": {"label": "T4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "session": "t4", "timeout": 18000},
-        },
-    }))
     (cfg_dir / "lease.json").write_text(json.dumps({
         "enabled": True, "daily_cu_budget": 15, "monthly_cu_budget": 150, "max_hours": 8,
         "keepalive": {"enabled": True, "interval_seconds": 60, "pulse_seconds": 600, "stale_seconds": 600},
-        "standing": {"profile": "lobby", "daily_cu_cap": 4, "max_session_hours": 12},
+        "standing": {"caller": "standing", "shape": "cpu", "daily_cu_cap": 4, "max_session_hours": 12},
         "session_gate": gate if gate is not None else {"enabled": True, "bypass_actors": ["panel", "test"], "agent_classes": ["high_ram"], "infra_actor": "standing"},
     }, sort_keys=True, separators=(",", ":")))
     # Caller attribution: the fixture's own scratch registry (fictional
@@ -524,9 +510,8 @@ def test_gate_standing_exemption_is_exact(tmp_path, monkeypatch):
     repo = gate_repo(tmp_path, monkeypatch)
     fake = FakeColab()
     # The infra actor admitting the standing duty's own lease: the
-    # gate fixture's standing shape derives from its legacy
-    # standing profile (plain CPU), and the exemption needs the
-    # duty's standing marker as well as the via.
+    # gate fixture's standing shape is plain CPU, and the exemption
+    # needs the duty's standing marker as well as the via.
     out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, via="standing", standing=True)
     assert out["action"] == "created"
     assert [e["kind"] for e in gate_journal(repo)] == ["shape-infra"]

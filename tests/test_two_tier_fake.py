@@ -1,7 +1,7 @@
 """Two-tier lease behaviour against the fake colab CLI (no login, no
-network): per-session records, the legacy-record migration, the
---hours window, the two-tier grant + standing duty, the standing
-budget sub-cap, and the `state` read the UI renders.
+network): per-session records, the --hours window, the two-tier
+grant + standing duty, the standing budget sub-cap, and the `state`
+read the UI renders.
 """
 
 import json
@@ -84,38 +84,6 @@ def expire_grant(env) -> None:
     g = json.loads((var(env) / "grant.json").read_text())
     g["until"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     (var(env) / "grant.json").write_text(json.dumps(g))
-
-
-def test_legacy_record_migration(tmp_path):
-    env = lease_env(tmp_path)
-    var(env).mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
-    legacy = {
-        "profile": "workload",
-        "session": "workload",
-        "acquired_at": (now - timedelta(hours=1)).isoformat(),
-        "deadline": (now + timedelta(hours=7)).isoformat(),
-        "last_used_at": now.isoformat(),
-        "jobs": [],
-    }
-    (var(env) / "lease.json").write_text(json.dumps(legacy))
-    sess = Path(env["FAKE_COLAB_STATE"]) / "sessions" / "workload"
-    sess.mkdir(parents=True, exist_ok=True)
-    (sess / "ACTIVE").write_text("1")
-    # The first post-landing reads must still see the legacy lease:
-    # a live lease was on this path when the layout changed. Its
-    # shape is derived from the legacy entry it names (the High-RAM
-    # CPU profile -> cpu-highram), never from the profile's name.
-    assert run_lease(env, "status")["action"] == "active"
-    assert run_lease(env, "reap")["action"] == "kept"
-    adopted = run_lease(env, "acquire", "--shape", "cpu-highram")
-    assert adopted["action"] == "adopted"
-    assert adopted["record"]["acquired_at"] == legacy["acquired_at"]
-    assert adopted["record"]["shape"] == "cpu-highram"
-    assert "profile" not in adopted["record"]
-    # A save migrated the record to its per-session path.
-    assert (var(env) / "lease-workload.json").exists()
-    assert not (var(env) / "lease.json").exists()
 
 
 def test_acquire_hours_deadline_and_projection(tmp_path):
@@ -228,15 +196,15 @@ def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
     var(env).mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     # Seed attributed standing spend at (standing cap - 0.1): a
-    # journaled legacy standing segment covering today so far,
-    # rated to total exactly that. A 4h standing window projects
+    # journaled standing segment (caller-stamped) covering today
+    # so far, rated to total exactly that. A 4h standing window projects
     # 0.32 more and breaches the sub-cap. The cap is read from the
     # live config — it is the operator's panel setting, not a test
     # constant.
     standing_cap = json.loads((REPO / "config" / "lease.json").read_text())["standing"]["daily_cu_cap"]
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     hours = max((now - day_start).total_seconds() / 3600.0, 1 / 60)
-    seg = {"profile": "lobby", "session": "seed", "start": day_start.isoformat(), "end": now.isoformat(), "rate": (standing_cap - 0.1) / hours}
+    seg = {"caller": "standing", "session": "seed", "start": day_start.isoformat(), "end": now.isoformat(), "rate": (standing_cap - 0.1) / hours}
     (var(env) / "lease-spend-journal.jsonl").write_text(json.dumps(seg) + "\n")
     run_lease(env, "grant", "--hours", "4")
     out = run_lease(env, "standing", expect_rc=1)

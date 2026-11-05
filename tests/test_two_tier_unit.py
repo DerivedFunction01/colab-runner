@@ -57,8 +57,8 @@ def make_stub(alive):
 
 def seed_cli_catalog(tmp_path):
     """Seed the scratch var's CLI catalog cache with one GPU shape
-    whose rate is unconfirmed (the live legacy catalog's T4 entry
-    carries a null rate): the null-rate shape these tests price."""
+    whose rate is unconfirmed (no measured rate is seeded for it):
+    the null-rate shape these tests price."""
     var = tmp_path / "var"
     var.mkdir(parents=True, exist_ok=True)
     (var / "cli-catalog.json").write_text(json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "gpu": ["T4"], "tpu": ["v6e1"], "no_high_mem": []}))
@@ -102,10 +102,19 @@ def test_acquire_null_rate_shape(tmp_path, monkeypatch):
 T0 = datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc)
 
 
-def seed_profile_record(profile, session, **over):
+_SHAPE_FIXTURES = {
+    "cpu": ({"gpu": None, "tpu": None, "high_mem": False}, 0.08),
+    "cpu-highram": ({"gpu": None, "tpu": None, "high_mem": True}, 0.26),
+}
+
+
+def seed_record(session, shape, **over):
+    shape_spec, rate = _SHAPE_FIXTURES[shape]
     rec = {
-        "profile": profile,
         "session": session,
+        "shape": shape,
+        "shape_spec": shape_spec,
+        "rate_cu_per_hour": rate,
         "acquired_at": "2026-10-29T17:00:00+00:00",
         "deadline": "2026-10-30T02:00:00+00:00",
         "last_used_at": "2026-10-29T17:30:00+00:00",
@@ -203,7 +212,7 @@ def test_acquire_out_of_scope_carries_neither_stamp(tmp_path, monkeypatch):
 
 def test_acquire_adopted_in_scope_gains_envelope_stamp(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
-    seed_profile_record("workload", "workload")
+    seed_record("workload", "cpu-highram")
     lease.write_grant(REPO, 8, burst_shape="cpu-highram", now_dt=T0)
     out = lease.acquire(make_stub({"workload"}), REPO, "cpu-highram", now_dt=T0, via="panel")
     assert out["action"] == "adopted"
@@ -260,7 +269,7 @@ def test_acquire_in_scope_refused_by_smaller_snapshot(tmp_path, monkeypatch):
 def test_extend_burst_independent_of_grant(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     lease.write_grant(REPO, 8, now_dt=T0)
-    seed_profile_record("workload", "workload")
+    seed_record("workload", "cpu-highram")
     out = lease.extend(make_stub({"workload"}), REPO, "workload", 2, now_dt=T0)
     assert out["action"] == "extended"
     assert out["budget"]["projected"] == 0.52  # the burst's own rate x delta
@@ -271,7 +280,7 @@ def test_extend_burst_independent_of_grant(tmp_path, monkeypatch):
 def test_extend_lobby_directly_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     lease.write_grant(REPO, 8, now_dt=T0)
-    rec = seed_profile_record("lobby", "lobby", standing=True)
+    rec = seed_record("lobby", "cpu", standing=True)
     out = lease.extend(make_stub({"lobby"}), REPO, "lobby", 2, now_dt=T0)
     assert out["action"] == "extend-standing-managed"
     assert lease.load_record(REPO, "lobby")["deadline"] == rec["deadline"]
