@@ -4,7 +4,13 @@ run check.py remotely with the probed worker count. Returns verdict + wall
 time.
 
 Usage: colab-check <check.py paths...> [--repo ID] [--variant NAME]
-       [--shape SHAPE]
+       [--shape SHAPE] [--caller TAG]
+The caller claim resolves exactly as colab-run's does, minus the
+manifest tier (a gate names no job): --caller over $COLAB_CALLER,
+validated against the caller registry before anything starts. The
+claim is what the gate's lease acquire adopts under — a gate for a
+thread runs under that thread's caller, so it shares the lease the
+demand duty created for it.
 The repo comes from the local registry (config/repos.json): --repo, else
 its default_repo — no repo is named in this file. Its entry supplies the
 local checkout, the clone URL, the remote dest, the venv path, and the
@@ -49,7 +55,7 @@ def main() -> int:
         if skip_next:
             skip_next = False
             continue
-        if a in ("--repo", "--variant", "--shape"):
+        if a in ("--repo", "--variant", "--shape", "--caller"):
             skip_next = True
             continue
         if not a.startswith("--"):
@@ -61,6 +67,15 @@ def main() -> int:
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
         print("colab-check: STAGED — no colab login yet (see README).", file=sys.stderr)
         return 2
+    # Caller claim: flag over $COLAB_CALLER; a presented but
+    # unregistered claim is refused at claim time, before anything
+    # starts (the same helpers colab-run resolves through).
+    caller_flag = sys.argv[sys.argv.index("--caller") + 1] if "--caller" in sys.argv else None
+    claim_err = lease.caller_claim_error(REPO, flag=caller_flag, env=os.environ.get("COLAB_CALLER"))
+    if claim_err:
+        print(f"colab-check: {claim_err}", file=sys.stderr)
+        return 2
+    caller = lease.resolve_caller(REPO, flag=caller_flag, env=os.environ.get("COLAB_CALLER"))
     if "--shape" in sys.argv:
         shape_id = sys.argv[sys.argv.index("--shape") + 1]
     else:
@@ -101,7 +116,7 @@ def main() -> int:
     lease_id = f"check-{int(time.time())}"
     session = lease_id  # the lease-disabled fallback's per-run session
     if use_lease:
-        got = lease.acquire(cr.colab, REPO, shape_id, via="runner")
+        got = lease.acquire(cr.colab, REPO, shape_id, via="runner", caller=caller)
         if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused", "unknown-shape"):
             print(json.dumps({"gate": "lease-failed", "detail": got}))
             return 1

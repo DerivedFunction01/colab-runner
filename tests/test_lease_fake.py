@@ -249,19 +249,25 @@ def scratch_repo(tmp_path, monkeypatch, daily_cap=15):
     return tmp_path
 
 
-def test_second_caller_creates_its_own_lease(tmp_path, monkeypatch):
-    """Concurrency is per caller: a second caller at the same shape
-    creates its own lease under its own generated name — it never
-    adopts the first caller's, and no name is derived by rule."""
+def test_second_caller_rides_the_existing_lease(tmp_path, monkeypatch):
+    """A session is shared capacity (operator ruling, 2026-11-05):
+    a second caller at the same shape uses the first caller's live
+    lease — no new session is created, the record keeps its
+    creator's stamp, and the ride is journaled as the rider's
+    claim. Attribution is knowing who called, never a gate on use."""
     repo = scratch_repo(tmp_path, monkeypatch)
     fake = FakeColab()
     a = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
     b = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="beta")
-    assert a["action"] == b["action"] == "created"
-    assert a["record"]["session"] != b["record"]["session"]
-    assert ("new", "-s", b["record"]["session"]) in fake.calls
-    assert len(lease_mod.all_records(repo)) == 2
-    assert {r["caller"] for r in lease_mod.all_records(repo)} == {"alpha", "beta"}
+    assert a["action"] == "created"
+    assert b["action"] == "adopted"
+    assert b["record"]["session"] == a["record"]["session"]
+    assert b["riding"] is True and b["owner_caller"] == "alpha"
+    assert not [c for c in fake.calls if c[0] == "new" and "-s" in c and c[-1] != a["record"]["session"]]
+    assert len(lease_mod.all_records(repo)) == 1
+    assert lease_mod.all_records(repo)[0]["caller"] == "alpha"
+    claims = lease_mod.load_caller_claims(repo)
+    assert claims[a["record"]["session"]]["caller"] == "beta"
 
 
 def test_acquire_unknown_shape_creates_nothing(tmp_path, monkeypatch):
@@ -295,24 +301,27 @@ def test_reap_covers_concurrent_leases_independently(tmp_path, monkeypatch):
 
 def test_budget_guard_prices_concurrent_windows(tmp_path, monkeypatch):
     """Daily cap 1.0: one 8 h cpu window projects 0.64 and fits;
-    with another caller's identical window live, a further acquire
-    is refused — concurrent windows are priced as the sum they
-    commit (1.28), reported as committed_projected."""
+    a capacity request (the duty seam — the route that creates a
+    second window rather than riding the live one) is refused
+    while that window is live: concurrent windows are priced as
+    the sum they commit (1.28), reported as committed_projected.
+    An ordinary acquire by another caller simply rides the live
+    lease and prices nothing new."""
     repo = scratch_repo(tmp_path, monkeypatch, daily_cap=1.0)
     fake = FakeColab(alive={"one"})
     lease_mod.save_record(repo, {"shape": "cpu", "session": "one", "caller": "alpha", "rate_cu_per_hour": 0.08, "acquired_at": PNOW.isoformat(), "deadline": (PNOW + timedelta(hours=8)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
-    out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="beta")
+    out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="beta", duty=True)
     assert out["action"] == "refused-budget"
     assert out["budget"]["reason"] == "daily-budget"
     assert out["budget"]["committed_projected"] == 0.64
-    # Control: with the other record gone the same acquire fits.
+    # Control: with the other record gone the same request fits.
     lease_mod.delete_record(repo, "one")
     fake2 = FakeColab()
     out = lease_mod.acquire(fake2, repo, "cpu", now_dt=PNOW, caller="beta")
     assert out["action"] == "created"
-    # And the mirror direction: a third caller prices the live
-    # window the same way.
-    out = lease_mod.acquire(FakeColab(alive={out["record"]["session"]}), repo, "cpu", now_dt=PNOW, caller="gamma")
+    # And the mirror direction: a third caller's capacity request
+    # prices the live window the same way.
+    out = lease_mod.acquire(FakeColab(alive={out["record"]["session"]}), repo, "cpu", now_dt=PNOW, caller="gamma", duty=True)
     assert out["action"] == "refused-budget"
     assert out["budget"]["committed_projected"] == 0.64
 
@@ -659,11 +668,15 @@ def test_caller_stamps_created_record_and_adopt_fills(tmp_path, monkeypatch):
     out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
     assert out["action"] == "adopted"
     assert out["record"]["session"] == session
-    # Another caller never adopts it: it creates its own lease.
+    # Another caller rides it: same session, creator's stamp kept,
+    # the ride journaled as the rider's claim.
     out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="beta")
-    assert out["action"] == "created"
-    assert out["record"]["session"] != session
-    assert len(lease_mod.all_records(repo)) == 2
+    assert out["action"] == "adopted"
+    assert out["record"]["session"] == session
+    assert out["riding"] is True and out["owner_caller"] == "alpha"
+    assert len(lease_mod.all_records(repo)) == 1
+    assert lease_mod.load_record(repo, session)["caller"] == "alpha"
+    assert lease_mod.load_caller_claims(repo)[session]["caller"] == "beta"
     # A pre-attribution record gains the adopting call's caller:
     # an unstamped record is adoptable by the first caller to ask.
     out = lease_mod.acquire(fake, repo, "cpu-highram", now_dt=PNOW)

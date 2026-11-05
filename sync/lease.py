@@ -1306,15 +1306,19 @@ def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = 
 
 
 def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False) -> dict:
-    """Adopt the caller's live lease at this shape or create it. The
-    only entry point that ever creates a session under the lease
-    model. A lease is identified by (caller, shape): an acquire
-    whose caller already holds a live, unexpired lease at the
-    shape adopts it; any other acquire creates a fresh lease with
-    a generated session name — so a caller may hold several leases
-    at once (across shapes, or across its own lane suffixes, which
-    are distinct caller claims), and no lease is ever shared across
-    callers.
+    """Adopt a live lease at this shape or create one. The only
+    entry point that ever creates a session under the lease model.
+    A session is shared capacity, not a caller's possession: any
+    caller may use an existing available (live, unexpired) lease
+    at the shape — its own first, then an unstamped one, then any
+    other caller's. The record keeps its creator's caller stamp as
+    history; what attribution needs is who called, and every use
+    by another caller is journaled as a claim (below), never a
+    restamp. A fresh lease is created only when no available lease
+    at the shape can be used, or when the call is a capacity duty
+    (duty/standing): a demand the hook consumes and the standing
+    duty exist to add or hold a lease of their own, so they adopt
+    only their own (or an unstamped) record and otherwise create.
 
     `hours` sets this lease's window: the deadline is now + hours
     and the budget projection prices that window, exactly as given —
@@ -1340,7 +1344,9 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     validate; the core stamps what it is given). A created record
     carries it; an adopted record keeps its creator's caller,
     filling the field only when the record predates attribution
-    and the adopting call supplies one."""
+    and the adopting call supplies one. A use by a different
+    caller is journaled as a claim on the session — attribution
+    records who called; it never gates use."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     if not cfg.get("enabled"):
@@ -1351,15 +1357,21 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     shape = shapes[shape_id]
     grant = active_grant(repo, now_dt)
     in_scope = shape_in_grant(repo, grant, shape_id)
-    candidates = [r for r in all_records(repo) if r.get("shape") == shape_id and r.get("caller") in (caller, None)]
-    # An unstamped record (pre-attribution, or created by an
-    # unattributed call) is adoptable by the first caller to ask —
-    # the adoption stamps it (below) — while a stamped record is
-    # its creator's alone. An exact caller match wins over an
-    # unstamped candidate.
-    rec = max(candidates, key=lambda r: (caller is not None and r.get("caller") == caller, r.get("deadline") or ""), default=None)
-    if rec is not None:
-        session = rec["session"]
+    at_shape = [r for r in all_records(repo) if r.get("shape") == shape_id]
+    if duty or standing:
+        # Capacity duties adopt only their own (or an unstamped)
+        # record; every other call may use any available lease.
+        pool = [r for r in at_shape if r.get("caller") in (caller, None)]
+    else:
+        pool = at_shape
+    # Preference: the caller's own record, then an unstamped one
+    # (adoptable by the first caller to ask — the adoption stamps
+    # it, below), then any other caller's; latest deadline breaks
+    # ties within a tier.
+    pool.sort(key=lambda r: (caller is not None and r.get("caller") == caller, r.get("caller") is None, r.get("deadline") or ""), reverse=True)
+    rec = None
+    for cand in pool:
+        session = cand["session"]
         state = session_state(colab, session)
         if state == "unknown":
             # Never stop, delete, or recreate on an unreadable session
@@ -1368,29 +1380,47 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
             # record was destroyed under a healthy session (the
             # 2026-10-29 incident's class). The record stays exactly
             # as it is; a later call retries.
-            return {"action": "acquire-unknown", "record": rec, "session": session}
-        if now_dt < parse_dt(rec["deadline"]) and state == "alive":
-            rec["last_used_at"] = now_dt.isoformat()
-            newly_attributed = in_scope and rec.get("envelope_id") != grant["granted_at"]
-            if newly_attributed:
-                rec["envelope_id"] = grant["granted_at"]
-            if caller and not rec.get("caller"):
-                rec["caller"] = caller
+            return {"action": "acquire-unknown", "record": cand, "session": session}
+        if now_dt < parse_dt(cand["deadline"]) and state == "alive":
+            rec = cand
+            break
+        # Not usable. The caller's own (or an unstamped) record is
+        # cleared here exactly as before, so its window reopens
+        # for the create below; another caller's dead or expired
+        # lease is left for its owner and the reaper — using a
+        # session never destroys someone else's record.
+        if cand.get("caller") in (caller, None):
+            stop_session_safe(colab, session)  # expired or confirmed dead: clear before recreating
+            if session_state(colab, session) == "alive":
+                # The stop did not take: keep the record of a session that
+                # is still billing (release()'s rule, same reason).
+                return {"action": "acquire-stop-failed", "record": cand, "session": session}
+            append_spend_segment(repo, cand, now_dt or datetime.now(timezone.utc))
+            delete_record(repo, session)
+    if rec is not None:
+        session = rec["session"]
+        rec["last_used_at"] = now_dt.isoformat()
+        newly_attributed = in_scope and rec.get("envelope_id") != grant["granted_at"]
+        if newly_attributed:
+            rec["envelope_id"] = grant["granted_at"]
+        if caller and not rec.get("caller"):
+            rec["caller"] = caller
+        save_record(repo, rec)
+        if newly_attributed:
+            _note_envelope_lease_started(repo, rec)
+        if _capture_session_host(repo, rec, "adopted", spool_on_first=False):
             save_record(repo, rec)
-            if newly_attributed:
-                _note_envelope_lease_started(repo, rec)
-            if _capture_session_host(repo, rec, "adopted", spool_on_first=False):
-                save_record(repo, rec)
-            fresh, _age = keepalive_fresh(colab, repo, session)
-            ka = {"keepalive": "ok"} if fresh else ensure_keepalive(colab, repo, session)
-            return {"action": "adopted", "record": rec, **ka}
-        stop_session_safe(colab, session)  # expired or confirmed dead: clear before recreating
-        if session_state(colab, session) == "alive":
-            # The stop did not take: keep the record of a session that
-            # is still billing (release()'s rule, same reason).
-            return {"action": "acquire-stop-failed", "record": rec, "session": session}
-        append_spend_segment(repo, rec, now_dt or datetime.now(timezone.utc))
-        delete_record(repo, session)
+        fresh, _age = keepalive_fresh(colab, repo, session)
+        ka = {"keepalive": "ok"} if fresh else ensure_keepalive(colab, repo, session)
+        out = {"action": "adopted", "record": rec, **ka}
+        if caller and rec.get("caller") not in (None, caller):
+            # Riding another caller's lease: the use is journaled
+            # as this caller's claim on the session; the record's
+            # creator stamp is untouched.
+            append_caller_claim(repo, session, caller, "acquire")
+            out["riding"] = True
+            out["owner_caller"] = rec.get("caller")
+        return out
     effective_hours = float(hours) if hours is not None else float(cfg.get("max_hours", 8))
     if max_hours_cap is not None:
         # Only a caller passing its own cap clamps the window. Until

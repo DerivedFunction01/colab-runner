@@ -980,12 +980,14 @@ def test_auto_timed_start_waits_then_fires(tmp_path, monkeypatch):
 
 
 # --- Concurrent leases (profile retirement) ------------------------------------
-# Concurrency is per caller, not per profile: two callers may hold
-# leases at the same shape at once, each under its own generated
-# session name and record; a caller's own re-acquire adopts its own
-# lease and never another caller's. (The retired parallel-instance
-# derivation — one extra session per profile, named by rule — is
-# gone; this is its successor behaviour.)
+# Use is shared, capacity is per request: any caller's acquire may
+# use (ride) a live lease at the shape, whoever created it — the
+# ride is journaled as the rider's claim and the record keeps its
+# creator's stamp. A second concurrent lease at the same shape
+# comes from a capacity request (the demand duty), never from an
+# ordinary acquire that could have ridden. (The retired
+# parallel-instance derivation — one extra session per profile,
+# named by rule — is gone; this is its successor behaviour.)
 
 
 def test_two_callers_hold_concurrent_leases_at_one_shape(tmp_path, monkeypatch):
@@ -994,9 +996,17 @@ def test_two_callers_hold_concurrent_leases_at_one_shape(tmp_path, monkeypatch):
     alive = set()
     stub = _auto_stub(alive)
     a = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="alpha")
+    assert a["action"] == "created"
+    # Beta's ordinary acquire rides alpha's live lease.
     b = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="beta")
-    assert a["action"] == b["action"] == "created"
-    assert a["record"]["session"] != b["record"]["session"]
+    assert b["action"] == "adopted"
+    assert b["record"]["session"] == a["record"]["session"]
+    assert b["riding"] is True and b["owner_caller"] == "alpha"
+    assert len(lease.all_records(REPO)) == 1
+    # A capacity request (duty) creates beta's own second lease.
+    b2 = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="beta", duty=True)
+    assert b2["action"] == "created"
+    assert b2["record"]["session"] != a["record"]["session"]
     assert len(lease.all_records(REPO)) == 2
     again = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="alpha")
     assert again["action"] == "adopted"
