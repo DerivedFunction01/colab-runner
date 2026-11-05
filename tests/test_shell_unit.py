@@ -85,6 +85,9 @@ class FakeRun:
 
 def run_main(monkeypatch, fake, argv):
     monkeypatch.setattr(sh.subprocess, "run", fake)
+    # The main() scenarios below target a live session; the connect
+    # guard's own refusal paths are pinned by the tests after them.
+    monkeypatch.setattr(sh, "live_state", lambda session: "alive")
     return sh.main(argv)
 
 
@@ -110,3 +113,31 @@ def test_main_no_session_is_2(tmp_path, monkeypatch):
     fake = FakeRun()
     assert run_main(monkeypatch, fake, ["echo hi"]) == 2
     assert fake.calls == [] or fake.calls[-1][0][0] != "ssh"
+
+
+def test_main_refuses_a_dead_session_without_connecting(tmp_path, monkeypatch):
+    """The connect guard: a target that does not read alive server-side
+    is refused before any ssh invocation — the CLI's ssh flow would
+    otherwise assign a fresh default-shape runtime for the dead name
+    (the 2026-11-04 lane-probe mints)."""
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    fake = FakeRun()
+    monkeypatch.setattr(sh.subprocess, "run", fake)
+    monkeypatch.setattr(sh, "live_state", lambda session: "absent")
+    assert sh.main(["-s", "workload", "echo hi"]) == 2
+    assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)
+
+
+def test_main_refuses_when_liveness_is_unknown(tmp_path, monkeypatch):
+    """An unreadable sessions list is not a pass: the guard fails
+    closed rather than risk minting a runtime."""
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    fake = FakeRun()
+    monkeypatch.setattr(sh.subprocess, "run", fake)
+
+    def boom(session):
+        raise RuntimeError("list failed")
+
+    monkeypatch.setattr(sh, "live_state", boom)
+    assert sh.main(["-s", "workload", "echo hi"]) == 2
+    assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)

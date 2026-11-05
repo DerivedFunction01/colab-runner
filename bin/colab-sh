@@ -16,8 +16,11 @@ The script (inline, file, or stdin) is delivered on ssh's stdin to
 
 Rules:
 - Targets an existing session only — the active lease's session by
-  default. It never creates a session (the CLI's ssh auto-create is
-  deliberately not used; session lifecycle belongs to the lease).
+  default. It never creates a session: the target must read alive
+  server-side before connecting (verified via the lease machinery's
+  own read), because the CLI's ssh flow otherwise assigns a fresh
+  default-shape runtime for a dead name; session lifecycle belongs
+  to the lease.
 - One SSH connection per runtime at a time (the server answers 429
   while another is connected). This wrapper is one-shot: it connects,
   runs, disconnects.
@@ -115,6 +118,21 @@ def resolve_session(flag: str | None) -> str | None:
         return None
 
 
+def live_state(session: str) -> str:
+    """The target's server-side tri-state (alive/absent/unknown),
+    read through the lease machinery's own funnel (bin/colab-run)
+    and tri-state read (sync.lease.session_state). One seam, so the
+    connect guard in main() is the only place that consults it."""
+    from importlib.machinery import SourceFileLoader
+
+    colab_run = SourceFileLoader("colab_run", str(REPO / "bin" / "colab-run")).load_module()
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    from sync.lease import session_state
+
+    return session_state(colab_run.colab, session)
+
+
 def read_script(args) -> str | None:
     if args.file:
         return Path(args.file).read_text()
@@ -151,6 +169,24 @@ def main(argv=None) -> int:
         return 2
     if not CLI_VENV_PYTHON.exists():
         print(f"colab-sh: colab CLI venv python missing at {CLI_VENV_PYTHON}", file=sys.stderr)
+        return 2
+    # Existing sessions only — enforced, not assumed. The CLI's ssh
+    # flow assigns a fresh default-shape (Standard) runtime when the
+    # named session has no live assignment, so probing a dead or
+    # stale profile name silently mints one (2026-11-04: lane probes
+    # of two dead profile names created Standard runtimes under
+    # both, each behind its own approval card). Refuse unless the
+    # machinery's own read calls the session alive.
+    try:
+        state = live_state(session)
+    except Exception:  # noqa: BLE001
+        state = "unknown"
+    if state != "alive":
+        print(
+            f"colab-sh: session {session!r} is not live (state: {state}); refusing to connect — "
+            "the CLI's ssh flow would create a new runtime. Attach to the lease record's session instead.",
+            file=sys.stderr,
+        )
         return 2
     script = read_script(args)
     if script is None or not script.strip():
