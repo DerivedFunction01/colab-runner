@@ -393,8 +393,8 @@ def main() -> int:
             # checkpoint (shell_job carries the script's exit code):
             # the outputs above are pulled regardless — reports and
             # verdicts land locally either way — but the run record
-            # tells the truth about the outcome. (2026-11-05: an
-            # workload env-build whose init_venv.py failed recorded
+            # tells the truth about the outcome. (2026-11-05: a
+            # job-zero build whose init_venv.py failed recorded
             # "complete" with a clean-looking pull; only a human
             # reading the pulled report saw assertions_passed:
             # false.) Jobs whose checkpoints carry no exit_code are
