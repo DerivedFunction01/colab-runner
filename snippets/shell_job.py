@@ -38,13 +38,16 @@ def main() -> int:
 
     if args.script:
         script_path = Path(args.script)
-        if not script_path.is_file() and script_path.is_absolute():
+        if not script_path.is_file() and script_path.is_absolute() and Path.cwd() != Path("/content"):
             # The runner addresses session files as /content/<name>;
             # under the fake CLI the session root is the working dir
             # instead (the same dual-world seam as the runner's
             # relative out dir), so fall back to the bare name there.
-            # On a real VM the cwd is /content and a genuinely
-            # missing file refuses exactly as before.
+            # The discriminator is where this process runs, not
+            # whether a /content happens to exist on the local
+            # filesystem: on a real VM the cwd is /content, the
+            # fallback never engages, and a genuinely missing file
+            # refuses exactly as before.
             alt = Path(script_path.name)
             if alt.is_file():
                 script_path = alt
@@ -70,10 +73,12 @@ def main() -> int:
     ckpt.write_text(json.dumps({"completed_units": 0, "state": "running"}))
 
     cwd = Path(args.cwd)
-    if not cwd.is_dir():
-        # Same dual-world seam as the script path above: under the
-        # fake CLI the session root is the working dir, not /content.
-        # On a real VM /content always exists.
+    if Path.cwd() != Path("/content") and (cwd == Path("/content") or not cwd.is_dir()):
+        # Same dual-world seam as the script path above, keyed the
+        # same way: under the fake CLI the session root is the
+        # working dir, not /content — a stray local /content
+        # directory must not lure the job into running there while
+        # its files live in the session root.
         cwd = Path.cwd()
 
     with open(out / "heartbeat.log", "a") as log:

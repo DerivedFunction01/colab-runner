@@ -187,12 +187,28 @@ def orphan_sweep() -> list[dict]:
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args:
-        print("usage: colab-run <job-name> [--resume RUN_ID]", file=sys.stderr)
+    # Flags travel in pairs and may sit on either side of the job
+    # name — extract them first and take the first remaining token
+    # as the job. (Job-first-only parsing read a leading --caller
+    # as a job name; it bit a consumer following shorthand in a
+    # message, 2026-11-05.)
+    resume = caller_flag = None
+    positional = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--resume" and i + 1 < len(args):
+            resume = args[i + 1]
+            i += 2
+        elif args[i] == "--caller" and i + 1 < len(args):
+            caller_flag = args[i + 1]
+            i += 2
+        else:
+            positional.append(args[i])
+            i += 1
+    if not positional:
+        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG]", file=sys.stderr)
         return 2
-    job_name = args[0]
-    resume = args[args.index("--resume") + 1] if "--resume" in args else None
-    caller_flag = args[args.index("--caller") + 1] if "--caller" in args else None
+    job_name = positional[0]
     manifest_path = REPO / "jobs" / job_name / "job.json"
     if not manifest_path.exists():
         print(f"no job manifest at {manifest_path}", file=sys.stderr)
