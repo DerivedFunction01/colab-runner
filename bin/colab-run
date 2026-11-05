@@ -4,8 +4,11 @@ pull results, stop the session on every exit path.
 
 Usage: colab-run <job-name> [--resume RUN_ID]
 Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
-The CLI is resolved via $COLAB_BIN (tests point this at a fake), else PATH,
-else ~/.local/bin/colab.
+The CLI is resolved via $COLAB_BIN (tests point this at a fake), else the
+uv tool venv (~/.local/share/uv/tools/google-colab-cli/bin/colab), else
+PATH, else ~/.local/bin/colab. The CLI is deliberately NOT installed on
+PATH (no global shim): this funnel is the only sanctioned access, and a
+bare `colab` in an agent shell is a contract breach, not a shortcut.
 """
 
 import hashlib
@@ -30,7 +33,13 @@ _spec_l.loader.exec_module(lease)
 
 
 def colab_bin() -> str:
-    return os.environ.get("COLAB_BIN") or shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
+    env_bin = os.environ.get("COLAB_BIN")
+    if env_bin:
+        return env_bin
+    venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
+    if venv_bin.exists():
+        return str(venv_bin)
+    return shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
 
 
 def colab_env() -> dict:

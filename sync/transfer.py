@@ -35,7 +35,13 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def colab_bin() -> str:
-    return os.environ.get("COLAB_BIN") or shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
+    env_bin = os.environ.get("COLAB_BIN")
+    if env_bin:
+        return env_bin
+    venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
+    if venv_bin.exists():
+        return str(venv_bin)
+    return shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
 
 
 def colab_env() -> dict:

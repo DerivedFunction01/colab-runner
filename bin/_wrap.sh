@@ -7,7 +7,7 @@ export NO_PROXY="${NO_PROXY:+$NO_PROXY,}google.com,googleapis.com,googleusercont
 export no_proxy="${no_proxy:+$no_proxy,}google.com,googleapis.com,googleusercontent.com,colab.dev"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$(command -v python3 || echo /usr/bin/python3)"
-COLAB_BIN="${COLAB_BIN:-$(for c in "$(command -v colab || true)" "$HOME/.local/bin/colab"; do [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; break; }; done)}"
+COLAB_BIN="${COLAB_BIN:-$(for c in "$HOME/.local/share/uv/tools/google-colab-cli/bin/colab" "$(command -v colab || true)" "$HOME/.local/bin/colab"; do [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; break; }; done)}"
 
 wrap_enter() { "$PY" "$REPO_ROOT/ops/mirror_transient.py" restore >/dev/null 2>&1 || true; }
 wrap_exit() { "$PY" "$REPO_ROOT/ops/mirror_transient.py" capture >/dev/null 2>&1 || true; }

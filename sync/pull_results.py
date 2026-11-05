@@ -37,7 +37,8 @@ def main() -> int:
     if args.session:
         import shutil
 
-        colab = shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
+        venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
+        colab = str(venv_bin) if venv_bin.exists() else shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
 
     results, bad = [], False
     for entry in manifest["files"]:

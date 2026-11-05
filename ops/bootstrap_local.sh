@@ -28,7 +28,7 @@ done
 echo "tool python: $TOOL_PY ($("$TOOL_PY" --version 2>&1))"
 MIN_VER="$(python3 -c "import json; print([i['min_version'] for i in json.load(open('$REPO_ROOT/config/transient.json'))['items'] if i['id']=='colab-tool'][0])")"
 PKG="$(python3 -c "import json; print([i['package'] for i in json.load(open('$REPO_ROOT/config/transient.json'))['items'] if i['id']=='colab-tool'][0])")"
-colab_bin() { for c in "$(command -v colab || true)" "$HOME/.local/bin/colab"; do [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }; done; }
+colab_bin() { for c in "$HOME/.local/share/uv/tools/google-colab-cli/bin/colab" "$(command -v colab || true)" "$HOME/.local/bin/colab"; do [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }; done; }
 COLAB="$(colab_bin || true)"
 ver_of() { "$1" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true; }
 CUR=""

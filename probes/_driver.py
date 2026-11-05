@@ -17,6 +17,9 @@ TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
 def colab_bin() -> str:
     import shutil
 
+    venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
+    if venv_bin.exists():
+        return str(venv_bin)
     return shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
 
 
