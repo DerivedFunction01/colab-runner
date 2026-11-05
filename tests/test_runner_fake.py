@@ -22,9 +22,14 @@ def control_sha(seed: str, unit: int) -> str:
 
 FAKE_ENV_KEEPALIVE = dict(KEEPALIVE_MAX_CYCLES="2", KEEPALIVE_INTERVAL_SECONDS="0", KEEPALIVE_ALLOW_NONCOLAB="1")
 
+# Session shape gate: the suite's test actor claim (see
+# test_lease_fake.lease_env) — without it the runner's acquire is
+# an agent actor and caller attribution refuses the fresh start.
+FAKE_ENV_GATE = dict(COLAB_LEASE_ACTOR="test")
+
 
 def test_colab_run_smoke_end_to_end(tmp_path):
-    env = dict(os.environ, COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE)
+    env = dict(os.environ, COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE)
     r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
@@ -38,7 +43,7 @@ def test_colab_run_smoke_end_to_end(tmp_path):
 
 
 def test_orphan_sweep_marks_dead_session(tmp_path):
-    env = dict(os.environ, COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE)
+    env = dict(os.environ, COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE)
     runs = REPO / "results" / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     stale = runs / "ghost-20000101T000000Z.json"

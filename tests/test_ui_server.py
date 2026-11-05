@@ -240,7 +240,7 @@ def test_start_invokes_acquire_and_appends_event(ui):
     status, result = ui.post("/api/lease/start", {"profile": "workload", "hours": 2})
     assert status == 200
     assert result["action"] == "acquired"
-    assert "acquire workload --hours 2 --via panel" in ui.invocations()
+    assert "acquire workload --hours 2 --via panel --caller panel" in ui.invocations()
     events = ui.outbox_events()
     assert len(events) == 1
     assert events[0]["kind"] == "lease-started"
@@ -255,7 +255,7 @@ def test_start_carries_panel_actor_claim(ui):
     # core's bypass (env claim + --via panel together).
     status, _result = ui.post("/api/lease/start", {"profile": "standard", "hours": 1})
     assert status == 200
-    assert "acquire standard --hours 1 --via panel" in ui.invocations()
+    assert "acquire standard --hours 1 --via panel --caller panel" in ui.invocations()
     assert "actor:panel" in ui.invocations()
 
 
@@ -536,7 +536,7 @@ def test_instance_start_stop_route_through_lease_endpoints(ui):
     instance profile id through the existing routes."""
     status, result = ui.post("/api/lease/start", {"profile": "workload2", "hours": 2})
     assert status == 200 and result["action"] == "acquired"
-    assert "acquire workload2 --hours 2 --via panel" in ui.invocations()
+    assert "acquire workload2 --hours 2 --via panel --caller panel" in ui.invocations()
     status, result = ui.post("/api/lease/stop", {"profile": "workload2"})
     assert status == 200 and result["action"] == "released"
     assert "release workload2" in ui.invocations()
@@ -548,3 +548,27 @@ def test_frontend_has_parallel_toggle_and_instance_card():
     assert "data-parallel" in js  # the per-spec toggle, bound to the served block
     assert "data-istart" in js  # the dormant instance card's Start
     assert "parallelToggleHTML" in js
+
+
+def test_access_release_endpoint_and_outbox(ui):
+    """Step 5: the one-tap release routes through the core verb; a
+    released session lands in the outbox, a record-backed one is
+    refused with the core's answer."""
+    status, result = ui.post("/api/access/release", {"session": "stray-1"})
+    assert status == 200 and result["action"] == "session-released"
+    assert "release-session stray-1" in ui.invocations()
+    events = ui.outbox_events()
+    assert [e["kind"] for e in events] == ["session-released"]
+    assert events[0]["detail"]["session"] == "stray-1"
+    status, result = ui.post("/api/access/release", {"session": "recorded-session"})
+    assert status == 409 and result["action"] == "session-has-record"
+    status, _ = ui.post("/api/access/release", {})
+    assert status == 400
+
+
+def test_frontend_renders_access_list():
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    html = (REPO / "ui" / "static" / "index.html").read_text()
+    assert 'id="access-list"' in html
+    assert "renderAccess" in js and "/api/access/release" in js
+    assert "data-access-release" in js

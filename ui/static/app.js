@@ -362,7 +362,7 @@ function renderLeases() {
     return `<div class="card">
       <div class="row"><b>${esc(title)}</b>${leaseChip(entry)}</div>
       <p class="big num" data-countdown="${esc(rec.deadline || "")}">${esc(countdownText(rec.deadline))}</p>
-      <p class="kvline">Deadline <b>${esc(fmtTime(rec.deadline))}</b> · session <span class="mono">${esc(rec.session || "—")}</span></p>
+      <p class="kvline">Deadline <b>${esc(fmtTime(rec.deadline))}</b> · session <span class="mono">${esc(rec.session || "—")}</span>${rec.caller ? ` · Caller <b>${esc(rec.caller)}</b>` : ""}</p>
       <p class="kvline">Heartbeat <b>${age == null ? "unknown" : `${Math.round(age)}s ago`}</b> · Pulse <b>${esc(pulse || "—")}</b> · Burn <b>${esc(burn)}</b></p>
       <button type="button" class="danger" data-stop="${esc(profile)}">Terminate</button>
       <button type="button" class="ghost" data-xtoggle="${esc(profile)}">Extend</button>
@@ -390,6 +390,32 @@ function renderLeases() {
     });
   });
   wireExtendPickers(box);
+}
+
+function renderAccess() {
+  // The access list is served ready by the core (the records
+  // portion): every live session with its caller, or flagged
+  // unattributed. Unattributed entries carry the one-tap release;
+  // attributed ones render without it — their lifecycle belongs
+  // to their lease record or their owning thread.
+  const box = $("access-list");
+  if (!box) return;
+  const access = (S && S.access) || [];
+  if (!access.length) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = `<div class="card">
+    <div class="row"><b>Session access</b></div>
+    ${access.map((e) => `<p class="kvline"><span class="mono">${esc(e.session || "—")}</span> · ${esc(e.shape_class || "shape unknown")} · ${e.caller ? `Caller <b>${esc(e.caller)}</b>` : `<span class="chip warn">Unattributed</span>`} · since <b>${esc(fmtTime(e.first_seen))}</b>${e.unattributed ? ` <button type="button" class="danger" data-access-release="${esc(e.session || "")}">Release</button>` : ""}</p>`).join("")}
+  </div>`;
+  box.querySelectorAll("[data-access-release]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const session = btn.getAttribute("data-access-release");
+      if (!window.confirm(`Release the unattributed session ${session} now?`)) return;
+      act(btn, () => api("/api/access/release", { session }));
+    });
+  });
 }
 
 function renderGrant() {
@@ -622,6 +648,8 @@ function logDayBand(key) {
 function logEntryHtml(ev) {
   const profile = logProfile(ev);
   const session = logSession(ev);
+  const d = ev.detail || {};
+  const caller = d.caller || (d.result || {}).caller || ((d.result || {}).record || {}).caller || null;
   const open = logsView.openEntries.has(ev.seq);
   const detail = logDetailText(ev);
   return `<div class="tl-entry">
@@ -630,7 +658,7 @@ function logEntryHtml(ev) {
       <span class="tl-rail">${levelDot(logLevel(ev))}</span>
       <span class="tl-main">
         <span class="tl-top"><span class="kind-code">${esc(ev.kind)}</span></span>
-        <span class="tl-who">${profile ? esc(specLabel(profile)) : '<span class="muted">—</span>'}${session ? `<span class="muted"> · ${esc(session)}</span>` : ""}</span>
+        <span class="tl-who">${profile ? esc(specLabel(profile)) : '<span class="muted">—</span>'}${session ? `<span class="muted"> · ${esc(session)}</span>` : ""}${caller ? `<span class="muted"> · caller ${esc(caller)}</span>` : ""}</span>
         ${detail ? `<span class="tl-detail">${detail}</span>` : ""}
       </span>
     </button>
@@ -688,6 +716,7 @@ function renderSections(names) {
   if (names.includes("budget")) renderBudget();
   if (names.includes("records") || names.includes("specs")) {
     renderLeases();
+    renderAccess();
     renderControls();
   }
   if (names.includes("grant")) renderGrant();

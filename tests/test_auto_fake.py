@@ -143,7 +143,7 @@ def test_unrequest(tmp_path):
 def test_request_refused_at_write_for_agent_standard(tmp_path):
     env = auto_env(tmp_path, enabled=True)
     env.pop("COLAB_LEASE_ACTOR", None)
-    out = run_lease(env, "request", "standard", "--reason", "burst", "--via", "xbrl-thread", expect_rc=1)
+    out = run_lease(env, "request", "standard", "--reason", "burst", "--caller", "test", expect_rc=1)
     assert out["action"] == "shape-refused"
     assert out["shape_class"] == "standard"
     assert not request_file(env).exists()  # a refused demand is never recorded

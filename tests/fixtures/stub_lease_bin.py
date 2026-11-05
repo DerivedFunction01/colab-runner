@@ -130,6 +130,11 @@ def main(argv):
         out = {"action": "extended", "profile": argv[1], "hours": hours, "old_deadline": "2026-11-02T00:00:00+00:00", "new_deadline": "2026-11-02T02:00:00+00:00"}
     elif cmd == "release":
         out = {"action": "released", "profile": argv[1] if len(argv) > 1 else None}
+    elif cmd == "release-session":
+        if len(argv) > 1 and argv[1] == "recorded-session":
+            print(json.dumps({"action": "session-has-record", "session": argv[1]}))
+            return 1
+        out = {"action": "session-released", "session": argv[1] if len(argv) > 1 else None, "stop": "stopped"}
     elif cmd == "grant":
         out = {"action": "granted", "until": DEADLINE}
     elif cmd == "extend-grant":

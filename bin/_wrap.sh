@@ -43,6 +43,12 @@ profile_field() { # profile name, field -> value
 gate_check() { # profile name -> the session shape gate's admission verdict JSON; exit 0 admitted, 1 refused
   # The wrappers that create sessions bypass the lease core, so they
   # consult its single admission seam (bin/colab-lease) before any
-  # CLI call. Prints the verdict JSON either way.
-  "$REPO_ROOT/bin/colab-lease" admission "${1:-$(default_profile)}"
+  # CLI call. Prints the verdict JSON either way. The driver-set
+  # $COLAB_CALLER claim rides the consult when present, so the
+  # verdict and its journal entry name the thread.
+  if [ -n "${COLAB_CALLER:-}" ]; then
+    "$REPO_ROOT/bin/colab-lease" admission "${1:-$(default_profile)}" --caller "$COLAB_CALLER"
+  else
+    "$REPO_ROOT/bin/colab-lease" admission "${1:-$(default_profile)}"
+  fi
 }

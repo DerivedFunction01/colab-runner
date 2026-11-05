@@ -36,7 +36,7 @@ REPO = UI_DIR.parent
 STATIC_DIR = UI_DIR / "static"
 CONFIG_PATH = UI_DIR / "config.json"
 
-FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live"}
+FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live", "caller-start-refused"}
 # The panel's budget-cap editor fields, in body-name → core-flag order.
 BUDGET_CAP_FIELDS = {"daily_cu_budget": "--daily", "monthly_cu_budget": "--monthly", "standing_daily_cu_cap": "--standing-daily"}
 CORE_TIMEOUT_S = 1800
@@ -355,6 +355,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_lease_stop(body)
         if parsed.path == "/api/lease/extend":
             return self.api_lease_extend(body)
+        if parsed.path == "/api/access/release":
+            return self.api_access_release(body)
         if parsed.path == "/api/grant":
             return self.api_grant(body)
         if parsed.path == "/api/grant/extend":
@@ -400,8 +402,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": "hours must be a positive number"})
             args += ["--hours", fmt_hours(hours)]
         # Panel-started leases carry the panel's requester tag, so a
-        # lease record shows who started it (envelope attribution).
-        args += ["--via", "panel"]
+        # lease record shows who started it (envelope attribution),
+        # and its caller claim — the machinery caller "panel", which
+        # is also the creation authority the gate's bypass rides.
+        args += ["--via", "panel", "--caller", "panel"]
         rc, result, err = run_core(*args)
         if result is None:
             OUTBOX.append("lease-start-failed", {"profile": profile, "hours": hours, "error": err, "rc": rc})
@@ -409,6 +413,24 @@ class Handler(BaseHTTPRequestHandler):
         kind = "lease-started" if is_success(rc, result) else "lease-start-failed"
         OUTBOX.append(kind, {"profile": profile, "hours": hours, "result": result})
         return self.send_json(200, result)
+
+    def api_access_release(self, body: dict) -> None:
+        """One-tap release of an unattributed session from the access
+        list: the core's release-session verb (a record-backed
+        session is refused there — it releases per profile). The
+        outcome is appended to the outbox under a server-side kind
+        the notify hook counts like any lease event; the UI log's
+        kind vocabulary is untouched."""
+        session = body.get("session")
+        if not session or not isinstance(session, str):
+            return self.send_json(400, {"error": "session is required"})
+        rc, result, err = run_core("release-session", session)
+        if result is None:
+            return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
+        if result.get("action") == "session-released":
+            OUTBOX.append("session-released", {"session": session, "result": result})
+            return self.send_json(200, result)
+        return self.send_json(409, result)
 
     def api_lease_stop(self, body: dict) -> None:
         profile = body.get("profile")

@@ -166,3 +166,45 @@ def test_bridge_block_serves_agent_status(tmp_path):
     lease.write_grant(repo, 3)
     block = lease._bridge_block(fake, repo)
     assert block["armed"] is True and block["generation"] == "gen-test" and block["children"] == []
+
+
+def test_install_stamps_the_lobby_records_caller(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".config" / "colab-cli").mkdir(parents=True)
+    (tmp_path / ".config" / "colab-cli" / "token.json").write_text("{}")
+    lease.write_grant(repo, 3, now_dt=NOW)
+    rec = seed_lobby(repo)
+    rec["caller"] = "alpha"
+    (repo / "var" / "lease-lobby.json").write_text(json.dumps(rec))
+    out = lease.bridge_duty(Fake(), repo, NOW)
+    assert out["bridge_install"] == "installed"
+    cfg = json.loads((repo / "var" / "bridge-config.json").read_text())
+    assert cfg["caller"] == "alpha"
+
+
+def test_install_without_a_record_caller_stamps_the_machinery_default(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".config" / "colab-cli").mkdir(parents=True)
+    (tmp_path / ".config" / "colab-cli" / "token.json").write_text("{}")
+    lease.write_grant(repo, 3, now_dt=NOW)
+    seed_lobby(repo)
+    out = lease.bridge_duty(Fake(), repo, NOW)
+    assert out["bridge_install"] == "installed"
+    cfg = json.loads((repo / "var" / "bridge-config.json").read_text())
+    assert cfg["caller"] == "lease"
+
+
+def test_bridge_stop_line_caller_folds_into_the_spend_segment(tmp_path):
+    repo, fake = armed_setup(tmp_path)
+    key = "/content/bridge/log/bridge-000001.jsonl"
+    lines = [json.loads(x) for x in fake.remote[key].decode().splitlines()]
+    for line in lines:
+        if line["kind"] == "stop":
+            line["caller"] = "alpha"
+    fake.remote[key] = ("\n".join(json.dumps(x) for x in lines) + "\n").encode()
+    out = lease.bridge_duty(fake, repo, NOW)
+    assert out["bridge"] == "armed"
+    journal = [json.loads(x) for x in (repo / "var" / "lease-spend-journal.jsonl").read_text().splitlines()]
+    assert len(journal) == 1 and journal[0]["caller"] == "alpha"

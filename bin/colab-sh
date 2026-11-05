@@ -118,6 +118,14 @@ def resolve_session(flag: str | None) -> str | None:
         return None
 
 
+def _lease_module():
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    from sync import lease
+
+    return lease
+
+
 def live_state(session: str) -> str:
     """The target's server-side tri-state (alive/absent/unknown),
     read through the lease machinery's own funnel (bin/colab-run)
@@ -126,11 +134,32 @@ def live_state(session: str) -> str:
     from importlib.machinery import SourceFileLoader
 
     colab_run = SourceFileLoader("colab_run", str(REPO / "bin" / "colab-run")).load_module()
-    if str(REPO) not in sys.path:
-        sys.path.insert(0, str(REPO))
-    from sync.lease import session_state
+    return _lease_module().session_state(colab_run.colab, session)
 
-    return session_state(colab_run.colab, session)
+
+def claim_caller(flag: str | None) -> tuple[str | None, str | None]:
+    """Resolve the attach's caller claim (--caller flag over
+    $COLAB_CALLER) through the lease core's registry. Returns
+    (caller, error): a presented but unregistered claim is an
+    error — refused at claim time. Attach is journal-only: an
+    absent claim never blocks, it just leaves the attach
+    unattributed in the journal."""
+    lease = _lease_module()
+    env = os.environ.get("COLAB_CALLER")
+    err = lease.caller_claim_error(REPO, flag=flag, env=env)
+    if err:
+        return None, err
+    return lease.resolve_caller(REPO, flag=flag, env=env), None
+
+
+def journal_claim(session: str, caller: str | None) -> None:
+    """Record the attach in the caller-claims journal (the
+    attribution evidence for sessions outside lease records).
+    Best-effort, like every journal in the lease core."""
+    try:
+        _lease_module().append_caller_claim(REPO, session, caller, "colab-sh")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def read_script(args) -> str | None:
@@ -146,6 +175,7 @@ def read_script(args) -> str | None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="colab-sh", description=__doc__.split("\n")[0])
     ap.add_argument("-s", "--session", help="session name (default: the active lease's)")
+    ap.add_argument("--caller", help="caller claim: the thread doing this work (or $COLAB_CALLER); journaled per attach")
     ap.add_argument("-f", "--file", help="shell script file to run")
     ap.add_argument("--dir", default="/content", help="remote working directory")
     ap.add_argument("--timeout", type=float, default=900, help="seconds (default 900)")
@@ -159,6 +189,10 @@ def main(argv=None) -> int:
         script_args = args.command + script_args
         args.command = []
 
+    caller, claim_err = claim_caller(args.caller)
+    if claim_err:
+        print(f"colab-sh: {claim_err}", file=sys.stderr)
+        return 2
     session = resolve_session(args.session)
     if not session:
         print("colab-sh: no session (no -s, no $COLAB_SH_SESSION, no lease record)", file=sys.stderr)
@@ -208,6 +242,10 @@ def main(argv=None) -> int:
     except Exception:
         pass
 
+    # The attach is real from here: journal its caller claim (the
+    # claim never gates the attach — attribution is evidence, and
+    # the liveness guard above is the only refusal on this path).
+    journal_claim(session, caller)
     cmd = ssh_argv(session, args.dir, script_args, identity)
     try:
         r = subprocess.run(

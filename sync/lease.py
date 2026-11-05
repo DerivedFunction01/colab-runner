@@ -387,11 +387,13 @@ def append_gate_journal(repo: Path, event: dict) -> bool:
         return False
 
 
-def check_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None) -> dict:
+def check_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None, caller: str | None = None) -> dict:
     """Admission verdict for creating a session for `profile_name`
     (pure: no journaling, no colab calls). The verdict names the
     profile, its shape class, the actor evidence, and the basis:
-    disabled / agent-allowed / bypass / infra / refused.
+    disabled / agent-allowed / bypass / infra / refused. The
+    caller rides the verdict as attribution evidence only — it
+    never changes the shape decision.
 
     Bypass: the env claim names a whitelisted bypass actor; the
     panel claim additionally requires the via tag to corroborate
@@ -403,7 +405,7 @@ def check_session_admission(repo: Path, profile_name: str, via: str | None = Non
     policy = session_gate_policy(repo)
     cls = shape_class(profile)
     env = os.environ.get(ACTOR_ENV_CLAIM) or None
-    verdict = {"allowed": False, "profile": profile_name, "shape_class": cls, "via": via, "env_actor": env, "bypass": False}
+    verdict = {"allowed": False, "profile": profile_name, "shape_class": cls, "via": via, "env_actor": env, "bypass": False, "caller": caller}
     if not policy["enabled"]:
         return {**verdict, "allowed": True, "basis": "disabled"}
     if cls in policy["agent_classes"]:
@@ -416,20 +418,54 @@ def check_session_admission(repo: Path, profile_name: str, via: str | None = Non
     return {**verdict, "basis": "refused", "action": "shape-refused", "actor": via or env or "agent", "agent_classes": policy["agent_classes"]}
 
 
-def enforce_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None, seam: str = "acquire") -> dict | None:
+def enforce_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None, seam: str = "acquire", caller: str | None = None, creation: bool = True, duty: bool = False) -> dict | None:
     """check_session_admission plus journaling, for the creation
     seams: a refusal returns the verdict (action shape-refused) for
     the caller to surface; an admission returns None, journaling
     first when it rode a bypass or the infra exemption —
     agent-allowed admissions are the common case and stay
-    unjournaled."""
-    verdict = check_session_admission(repo, profile_name, via=via, profile=profile)
+    unjournaled. Journal events carry the resolved caller beside
+    the actor evidence (attribution joins, never replaces).
+
+    Creation authority (caller-attribution plan): past the shape
+    check, a fresh creation (creation=True) by an agent-class actor
+    is refused regardless of shape or claim — creation belongs to
+    the panel (bypass basis), the standing exemption (infra
+    basis), and the lease duty consuming demands (duty=True, an
+    internal marker only auto_acquire passes). The refusal is
+    journaled as caller-start-refused naming the caller and seam.
+    With the gate disabled the whole admission layer is off, this
+    refusal included. Non-creation consults (a demand write) pass
+    creation=False and see the shape check only."""
+    verdict = check_session_admission(repo, profile_name, via=via, profile=profile, caller=caller)
     if not verdict["allowed"]:
-        append_gate_journal(repo, {"kind": "shape-refused", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "agent_classes": verdict.get("agent_classes")})
+        append_gate_journal(repo, {"kind": "shape-refused", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller, "agent_classes": verdict.get("agent_classes")})
         return verdict
     if verdict["basis"] in ("bypass", "infra"):
-        append_gate_journal(repo, {"kind": f"shape-{verdict['basis']}", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"]})
+        append_gate_journal(repo, {"kind": f"shape-{verdict['basis']}", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller})
+        return None
+    if creation and not duty and verdict["basis"] == "agent-allowed" and not _actor_privileged(repo, profile_name, via, verdict):
+        append_gate_journal(repo, {"kind": "caller-start-refused", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller})
+        return {**verdict, "allowed": False, "basis": "agent-creation-denied", "action": "caller-start-refused", "actor": via or verdict["env_actor"] or "agent"}
     return None
+
+
+def _actor_privileged(repo: Path, profile_name: str, via: str | None, verdict: dict) -> bool:
+    """Whether the presenting actor carries creation authority
+    independent of the shape class. The shape verdict's basis
+    cannot answer this: an agent-allowed shape admits on basis
+    agent-allowed without ever consulting the bypass list, so a
+    bypass actor creating an agent-class shape would read as a
+    plain agent. The evidence rules mirror
+    check_session_admission's: a whitelisted env claim (the panel
+    claim additionally needing its via half), or the infra actor
+    admitting exactly the configured standing profile."""
+    policy = session_gate_policy(repo)
+    env = verdict.get("env_actor")
+    if env is not None and env in policy.get("bypass_actors", []) and (env != PANEL_ACTOR or via == PANEL_ACTOR):
+        return True
+    standing_profile = load_config(repo).get("standing", {}).get("profile", "lobby")
+    return via is not None and via == policy.get("infra_actor") and profile_name == standing_profile
 
 
 def renewal_admission(repo: Path, profile_name: str | None, profile: dict) -> dict:
@@ -442,6 +478,127 @@ def renewal_admission(repo: Path, profile_name: str | None, profile: dict) -> di
     cls = shape_class(profile)
     allowed = not policy["enabled"] or cls in policy["agent_classes"]
     return {"allowed": allowed, "profile": profile_name, "shape_class": cls, "agent_classes": policy["agent_classes"]}
+
+
+# --- Caller attribution -------------------------------------------------------
+# A caller is the named thread doing the work (plan:
+# .plans/2026-11-04-caller-attribution.md) — a sibling of the gate's
+# actor class above, never a substitute: the actor says which
+# channel acted (panel / test / standing / agent), the caller says
+# which thread. The claim arrives as a --caller flag on one-shot
+# calls (legible on the runtime's approval card, which shows the
+# command line) or as $COLAB_CALLER for drivers and machinery.
+# Thread callers are governed by the local, untracked registry
+# config/callers.json (the config/profiles.json pattern; schema in
+# tracked config/callers.example.json), read fresh at every
+# resolution like the gate policy. The machinery callers are code
+# constants, always valid, so a missing local registry never breaks
+# the panel or the duty. A claim is a registered base with an
+# optional single ":lane" suffix validated against the base.
+
+CALLER_ENV = "COLAB_CALLER"
+MACHINERY_CALLERS = (PANEL_ACTOR, GATE_DEFAULT_INFRA_ACTOR, "test", "lease")
+_CALLER_PART = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+
+
+def callers_path(repo: Path) -> Path:
+    return repo / "config" / "callers.json"
+
+
+def caller_registry(repo: Path) -> set:
+    """The valid caller bases: the machinery constants plus the
+    local registry's thread callers. A missing or malformed local
+    file yields the machinery set alone — fail-closed for thread
+    claims, never a crash."""
+    names = set(MACHINERY_CALLERS)
+    raw = load_json(callers_path(repo), {})
+    listed = raw.get("callers") if isinstance(raw, dict) else None
+    if isinstance(listed, list):
+        for name in listed:
+            if isinstance(name, str) and _CALLER_PART.fullmatch(name):
+                names.add(name)
+    return names
+
+
+def validate_caller(repo: Path, raw) -> str | None:
+    """Validate one raw claim: the normalized caller (base, with
+    its lane suffix when carried) or None — for an absent claim,
+    an unregistered base, or a malformed shape alike. Callers that
+    must distinguish "no claim" from "bad claim" use
+    caller_claim_error."""
+    if not isinstance(raw, str) or not raw or raw != raw.strip():
+        return None
+    base, sep, suffix = raw.partition(":")
+    if not _CALLER_PART.fullmatch(base):
+        return None
+    if sep and not _CALLER_PART.fullmatch(suffix):
+        return None
+    if base not in caller_registry(repo):
+        return None
+    return f"{base}:{suffix}" if sep else base
+
+
+def resolve_caller(repo: Path, flag: str | None = None, env: str | None = None) -> str | None:
+    """The seam's caller claim, resolved: the flag when one was
+    presented, else the env value, validated. None when no claim
+    was presented or the presented claim is invalid."""
+    raw = flag if flag is not None else env
+    return validate_caller(repo, raw)
+
+
+def caller_claim_error(repo: Path, flag: str | None = None, env: str | None = None) -> str | None:
+    """Why the presented claim failed, or None: no claim presented,
+    or the claim validated. The wrapper seams refuse on a presented
+    but invalid claim (an unregistered caller is refused at claim
+    time) while an absent claim simply leaves the call
+    unattributed."""
+    raw = flag if flag is not None else env
+    if raw is None:
+        return None
+    if validate_caller(repo, raw) is not None:
+        return None
+    return f"unregistered caller {raw!r} (registry: config/callers.json; machinery callers always valid)"
+
+
+def caller_claims_path(repo: Path) -> Path:
+    return var_dir(repo) / "caller-claims.jsonl"
+
+
+def append_caller_claim(repo: Path, session: str, caller: str | None, seam: str) -> bool:
+    """Journal one attach claim (the colab-sh seam writes these):
+    who attached to which session, when, through which wrapper.
+    The claims are the attribution evidence for sessions that live
+    outside lease records. Best-effort like every journal here."""
+    try:
+        p = caller_claims_path(repo)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "session": session, "caller": caller, "seam": seam}) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def load_caller_claims(repo: Path) -> dict:
+    """The latest attributed claim per session: {session: {"caller",
+    "ts"}}. Claims with no caller are attach evidence only and do
+    not attribute."""
+    out: dict = {}
+    try:
+        lines = caller_claims_path(repo).read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            claim = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(claim, dict) and claim.get("session") and claim.get("caller"):
+            out[claim["session"]] = {"caller": claim["caller"], "ts": claim.get("ts")}
+    return out
 
 
 def record_path(repo: Path) -> Path:
@@ -619,6 +776,8 @@ def append_spend_segment(repo: Path, rec: dict, end_dt: datetime) -> bool:
     if end_dt <= start:
         return False
     line = {"profile": rec.get("profile"), "session": rec.get("session"), "start": rec["acquired_at"], "end": end_dt.isoformat(), "rate": _profile_rate(repo, rec.get("profile"))}
+    if rec.get("caller"):
+        line["caller"] = rec["caller"]
     try:
         p = spend_journal_path(repo)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -865,13 +1024,13 @@ def created_shape_mismatch(session: str, profile: dict) -> dict | None:
     host = session_host(session)
     if not host:
         return None
-    m = re.match(r"m-(hm|s)-", host)
-    if not m:
+    actual = _endpoint_shape(host)
+    if actual is None:
         return None
-    actual_high = m.group(1) == "hm"
+    actual_high = actual == "high_ram"
     if actual_high == bool(profile.get("high_mem")):
         return None
-    return {"action": "shape-mismatch", "session": session, "declared_high_mem": bool(profile.get("high_mem")), "actual_class": "high_ram" if actual_high else "standard", "host": host}
+    return {"action": "shape-mismatch", "session": session, "declared_high_mem": bool(profile.get("high_mem")), "actual_class": actual, "host": host}
 
 
 # The fallback's unassign replay, run under the CLI's own interpreter.
@@ -1142,7 +1301,7 @@ def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = 
     return {"kit": "installed"}
 
 
-def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None) -> dict:
+def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False) -> dict:
     """Adopt the live lease for this profile or create it. The only entry
     point that ever creates a session under the lease model. Works for
     any profile in the spec catalog; each profile's lease lives in its
@@ -1166,6 +1325,13 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     out-of-scope creation carries neither stamp — attribution is
     envelope-scoped, so a lease outside the envelope is
     indistinguishable from an ordinary lease.
+
+    Caller attribution (caller-attribution plan): `caller` is the
+    resolved thread claim from the wrapper seam (the seams
+    validate; the core stamps what it is given). A created or
+    adopt-foreign record carries it; an adopted record keeps its
+    creator's caller, filling the field only when the record
+    predates attribution and the adopting call supplies one.
 
     Adopt-foreign (parallel instances): an instance profile with no
     record whose session already exists live — created outside the
@@ -1201,6 +1367,8 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
             newly_attributed = in_scope and rec.get("envelope_id") != grant["granted_at"]
             if newly_attributed:
                 rec["envelope_id"] = grant["granted_at"]
+            if caller and not rec.get("caller"):
+                rec["caller"] = caller
             save_record(repo, rec)
             if newly_attributed:
                 _note_envelope_lease_started(repo, rec)
@@ -1239,8 +1407,11 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
         adopted_foreign = fstate == "alive"
     if not adopted_foreign:
         # Session shape gate: the creation branch only — adopting
-        # or reusing a live session above is never gated.
-        refusal = enforce_session_admission(repo, profile_name, via=via, profile=profile, seam="acquire")
+        # or reusing a live session above is never gated. `duty`
+        # marks the lease duty creating on a demand (auto_acquire
+        # is its only passer): the shape check still applies, the
+        # agent creation denial does not.
+        refusal = enforce_session_admission(repo, profile_name, via=via, profile=profile, seam="acquire", caller=caller, duty=duty)
         if refusal is not None:
             return refusal
         args = ["new", "-s", session] + _session_shape_args(profile)
@@ -1278,6 +1449,8 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
         rec["envelope_id"] = grant["granted_at"]
     if via and (grant is None or in_scope):
         rec["via"] = via
+    if caller:
+        rec["caller"] = caller
     if effective_hours > SESSION_CAP_HOURS:
         # A window longer than one session's life is a window lease
         # from birth (lease-extension plan): the reaper renews the
@@ -1307,7 +1480,7 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     return out
 
 
-def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime | None = None) -> dict:
+def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime | None = None, caller: str | None = None) -> dict:
     """Move a lease's deadline later by `hours` without touching its
     session (plan .plans/2026-11-01-lease-extension.md). The budget
     guard prices only the delta (the profile's rate x hours) before
@@ -1345,8 +1518,15 @@ def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime 
     new_deadline = (parse_dt(old_deadline) + timedelta(hours=float(hours))).isoformat()
     rec["deadline"] = new_deadline
     rec["renew"] = True
+    if caller and not rec.get("caller"):
+        # Caller attribution: an extension by the owning thread
+        # fills a pre-attribution record's caller; an attributed
+        # record keeps its creator's caller (as on adopt).
+        rec["caller"] = caller
     save_record(repo, rec)
     out = {"action": "extended", "profile": profile_name, "hours": float(hours), "old_deadline": old_deadline, "new_deadline": new_deadline, "record": rec, "budget": budget}
+    if caller:
+        out["caller"] = caller
     if state == "alive" and rec.get("kit") != "installed":
         kit = install_renewal_kit(colab, repo, rec, now_dt)
         out["kit"] = kit
@@ -1636,23 +1816,41 @@ def _capture_session_host(repo: Path, rec: dict, origin: str, spool_on_first: bo
         return False
     rec["host"] = host
     if previous is not None or spool_on_first:
-        append_reaper_event(repo, {"kind": "approval-needed", "profile": rec.get("profile"), "session": rec.get("session"), "host": host, "previous_host": previous, "origin": origin})
+        event = {"kind": "approval-needed", "profile": rec.get("profile"), "session": rec.get("session"), "host": host, "previous_host": previous, "origin": origin}
+        if rec.get("caller"):
+            # The approval announcement names whose work the host
+            # serves (caller-attribution plan) — present only when
+            # the record carries a caller, so unattributed births
+            # announce as such by absence.
+            event["caller"] = rec["caller"]
+        append_reaper_event(repo, event)
     return True
 
 
 def _note_envelope_lease_started(repo: Path, rec: dict) -> None:
     """Record an envelope attribution in the ledger, and spool the
     envelope-lease-started event the companion drains into the UI
-    outbox (the drain is kind-generic; the panel renders this kind)."""
-    append_grant_ledger(repo, {"kind": "lease-attributed", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), "via": rec.get("via"), "session": rec.get("session"), "deadline": rec.get("deadline")})
-    append_reaper_event(repo, {"kind": "envelope-lease-started", "profile": rec.get("profile"), "envelope_id": rec.get("envelope_id"), "via": rec.get("via")})
+    outbox (the drain is kind-generic; the panel renders this kind).
+    The record's caller rides both events when it carries one."""
+    ledger = {"kind": "lease-attributed", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), "via": rec.get("via"), "session": rec.get("session"), "deadline": rec.get("deadline")}
+    spool = {"kind": "envelope-lease-started", "profile": rec.get("profile"), "envelope_id": rec.get("envelope_id"), "via": rec.get("via")}
+    if rec.get("caller"):
+        ledger["caller"] = rec["caller"]
+        spool["caller"] = rec["caller"]
+    append_grant_ledger(repo, ledger)
+    append_reaper_event(repo, spool)
 
 
 def _note_envelope_lease_released(repo: Path, rec: dict, reason: str) -> None:
     if not rec.get("envelope_id"):
         return
-    append_grant_ledger(repo, {"kind": "lease-released", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), "via": rec.get("via"), "reason": reason})
-    append_reaper_event(repo, {"kind": "envelope-lease-released", "profile": rec.get("profile"), "envelope_id": rec.get("envelope_id"), "reason": reason})
+    ledger = {"kind": "lease-released", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), "via": rec.get("via"), "reason": reason}
+    spool = {"kind": "envelope-lease-released", "profile": rec.get("profile"), "envelope_id": rec.get("envelope_id"), "reason": reason}
+    if rec.get("caller"):
+        ledger["caller"] = rec["caller"]
+        spool["caller"] = rec["caller"]
+    append_grant_ledger(repo, ledger)
+    append_reaper_event(repo, spool)
 
 
 def _attempt_renewal(colab, repo: Path, cfg: dict, rec: dict, state: str, now_dt: datetime) -> dict | None:
@@ -1764,8 +1962,11 @@ def reap(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     recs = all_records(repo)
+    # Unattributed detection runs even with no records at all —
+    # that is precisely the world where a stray matters.
+    unattributed = detect_unattributed(colab, repo, now_dt)
     if not recs:
-        return {"action": "none", "records": []}
+        return {"action": "none", "records": [], "unattributed": unattributed}
     grant = load_grant(repo)
     for rec in recs:
         # Host reconcile (initiation-time approval follow-up,
@@ -1793,6 +1994,7 @@ def reap(colab, repo: Path, now_dt: datetime | None = None) -> dict:
                 break
     out = {k: v for k, v in top.items() if k != "profile"}
     out["records"] = results
+    out["unattributed"] = unattributed
     return out
 
 
@@ -2249,7 +2451,11 @@ def install_bridge_kit(colab, repo: Path, rec: dict, generation: str) -> dict:
     gate = session_gate_policy(repo)
     agent_allowed = sorted(name for name, prof in profiles.items() if not gate["enabled"] or shape_class(prof) in gate["agent_classes"])
     cfg_local = var / "bridge-config.json"
-    cfg_local.write_text(json.dumps({"session": session, "generation": generation, "limits": bridge_limits(cfg), "profiles": profiles, "agent_allowed_profiles": agent_allowed}, indent=2))
+    # Caller attribution: the bridge mints children in-VM under
+    # this install's authority, so the config stamps the lobby
+    # record's caller (the machinery caller when the record
+    # predates attribution); child reports inherit it.
+    cfg_local.write_text(json.dumps({"session": session, "generation": generation, "limits": bridge_limits(cfg), "profiles": profiles, "agent_allowed_profiles": agent_allowed, "caller": rec.get("caller") or "lease"}, indent=2))
     if not _ensure_remote_dirs(colab, repo, session, [BRIDGE_KIT_REMOTE, f"{BRIDGE_REMOTE}/queue", f"{BRIDGE_REMOTE}/log", f"{BRIDGE_REMOTE}/results"], "bridge"):
         return {"bridge_install": "install-failed", "stage": "mkdir"}
     uploads = [
@@ -2294,6 +2500,8 @@ def _bridge_fold_stop(repo: Path, line: dict, folded: set) -> bool:
         return False
     folded.add(key)
     rec = {"profile": line["profile"], "session": line["name"], "acquired_at": line["minted_at"]}
+    if line.get("caller"):
+        rec["caller"] = line["caller"]
     try:
         end = parse_dt(line["ts"])
     except Exception:  # noqa: BLE001
@@ -2470,6 +2678,213 @@ def _bridge_block(colab, repo: Path) -> dict | None:
     }
 
 
+# --- Session access list & unattributed sessions (caller-attribution
+# plan, Steps 5–6) -------------------------------------------------------
+#
+# The access list is the panel's answer to "what is running and
+# whose is it": every live session, attributed from its lease
+# record or from the claims journal. A live session with neither is
+# unattributed — a detection state, never a claim value — stamped
+# with a first-seen time by reap()'s detection (Step 6) and
+# releasable from the panel in one tap.
+
+
+def session_endpoint(session: str) -> str | None:
+    """The raw binding endpoint/url for a session (the value
+    session_host parses the host out of), or None when the binding
+    or the entry is absent."""
+    binding = load_json(local_sessions_path(), {})
+    if not isinstance(binding, dict):
+        return None
+    entry = binding.get(session)
+    if not isinstance(entry, dict):
+        return None
+    for key in ("url", "endpoint"):
+        raw = entry.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
+def _endpoint_shape(endpoint: str | None) -> str | None:
+    """The shape class an endpoint's host names (m-hm- high-RAM,
+    m-s- standard — the same evidence the post-start assertion
+    reads), or None when the endpoint names neither."""
+    if not endpoint:
+        return None
+    host = urlparse(endpoint).hostname or endpoint
+    m = re.match(r"m-(hm|s)-", host)
+    if not m:
+        return None
+    return "high_ram" if m.group(1) == "hm" else "standard"
+
+
+def live_sessions(colab, repo: Path) -> list[dict] | None:
+    """The server's live sessions: [{session, endpoint,
+    shape_class}], endpoint/shape filled from the listing line when
+    it carries them, else from the local binding. None when the
+    listing is unreadable — a failed call, an empty answer, an auth
+    prompt: the session_state rule, that no caller may act on a
+    list it could not read."""
+    try:
+        out = colab("sessions", timeout=120).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    if not out or not out.strip() or "Enter the authorization code" in out:
+        return None
+    found: dict[str, dict] = {}
+    text = out.strip()
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, list):
+        for name in parsed:
+            if isinstance(name, str) and name:
+                found[name] = {"session": name, "endpoint": None, "shape_class": None}
+    if not found:
+        for line in text.splitlines():
+            m = re.match(r"\[([^\]]+)\]\s*(.*)$", line.strip())
+            if not m or not m.group(1).strip():
+                continue
+            entry = {"session": m.group(1).strip(), "endpoint": None, "shape_class": None}
+            rest = m.group(2)
+            for tok in rest.split():
+                if tok.startswith("http") or tok.startswith("m-"):
+                    entry["endpoint"] = tok
+                    break
+            if "High-RAM" in rest:
+                entry["shape_class"] = "high_ram"
+            elif "Standard" in rest:
+                entry["shape_class"] = "standard"
+            found[entry["session"]] = entry
+    if not found:
+        # Substring fallback over the names this workspace knows
+        # (records, binding, claims) — the way session_state reads
+        # a listing whose format carries no structure at all.
+        known = {rec.get("session") for rec in all_records(repo)}
+        binding = load_json(local_sessions_path(), {})
+        if isinstance(binding, dict):
+            known |= set(binding.keys())
+        known |= set(load_caller_claims(repo).keys())
+        for name in sorted(n for n in known if n):
+            if name in text:
+                found[name] = {"session": name, "endpoint": None, "shape_class": None}
+    for entry in found.values():
+        if not entry["endpoint"]:
+            entry["endpoint"] = session_endpoint(entry["session"])
+        if not entry["shape_class"]:
+            entry["shape_class"] = _endpoint_shape(entry["endpoint"])
+    return list(found.values())
+
+
+def unattributed_path(repo: Path) -> Path:
+    return var_dir(repo) / "unattributed.json"
+
+
+def load_unattributed(repo: Path) -> dict:
+    raw = load_json(unattributed_path(repo), {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_unattributed(repo: Path, stamps: dict) -> None:
+    p = unattributed_path(repo)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(stamps, indent=2, sort_keys=True))
+
+
+def clear_unattributed(repo: Path, session: str) -> None:
+    stamps = load_unattributed(repo)
+    if session in stamps:
+        del stamps[session]
+        save_unattributed(repo, stamps)
+
+
+def access_list(colab, repo: Path) -> list[dict]:
+    """Every live session with its attribution, served ready for
+    the panel: record-backed sessions carry their record's caller
+    and acquired_at and their profile's declared shape class;
+    claim-only sessions carry the latest claim and its time; the
+    rest are unattributed (caller None, first_seen from the
+    detection stamp). An unreadable live list serves an empty
+    list — no access section rather than a fabricated one."""
+    live = live_sessions(colab, repo)
+    if live is None:
+        return []
+    records = {rec.get("session"): rec for rec in all_records(repo)}
+    claims = load_caller_claims(repo)
+    stamps = load_unattributed(repo)
+    profiles = catalog_profiles(repo)
+    out = []
+    for entry in live:
+        name = entry["session"]
+        rec = records.get(name)
+        if rec is not None:
+            profile = profiles.get(rec.get("profile")) or {}
+            out.append({"session": name, "endpoint": entry["endpoint"], "shape_class": entry["shape_class"] or shape_class(profile), "caller": rec.get("caller"), "first_seen": rec.get("acquired_at")})
+            continue
+        claim = claims.get(name)
+        if claim is not None:
+            out.append({"session": name, "endpoint": entry["endpoint"], "shape_class": entry["shape_class"], "caller": claim.get("caller"), "first_seen": claim.get("ts")})
+            continue
+        stamp = stamps.get(name) or {}
+        out.append({"session": name, "endpoint": entry["endpoint"] or stamp.get("endpoint"), "shape_class": entry["shape_class"] or stamp.get("shape_class"), "caller": None, "first_seen": stamp.get("first_seen"), "unattributed": True})
+    return out
+
+
+def release_session(colab, repo: Path, session: str) -> dict:
+    """Stop one session by name (the panel's one-tap release for an
+    unattributed session) and clear its detection stamp. The stop
+    goes through stop_session_safe — the server-verified stop —
+    never a raw stop. A session with a lease record is refused
+    here: records release per profile through release(), which
+    owns the record lifecycle and the spend fold."""
+    if any(rec.get("session") == session for rec in all_records(repo)):
+        return {"action": "session-has-record", "session": session}
+    verdict = stop_session_safe(colab, session)
+    if verdict == "stop-failed":
+        return {"action": "session-stop-failed", "session": session, "stop": verdict}
+    clear_unattributed(repo, session)
+    return {"action": "session-released", "session": session, "stop": verdict}
+
+
+def detect_unattributed(colab, repo: Path, now_dt: datetime) -> dict:
+    """Unattributed detection (Step 6), run by reap() each pass: a
+    live session with no lease record and no caller claim is a
+    stray — stamped with its first-seen time and spooled once as
+    unattributed-session (the spool drains into the outbox; the
+    kind is not in the UI log's closed vocabulary, so it surfaces
+    in the access list, not the log). A stamped session that stops
+    being a live stray — it died, or it gained a record or a claim
+    — is cleared with an unattributed-cleared event. An unreadable
+    live list detects nothing: detection never acts on a list it
+    could not read."""
+    live = live_sessions(colab, repo)
+    if live is None:
+        return {"detected": [], "cleared": []}
+    known = {rec.get("session") for rec in all_records(repo)} | set(load_caller_claims(repo).keys())
+    stamps = load_unattributed(repo)
+    live_names = {e["session"] for e in live}
+    detected: list[str] = []
+    cleared: list[str] = []
+    for entry in live:
+        name = entry["session"]
+        if name in known or name in stamps:
+            continue
+        stamps[name] = {"first_seen": now_dt.isoformat(), "endpoint": entry["endpoint"], "shape_class": entry["shape_class"]}
+        append_reaper_event(repo, {"kind": "unattributed-session", "session": name, "endpoint": entry["endpoint"], "shape_class": entry["shape_class"], "first_seen": stamps[name]["first_seen"]})
+        detected.append(name)
+    for name in list(stamps):
+        if name not in live_names or name in known:
+            del stamps[name]
+            append_reaper_event(repo, {"kind": "unattributed-cleared", "session": name})
+            cleared.append(name)
+    if detected or cleared:
+        save_unattributed(repo, stamps)
+    return {"detected": detected, "cleared": cleared}
+
+
 def state_records(colab, repo: Path) -> dict:
     """Portion: every lease record's status. The per-record reads
     are independent and I/O-bound (session probes, heartbeat
@@ -2481,6 +2896,7 @@ def state_records(colab, repo: Path) -> dict:
         e = status(colab, repo, profile=rec["profile"])
         e["profile"] = rec["profile"]
         e["warm"] = rec.get("warm")
+        e["caller"] = rec.get("caller")
         return e
 
     if len(recs) <= 1:
@@ -2488,7 +2904,9 @@ def state_records(colab, repo: Path) -> dict:
     else:
         with ThreadPoolExecutor(max_workers=min(4, len(recs))) as pool:
             records = list(pool.map(entry, recs))
-    return {"records": records}
+    # The access list rides this portion: the panel's records
+    # section is where live-but-unrecorded sessions surface.
+    return {"records": records, "access": access_list(colab, repo)}
 
 
 def state_specs(colab, repo: Path) -> dict:
@@ -2545,29 +2963,34 @@ def request_path(repo: Path) -> Path:
     return var_dir(repo) / "lease-request.json"
 
 
-def write_request(repo: Path, reason: str = "", profile: str | None = None, now_dt: datetime | None = None, via: str | None = None, not_before: datetime | str | None = None) -> dict:
+def write_request(repo: Path, reason: str = "", profile: str | None = None, now_dt: datetime | None = None, caller: str | None = None, via: str | None = None, not_before: datetime | str | None = None) -> dict:
     """Record a demand for a lease (var/lease-request.json). Any driver
     may write it (bin/colab-lease request); the auto-acquire duty is the
-    only consumer. `via` is the requester tag: auto_acquire copies it
+    only consumer. `caller` is the requester: auto_acquire copies it
     onto the lease record it creates, so a lease started by demand is
-    attributable to whoever asked. `not_before` makes the demand a
+    attributable to the thread that asked (caller-attribution plan —
+    the demand's old `via` tag generalized; `via` remains accepted as
+    the same claim's legacy spelling). `not_before` makes the demand a
     timed start: the duty leaves it untouched until its time comes
     (two-tier envelope plan — a timed start is data the hook consumes,
     never an agent-fired command)."""
     now_dt = now_dt or datetime.now(timezone.utc)
+    if caller is None:
+        caller = via
     # Session shape gate, early refusal: a demand whose requester
-    # is identified (a via tag) and whose profile is catalogued is
-    # checked now, so a refused demand never sits in the file for
-    # the duty to retry. An unattributed demand (no via) defers to
-    # the consumption check in auto_acquire, which re-checks with
-    # the demand's via — possibly none — before acquiring.
-    if via is not None and profile is not None and profile in catalog_profiles(repo):
-        refusal = enforce_session_admission(repo, profile, via=via, seam="request")
+    # is identified (a caller claim) and whose profile is catalogued
+    # is checked now, so a refused demand never sits in the file for
+    # the duty to retry. An unattributed demand (no caller) defers
+    # to the consumption check in auto_acquire, which re-checks
+    # before acquiring. The check is shape-only (creation=False):
+    # a demand is an ask, never a creation.
+    if caller is not None and profile is not None and profile in catalog_profiles(repo):
+        refusal = enforce_session_admission(repo, profile, seam="request", caller=caller, creation=False)
         if refusal is not None:
             return refusal
     req = {"requested_at": now_dt.isoformat(), "reason": reason, "profile": profile}
-    if via:
-        req["via"] = via
+    if caller:
+        req["caller"] = caller
     if not_before is not None:
         req["not_before"] = not_before.isoformat() if isinstance(not_before, datetime) else parse_dt(str(not_before)).isoformat()
     p = request_path(repo)
@@ -2635,11 +3058,17 @@ def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
             return {"action": "skipped-unknown", "session": rec["session"]}
         append_spend_segment(repo, rec, now_dt or datetime.now(timezone.utc))
         save_record(repo, None, profile=profile_name)  # confirmed dead: clear before acquiring
-    result = acquire(colab, repo, profile_name, now_dt=now_dt, via=req.get("via"))
+    # The duty creates on the demand: the demand's caller becomes
+    # the lease's caller (a pre-attribution demand's via tag reads
+    # as the same claim), and the duty marker carries the creation
+    # past the agent creation denial — the shape check inside
+    # acquire still applies in full.
+    demand_caller = req.get("caller") or req.get("via")
+    result = acquire(colab, repo, profile_name, now_dt=now_dt, caller=demand_caller, duty=True)
     action = result.get("action")
     if action == "created":
         clear_request(repo)
-        return {"action": "auto-acquired", "session": result["record"]["session"], "deadline": result["record"]["deadline"], "reason": req.get("reason", ""), "via": req.get("via")}
+        return {"action": "auto-acquired", "session": result["record"]["session"], "deadline": result["record"]["deadline"], "reason": req.get("reason", ""), "via": req.get("via"), "caller": demand_caller}
     if action == "adopted":
         clear_request(repo)
         return {"action": "satisfied-live", "session": result["record"]["session"]}
@@ -2650,7 +3079,7 @@ def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         # refusal itself is journaled at the acquire seam; this
         # entry records the demand's disposition.
         clear_request(repo)
-        append_gate_journal(repo, {"kind": "demand-shape-refused", "seam": "auto", "profile": profile_name, "via": req.get("via"), "shape_class": result.get("shape_class")})
+        append_gate_journal(repo, {"kind": "demand-shape-refused", "seam": "auto", "profile": profile_name, "via": req.get("via"), "caller": demand_caller, "shape_class": result.get("shape_class")})
         return {"action": "skipped-shape", "profile": profile_name, "shape_class": result.get("shape_class")}
     if action == "refused-budget":
         return {"action": "skipped-budget", "budget": result.get("budget")}

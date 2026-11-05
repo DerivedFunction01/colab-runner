@@ -2,8 +2,11 @@
 """Run a named job on Colab: sweep orphans, sync in, execute detached, poll,
 pull results, stop the session on every exit path.
 
-Usage: colab-run <job-name> [--resume RUN_ID]
+Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG]
 Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
+--caller TAG (or the manifest's "caller" key, or $COLAB_CALLER)
+attributes the run to its thread: it rides the lease acquire and
+is stamped on the run record.
 The CLI is resolved via $COLAB_BIN (tests point this at a fake), else the
 uv tool venv (~/.local/share/uv/tools/google-colab-cli/bin/colab), else
 PATH, else ~/.local/bin/colab. The CLI is deliberately NOT installed on
@@ -189,11 +192,21 @@ def main() -> int:
         return 2
     job_name = args[0]
     resume = args[args.index("--resume") + 1] if "--resume" in args else None
+    caller_flag = args[args.index("--caller") + 1] if "--caller" in args else None
     manifest_path = REPO / "jobs" / job_name / "job.json"
     if not manifest_path.exists():
         print(f"no job manifest at {manifest_path}", file=sys.stderr)
         return 2
     job = json.loads(manifest_path.read_text())
+    # Caller claim: flag over the manifest's caller key over
+    # $COLAB_CALLER; a presented but unregistered claim is refused
+    # at claim time, before anything starts.
+    claim_raw = caller_flag if caller_flag is not None else job.get("caller")
+    claim_err = lease.caller_claim_error(REPO, flag=claim_raw, env=os.environ.get("COLAB_CALLER"))
+    if claim_err:
+        print(f"colab-run: {claim_err}", file=sys.stderr)
+        return 2
+    caller = lease.resolve_caller(REPO, flag=claim_raw, env=os.environ.get("COLAB_CALLER"))
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
         print("colab-run: STAGED — no colab login yet. Run ops/bootstrap_local.sh, then the one-time login (see README).", file=sys.stderr)
         return 2
@@ -215,6 +228,8 @@ def main() -> int:
     session = profile["session"]
     run_id = resume or f"{job_name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     rec = {"run_id": run_id, "job": job_name, "session": session, "state": "starting", "started_at": now(), "resumed": bool(resume)}
+    if caller:
+        rec["caller"] = caller
     save_record(rec)
     usage_before = colab("usage", timeout=120).stdout.strip()
     # Lease model (sync/lease.py): adopt-or-acquire the shared session and
@@ -222,8 +237,8 @@ def main() -> int:
     # disabled in config, fall back to the original per-job session.
     use_lease = bool(lease.load_config(REPO).get("enabled"))
     if use_lease:
-        got = lease.acquire(colab, REPO, profile_name, via="runner")
-        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch"):
+        got = lease.acquire(colab, REPO, profile_name, via="runner", caller=caller)
+        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused"):
             rec.update(state="failed", error=json.dumps(got)[:300])
             save_record(rec)
             print(json.dumps({"run_id": run_id, "state": "failed", "lease": got}, indent=2))
@@ -236,7 +251,7 @@ def main() -> int:
         # lease path is gated inside acquire): a job run is an agent
         # actor unless the env claim says otherwise. A refusal fails
         # the run before any session is created.
-        refusal = lease.enforce_session_admission(REPO, profile_name, via="runner", profile=profile, seam="runner")
+        refusal = lease.enforce_session_admission(REPO, profile_name, via="runner", profile=profile, seam="runner", caller=caller)
         if refusal is not None:
             rec.update(state="failed", error=json.dumps(refusal)[:300])
             save_record(rec)

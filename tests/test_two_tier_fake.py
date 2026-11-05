@@ -225,7 +225,11 @@ def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
     assert out["action"] == "standing-refused-budget"
     assert out["budget"]["reason"] == "standing-budget"
     assert not (var(env) / "lease-lobby.json").exists()
-    # The burst tier never answers to the standing sub-cap.
+    # The burst tier never answers to the standing sub-cap. The
+    # acquire rides the suite's test actor claim: under caller
+    # attribution a claimless agent actor's fresh start is refused
+    # (caller-start-refused), which is not what this test is about.
+    env["COLAB_LEASE_ACTOR"] = "test"
     assert run_lease(env, "acquire", "workload")["action"] == "created"
 
 
@@ -265,25 +269,28 @@ def test_demand_started_burst_carries_envelope_stamps(tmp_path):
     env = lease_env(tmp_path)
     env["COLAB_RUNNER_AUTO_ACQUIRE"] = "1"
     granted = run_lease(env, "grant", "--hours", "4")
-    run_lease(env, "request", "workload", "--reason", "burst work", "--via", "xbrl-thread")
+    run_lease(env, "request", "workload", "--reason", "burst work", "--caller", "test")
     out = run_lease(env, "auto")
     assert out["action"] == "auto-acquired"
-    assert out["via"] == "xbrl-thread"
+    assert out["caller"] == "test"
     rec = json.loads((var(env) / "lease-workload.json").read_text())
     assert rec["envelope_id"] == granted["grant"]["granted_at"]
-    assert rec["via"] == "xbrl-thread"
+    assert rec["caller"] == "test"
 
 
 def test_demand_out_of_scope_carries_neither_stamp(tmp_path):
     env = lease_env(tmp_path)
     env["COLAB_RUNNER_AUTO_ACQUIRE"] = "1"
     run_lease(env, "grant", "--hours", "4")  # scope: lobby + workload
-    run_lease(env, "request", "standard", "--reason", "outside", "--via", "xbrl-thread")
+    run_lease(env, "request", "standard", "--reason", "outside", "--caller", "test")
     out = run_lease(env, "auto")
     assert out["action"] == "auto-acquired"
     rec = json.loads((var(env) / "lease-standard.json").read_text())
     assert "envelope_id" not in rec
     assert "via" not in rec
+    # Caller attribution is not envelope-scoped: the record carries
+    # its caller even outside the envelope (via was the scoped tag).
+    assert rec["caller"] == "test"
 
 
 def test_envelope_ledger_and_state_block(tmp_path):
@@ -294,7 +301,7 @@ def test_envelope_ledger_and_state_block(tmp_path):
     env = lease_env(tmp_path)
     env["COLAB_RUNNER_AUTO_ACQUIRE"] = "1"
     granted = run_lease(env, "grant", "--hours", "4")
-    run_lease(env, "request", "workload", "--reason", "burst work", "--via", "xbrl-thread")
+    run_lease(env, "request", "workload", "--reason", "burst work", "--caller", "test")
     run_lease(env, "auto")
     st = run_lease(env, "state")
     block = st["envelope"]
@@ -304,7 +311,7 @@ def test_envelope_ledger_and_state_block(tmp_path):
     # live config's caps are at read time.
     assert block["caps"] == granted["grant"]["scope"]["caps"]
     assert [r["profile"] for r in block["records"]] == ["workload"]
-    assert block["records"][0]["via"] == "xbrl-thread"
+    assert block["records"][0]["caller"] == "test"
     spool = (var(env) / "reaper-events.jsonl").read_text()
     assert "envelope-lease-started" in spool
     assert run_lease(env, "release", "workload")["action"] == "released"
@@ -313,7 +320,7 @@ def test_envelope_ledger_and_state_block(tmp_path):
     ledger = [json.loads(line) for line in (var(env) / "grant-ledger.jsonl").read_text().splitlines() if line.strip()]
     assert [e["kind"] for e in ledger] == ["grant-started", "lease-attributed", "lease-released"]
     assert ledger[1]["envelope_id"] == granted["grant"]["granted_at"]
-    assert ledger[1]["via"] == "xbrl-thread"
+    assert ledger[1]["caller"] == "test"
     run_lease(env, "ungrant")
     ledger = [json.loads(line) for line in (var(env) / "grant-ledger.jsonl").read_text().splitlines() if line.strip()]
     assert ledger[-1]["kind"] == "grant-ended"

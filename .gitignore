@@ -12,6 +12,11 @@
 # tracked config/profiles.example.json — never committed.
 /config/profiles.json
 
+# Local caller registry: which named threads may claim caller identity
+# at the wrapper seams is local data, seeded from the tracked
+# config/callers.example.json — never committed.
+/config/callers.json
+
 # Job results: manifests are tracked under jobs/; payload bytes are not.
 /results/*
 !/results/.gitkeep

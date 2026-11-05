@@ -141,3 +141,39 @@ def test_main_refuses_when_liveness_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(sh, "live_state", boom)
     assert sh.main(["-s", "workload", "echo hi"]) == 2
     assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)
+
+
+# --- Caller claims (caller-attribution plan, Step 2) --
+# Resolution runs against the repo's real registry: only machinery
+# callers are safe to name here (thread callers live in the local
+# untracked registry and must never leak into tests).
+
+
+def test_claim_caller_flag_env_and_refusal(monkeypatch):
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    assert sh.claim_caller("lease") == ("lease", None)
+    assert sh.claim_caller("lease:lane-1") == ("lease:lane-1", None)
+    assert sh.claim_caller(None) == (None, None)
+    caller, err = sh.claim_caller("bogus-name-zzz")
+    assert caller is None and err is not None and "bogus-name-zzz" in err
+    monkeypatch.setenv("COLAB_CALLER", "panel")
+    assert sh.claim_caller(None) == ("panel", None)
+    assert sh.claim_caller("lease") == ("lease", None)  # flag over env
+
+
+def test_main_journals_the_attach_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    fake = FakeRun(rc=0)
+    assert run_main(monkeypatch, fake, ["-s", "workload", "--caller", "lease", "echo hi"]) == 0
+    import json as _json
+    lines = [_json.loads(x) for x in (tmp_path / "caller-claims.jsonl").read_text().splitlines() if x.strip()]
+    assert lines[-1]["session"] == "workload" and lines[-1]["caller"] == "lease" and lines[-1]["seam"] == "colab-sh"
+
+
+def test_main_refuses_an_unregistered_caller_before_connecting(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    fake = FakeRun()
+    assert run_main(monkeypatch, fake, ["-s", "workload", "--caller", "bogus-name-zzz", "echo hi"]) == 2
+    assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)

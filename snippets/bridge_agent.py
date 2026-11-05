@@ -350,6 +350,12 @@ class Agent:
         self.child_max_s = float(limits.get("child_max_hours", 4)) * 3600
         self.default_timeout = float(limits.get("command_timeout_seconds", 300))
         self.profiles = cfg.get("profiles", {})
+        # Caller attribution: the caller this bridge installation
+        # acts for, stamped into the config at kit install from the
+        # lobby record; child entries and stop lines inherit it, so
+        # bridge-minted spend attributes like any lease record.
+        # Absent in pre-attribution configs.
+        self.caller = cfg.get("caller")
         # Session shape gate: the profiles an agent-driven mint may
         # create, stamped into this config at kit install. A config
         # without the stamp (a bridge armed before the gate) derives
@@ -551,7 +557,7 @@ class Agent:
             else:
                 self._error_line(cmd, "mint-failed")
             return
-        info = {"profile": cmd["profile"], "rate": profile.get("rate_cu_per_hour"), "minted_at": now_iso(), "last_used_at": now_iso()}
+        info = {"profile": cmd["profile"], "rate": profile.get("rate_cu_per_hour"), "minted_at": now_iso(), "last_used_at": now_iso(), "caller": self.caller}
         self.registry.add_child(name, info)
         line = self.log.write({"kind": "mint", "id": cmd["id"], "name": name, "profile": cmd["profile"], "rate": info["rate"], "seconds": round(time.monotonic() - t0, 1)})
         self.registry.mark_processed(cmd["id"], line["seq"])
@@ -565,7 +571,7 @@ class Agent:
             if sessions is None or name in sessions:
                 return False
         info = self.registry.remove_child(name) or {}
-        line = {"kind": "stop", "name": name, "profile": info.get("profile"), "rate": info.get("rate"), "minted_at": info.get("minted_at"), "reason": reason}
+        line = {"kind": "stop", "name": name, "profile": info.get("profile"), "rate": info.get("rate"), "minted_at": info.get("minted_at"), "reason": reason, "caller": info.get("caller")}
         if cmd_id:
             line["id"] = cmd_id
         written = self.log.write(line)
@@ -685,7 +691,7 @@ class Agent:
                 idle = round(now - datetime.fromisoformat(info["last_used_at"]).timestamp())
             except (KeyError, ValueError):
                 age = idle = None
-            children.append({"name": name, "profile": info.get("profile"), "age_s": age, "idle_s": idle})
+            children.append({"name": name, "profile": info.get("profile"), "age_s": age, "idle_s": idle, "caller": info.get("caller")})
         status = {"v": PROTOCOL, "gen": self.generation, "ts": now_iso(), "session": self.session, "auth_down": self.auth_down, "children": children, "processed": len(self.registry.processed), "queue": queue_depth, "log_segment": self.log.path.name}
         try:
             tmp = STATUS_FILE.with_name(STATUS_FILE.name + ".tmp")

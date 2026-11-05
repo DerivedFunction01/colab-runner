@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin CLI over sync/lease.py — the shared-session lease.
 
-Usage: colab-lease status|acquire [profile] [--hours H] [--via TAG]|extend [profile] --hours H|release [profile]|reap|keepalive|auto|request [profile] [--reason TEXT] [--via TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst PROFILE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|parallel PROFILE --on|--off|admission [profile] [--via TAG]
+Usage: colab-lease status|acquire [profile] [--hours H] [--via TAG] [--caller TAG]|extend [profile] --hours H [--caller TAG]|release [profile]|release-session SESSION|reap|keepalive|auto|request [profile] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst PROFILE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|parallel PROFILE --on|--off|admission [profile] [--via TAG] [--caller TAG]
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
 orphan reconciliation across all profile records); `auto` is the
 hook's auto-acquire duty (inert unless enabled in config/lease.json);
@@ -86,6 +86,18 @@ def parse_flag(rest: list[str], flag: str) -> tuple[str | None, list[str], str |
     return value, out, None
 
 
+def resolve_cli_caller(flag: str | None) -> tuple[str | None, str | None]:
+    """Resolve a --caller flag against $COLAB_CALLER through the
+    core's registry. Returns (caller, error): a presented but
+    unregistered claim is an error — refused at claim time — while
+    no claim at all is (None, None), an unattributed call."""
+    env = os.environ.get("COLAB_CALLER")
+    err = lease.caller_claim_error(REPO, flag=flag, env=env)
+    if err:
+        return None, err
+    return lease.resolve_caller(REPO, flag=flag, env=env), None
+
+
 def configured_default_profile() -> str | None:
     """The default profile id from config/profiles.json — the only
     source executable code may resolve it from. None when the config
@@ -100,7 +112,7 @@ def configured_default_profile() -> str | None:
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args or args[0] not in ("status", "acquire", "extend", "release", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "parallel", "admission"):
+    if not args or args[0] not in ("status", "acquire", "extend", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "parallel", "admission"):
         print(__doc__.strip().split("\n")[2], file=sys.stderr)
         return 2
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
@@ -113,8 +125,14 @@ def main() -> int:
     elif cmd == "acquire":
         hours, rest, err = parse_hours(args[1:])
         via = None
+        caller_flag = None
         if err is None:
             via, rest, err = parse_flag(rest, "--via")
+        if err is None:
+            caller_flag, rest, err = parse_flag(rest, "--caller")
+        caller = None
+        if err is None:
+            caller, err = resolve_cli_caller(caller_flag)
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
@@ -123,7 +141,7 @@ def main() -> int:
         if profile is None:
             print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
             return 2
-        result = lease.acquire(cr.colab, REPO, profile, hours=hours, via=via)
+        result = lease.acquire(cr.colab, REPO, profile, hours=hours, via=via, caller=caller)
         if result.get("host_changed") and result.get("record"):
             # Initiation-time approval, Step 2: this entry point just
             # birthed (or adopted) a session on a new tunnel host —
@@ -132,6 +150,12 @@ def main() -> int:
             result["prime"] = lease.prime_session_host(cr.colab, REPO, result["record"]["session"])
     elif cmd == "extend":
         hours, rest, err = parse_hours(args[1:])
+        caller_flag = None
+        if err is None:
+            caller_flag, rest, err = parse_flag(rest, "--caller")
+        caller = None
+        if err is None:
+            caller, err = resolve_cli_caller(caller_flag)
         if err is None and hours is None:
             err = "extend requires --hours H (H > 0)"
         if err:
@@ -142,7 +166,7 @@ def main() -> int:
         if profile is None:
             print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
             return 2
-        result = lease.extend(cr.colab, REPO, profile, hours)
+        result = lease.extend(cr.colab, REPO, profile, hours, caller=caller)
     elif cmd == "release":
         profile = args[1] if len(args) > 1 else None
         result = lease.release(cr.colab, REPO, profile=profile)
@@ -229,6 +253,12 @@ def main() -> int:
         result = lease.set_parallel(REPO, positional[0], flags[0] == "--on")
     elif cmd == "admission":
         via, rest, err = parse_flag(args[1:], "--via")
+        caller_flag = None
+        if err is None:
+            caller_flag, rest, err = parse_flag(rest, "--caller")
+        caller = None
+        if err is None:
+            caller, err = resolve_cli_caller(caller_flag)
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
@@ -240,8 +270,8 @@ def main() -> int:
         if profile not in lease.catalog_profiles(REPO):
             result = {"action": "unknown-profile", "profile": profile}
         else:
-            refusal = lease.enforce_session_admission(REPO, profile, via=via, seam="wrapper")
-            result = refusal if refusal is not None else {"action": "admitted", "profile": profile}
+            refusal = lease.enforce_session_admission(REPO, profile, via=via, seam="wrapper", caller=caller)
+            result = refusal if refusal is not None else {"action": "admitted", "profile": profile, "caller": caller}
     elif cmd == "keepalive":
         rec = lease.load_record(REPO)
         if not rec:
@@ -256,25 +286,36 @@ def main() -> int:
     elif cmd == "auto":
         result = lease.auto_acquire(cr.colab, REPO)
     elif cmd == "request":
-        profile, reason, via, at = None, "", None, None
+        profile, reason, claim, at = None, "", None, None
         rest = args[1:]
         while rest:
             tok, rest = rest[0], rest[1:]
             if tok == "--reason" and rest:
                 reason, rest = rest[0], rest[1:]
-            elif tok == "--via" and rest:
-                via, rest = rest[0], rest[1:]
+            elif tok in ("--caller", "--via") and rest:
+                # --via is the caller claim's legacy spelling; both
+                # feed the one governed claim.
+                claim, rest = rest[0], rest[1:]
             elif tok == "--at" and rest:
                 at, rest = rest[0], rest[1:]
             elif not tok.startswith("--"):
                 profile = tok
+        caller, err = resolve_cli_caller(claim)
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
         if at is not None:
             try:
                 datetime.fromisoformat(at)
             except ValueError:
                 print("colab-lease: --at needs an ISO timestamp", file=sys.stderr)
                 return 2
-        result = lease.write_request(REPO, reason=reason, profile=profile, via=via, not_before=at)
+        result = lease.write_request(REPO, reason=reason, profile=profile, caller=caller, not_before=at)
+    elif cmd == "release-session":
+        if len(args) < 2:
+            print("colab-lease: release-session needs a session name", file=sys.stderr)
+            return 2
+        result = lease.release_session(cr.colab, REPO, args[1])
     elif cmd == "unrequest":
         had = lease.load_request(REPO) is not None
         lease.clear_request(REPO)
@@ -283,7 +324,7 @@ def main() -> int:
         result = lease.reap(cr.colab, REPO)
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
-    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live", "shape-refused", "shape-mismatch") else 1
+    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed") else 1
 
 
 if __name__ == "__main__":

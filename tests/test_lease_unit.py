@@ -946,7 +946,8 @@ def test_auto_timed_start_waits_then_fires(tmp_path, monkeypatch):
     """A demand with a future not_before survives an auto pass
     untouched (not consumed, not failed, no lease), then acquires on
     the first pass after its time — a timed start as data, with the
-    request's via tag copied onto the created record."""
+    request's tag (written here in its legacy via spelling) read as
+    the caller claim and stamped on the created record."""
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("COLAB_RUNNER_AUTO_ACQUIRE", "1")
     alive = set()
@@ -959,9 +960,10 @@ def test_auto_timed_start_waits_then_fires(tmp_path, monkeypatch):
     assert alive == set()
     out = lease.auto_acquire(stub, REPO, now_dt=NOW + timedelta(hours=2))
     assert out["action"] == "auto-acquired"
+    assert out["caller"] == "timer"
     assert lease.load_request(REPO) is None
     rec = lease.load_record(REPO, "standard")
-    assert rec is not None and rec["via"] == "timer"
+    assert rec is not None and rec["caller"] == "timer"
 
 
 # --- Parallel instances (plan: .plans/2026-11-03-parallel-cpu-sessions.md) -----
@@ -1287,3 +1289,74 @@ def test_no_raw_unassign_call_remains():
     for rel in ("sync/lease.py", "probes/_driver.py", "snippets/unassign_orphans.py"):
         assert "client.unassign(" not in (REPO / rel).read_text(), rel
     assert 'data=b"{}"' in lease.UNASSIGN_FALLBACK_SCRIPT
+
+
+# --- Caller creation authority (caller-attribution plan, Step 3) -----
+# The refusal matrix over enforce_session_admission: past the shape
+# check, an agent-class actor's fresh creation is refused on any
+# shape; the panel's two halves, a bypass claim, the infra
+# exemption, the duty marker, a non-creation consult, and a
+# disabled gate each admit. The gate policy is pinned per test;
+# the journal lands in the scratched var dir.
+
+HIGH_RAM = {"high_mem": True}
+STANDARD = {"high_mem": False}
+
+
+def _authority_fixture(tmp_path, monkeypatch, enabled=True):
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": enabled, "agent_classes": ["high_ram"], "bypass_actors": ["panel", "test"], "infra_actor": "standing"})
+    monkeypatch.setattr(lease, "load_config", lambda repo: {"standing": {"profile": "lobby"}})
+    monkeypatch.delenv("COLAB_LEASE_ACTOR", raising=False)
+
+
+def _gate_journal(tmp_path):
+    p = tmp_path / "var" / "session-gate-journal.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+
+
+def test_authority_refuses_agent_creation_and_journals(tmp_path, monkeypatch):
+    _authority_fixture(tmp_path, monkeypatch)
+    out = lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM, caller="alpha", seam="acquire")
+    assert out is not None and out["action"] == "caller-start-refused"
+    assert out["basis"] == "agent-creation-denied" and out["caller"] == "alpha"
+    journal = _gate_journal(tmp_path)
+    assert [e["kind"] for e in journal] == ["caller-start-refused"]
+    assert journal[0]["caller"] == "alpha" and journal[0]["seam"] == "acquire"
+
+
+def test_authority_shape_refusal_precedes_it(tmp_path, monkeypatch):
+    _authority_fixture(tmp_path, monkeypatch)
+    out = lease.enforce_session_admission(REPO, "plain", profile=STANDARD, caller="alpha")
+    assert out["action"] == "shape-refused"
+    assert [e["kind"] for e in _gate_journal(tmp_path)] == ["shape-refused"]
+
+
+def test_authority_non_creation_consult_and_duty_admit(tmp_path, monkeypatch):
+    _authority_fixture(tmp_path, monkeypatch)
+    assert lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM, caller="alpha", creation=False) is None
+    assert lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM, caller="alpha", duty=True) is None
+    assert _gate_journal(tmp_path) == []
+
+
+def test_authority_panel_two_halves_and_bypass_claim_admit(tmp_path, monkeypatch):
+    _authority_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("COLAB_LEASE_ACTOR", "panel")
+    # One half alone is not authority: the panel env claim without
+    # its via corroboration is refused like any agent.
+    out = lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM, caller="panel")
+    assert out is not None and out["action"] == "caller-start-refused"
+    assert lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM, via="panel", caller="panel") is None
+    # A whitelisted non-panel claim bypasses on the env half alone.
+    monkeypatch.setenv("COLAB_LEASE_ACTOR", "test")
+    assert lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM) is None
+
+
+def test_authority_infra_exemption_and_disabled_gate_admit(tmp_path, monkeypatch):
+    _authority_fixture(tmp_path, monkeypatch)
+    assert lease.enforce_session_admission(REPO, "lobby", profile=STANDARD, via="standing") is None
+    assert [e["kind"] for e in _gate_journal(tmp_path)] == ["shape-infra"]
+    _authority_fixture(tmp_path, monkeypatch, enabled=False)
+    assert lease.enforce_session_admission(REPO, "main", profile=HIGH_RAM, caller="alpha") is None

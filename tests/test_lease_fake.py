@@ -360,7 +360,7 @@ def test_state_portions_and_composition(tmp_path, monkeypatch):
     # The fake's help output parses as no catalog, so the specs
     # portion's catalog_error rides the composed payload exactly as
     # it did before the split.
-    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate"}
+    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access"}
     assert composed["catalog_error"] == specs["catalog_error"]
     assert composed["records"] == records["records"]
     assert composed["budget"] == budget["budget"]
@@ -426,6 +426,9 @@ def gate_repo(tmp_path, monkeypatch, gate=None):
         "standing": {"profile": "lobby", "daily_cu_cap": 4, "max_session_hours": 12},
         "session_gate": gate if gate is not None else {"enabled": True, "bypass_actors": ["panel", "test"], "agent_classes": ["high_ram"], "infra_actor": "standing"},
     }, sort_keys=True, separators=(",", ":")))
+    # Caller attribution: the fixture's own scratch registry (fictional
+    # thread names only — the machine's local registry never leaks in).
+    (cfg_dir / "callers.json").write_text(json.dumps({"callers": ["alpha", "beta"]}))
     (tmp_path / "snippets").symlink_to(REPO / "snippets")
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -459,13 +462,27 @@ def test_gate_refuses_agent_on_standard_and_gpu(tmp_path, monkeypatch):
     assert all(e["seam"] == "acquire" for e in journal)
 
 
-def test_gate_allows_agent_high_ram(tmp_path, monkeypatch):
+def test_gate_agent_high_ram_is_now_a_caller_start_refusal(tmp_path, monkeypatch):
+    """Caller attribution reversed the old agent-creation allowance:
+    an agent-class actor may no longer create even a High-RAM
+    session — creation belongs to the panel, the standing duty,
+    and the lease duty consuming demands. The refusal names the
+    caller and the seam, attempts no creation, and leaves no record."""
     repo = gate_repo(tmp_path, monkeypatch)
     fake = FakeColab()
-    out = lease_mod.acquire(fake, repo, "workload", now_dt=PNOW)
+    out = lease_mod.acquire(fake, repo, "workload", now_dt=PNOW, caller="alpha")
+    assert out["action"] == "caller-start-refused"
+    assert out["shape_class"] == "high_ram" and out["caller"] == "alpha"
+    assert out["basis"] == "agent-creation-denied"
+    assert not [c for c in fake.calls if c[0] == "new" and "-s" in c]
+    assert lease_mod.load_record(repo, "workload") is None
+    journal = gate_journal(repo)
+    assert [e["kind"] for e in journal] == ["caller-start-refused"]
+    assert journal[0]["caller"] == "alpha" and journal[0]["seam"] == "acquire"
+    # The duty exemption: the same creation on a demand passes.
+    out = lease_mod.acquire(fake, repo, "workload", now_dt=PNOW, caller="alpha", duty=True)
     assert out["action"] == "created"
-    assert [c for c in fake.calls if c[0] == "new" and "-s" in c] == [("new", "-s", "workload", "--high-mem")]
-    assert gate_journal(repo) == []  # agent-allowed admissions are not journaled
+    assert lease_mod.load_record(repo, "workload")["caller"] == "alpha"
 
 
 def test_gate_panel_bypass_needs_via_and_env(tmp_path, monkeypatch):
@@ -535,7 +552,7 @@ def test_gate_demand_refusal_clears_and_journals(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_AUTO_ACQUIRE", "1")
     fake = FakeColab()
     # An attributed demand for a blocked shape is refused at write.
-    out = lease_mod.write_request(repo, reason="burst", profile="standard", via="xbrl-thread", now_dt=PNOW)
+    out = lease_mod.write_request(repo, reason="burst", profile="standard", caller="alpha", now_dt=PNOW)
     assert out["action"] == "shape-refused"
     assert lease_mod.load_request(repo) is None
     # An unattributed demand defers to consumption, which refuses,
@@ -620,3 +637,162 @@ def test_gate_post_start_shape_mismatch_stops_and_refuses(tmp_path):
     out = run_lease(env, "acquire", "workload")
     assert out["action"] == "created"
     assert (Path(env["COLAB_RUNNER_VAR"]) / "lease-workload.json").exists()
+
+
+# --- Caller attribution seams (plan: .plans/2026-11-04-caller-attribution.md) --
+# The core stamps the caller it is given (the wrapper seams own
+# validation); these tests pin the stamping, the demand carry, the
+# extend fill, and the CLI's claim-time refusal.
+
+
+def test_caller_stamps_created_record_and_adopt_fills(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    out = lease_mod.acquire(fake, repo, "standard", now_dt=PNOW, caller="alpha")
+    assert out["action"] == "created"
+    assert lease_mod.load_record(repo, "standard")["caller"] == "alpha"
+    # Adopt keeps the creator's caller even when another calls.
+    out = lease_mod.acquire(fake, repo, "standard", now_dt=PNOW, caller="beta")
+    assert out["action"] == "adopted"
+    assert lease_mod.load_record(repo, "standard")["caller"] == "alpha"
+    # A pre-attribution record gains the adopting call's caller.
+    out = lease_mod.acquire(fake, repo, "workload", now_dt=PNOW)
+    assert out["action"] == "created"
+    assert "caller" not in lease_mod.load_record(repo, "workload")
+    out = lease_mod.acquire(fake, repo, "workload", now_dt=PNOW, caller="beta")
+    assert out["action"] == "adopted"
+    assert lease_mod.load_record(repo, "workload")["caller"] == "beta"
+
+
+def test_caller_extend_fills_only_when_absent(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    lease_mod.acquire(fake, repo, "standard", now_dt=PNOW)
+    out = lease_mod.extend(fake, repo, "standard", 1, now_dt=PNOW, caller="alpha")
+    assert out["action"] == "extended" and out["caller"] == "alpha"
+    assert lease_mod.load_record(repo, "standard")["caller"] == "alpha"
+    out = lease_mod.extend(fake, repo, "standard", 1, now_dt=PNOW, caller="beta")
+    assert lease_mod.load_record(repo, "standard")["caller"] == "alpha"
+
+
+def test_caller_demand_consumed_stamps_the_record(tmp_path, monkeypatch):
+    repo = gate_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("COLAB_RUNNER_AUTO_ACQUIRE", "1")
+    fake = FakeColab()
+    # A High-RAM demand from a registered caller is askable (the
+    # write-time check is shape-only) and the duty creates it,
+    # stamping the demand's caller on the record and the result.
+    out = lease_mod.write_request(repo, reason="burst", profile="workload", caller="alpha", now_dt=PNOW)
+    assert out["action"] == "requested"
+    assert lease_mod.load_request(repo)["caller"] == "alpha"
+    out = lease_mod.auto_acquire(fake, repo, now_dt=PNOW)
+    assert out["action"] == "auto-acquired" and out["caller"] == "alpha"
+    assert lease_mod.load_record(repo, "workload")["caller"] == "alpha"
+
+
+def test_caller_cli_claim_refusal_and_stamp(tmp_path):
+    """Against the live config: an unregistered --caller is refused
+    at claim time (exit 2, nothing created); a machinery caller
+    claims cleanly and is stamped on the record."""
+    env = lease_env(tmp_path)
+
+    def run(*args):
+        return subprocess.run([sys.executable, str(REPO / "bin" / "colab-lease"), *args], capture_output=True, text=True, env=env, timeout=300)
+
+    r = run("acquire", "standard", "--caller", "no-such-thread")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "no-such-thread" in r.stderr
+    assert not (Path(env["COLAB_RUNNER_VAR"]) / "lease-standard.json").exists()
+    out = run_lease(env, "acquire", "standard", "--caller", "test")
+    assert out["action"] == "created"
+    assert record(env)["caller"] == "test"
+
+
+def test_access_list_attributes_each_class(tmp_path, monkeypatch):
+    """Step 5: the access list serves every live session with its
+    attribution — record-backed from the record, claim-only from
+    the claims journal, the rest unattributed with the detection
+    stamp's first_seen."""
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab(alive={"ghost", "stray"})
+    lease_mod.acquire(fake, repo, "standard", now_dt=PNOW, caller="alpha")
+    lease_mod.append_caller_claim(repo, "ghost", "beta", "colab-sh")
+    lease_mod.save_unattributed(repo, {"stray": {"first_seen": "2026-11-05T01:02:03+00:00", "endpoint": None, "shape_class": "standard"}})
+    access = lease_mod.access_list(fake, repo)
+    by_session = {e["session"]: e for e in access}
+    assert set(by_session) == {"standard", "ghost", "stray"}
+    assert by_session["standard"]["caller"] == "alpha"
+    assert by_session["standard"]["first_seen"] == lease_mod.load_record(repo, "standard")["acquired_at"]
+    assert "unattributed" not in by_session["standard"]
+    assert by_session["ghost"]["caller"] == "beta" and by_session["ghost"]["first_seen"]
+    assert by_session["stray"]["caller"] is None and by_session["stray"]["unattributed"] is True
+    assert by_session["stray"]["first_seen"] == "2026-11-05T01:02:03+00:00"
+    assert by_session["stray"]["shape_class"] == "standard"
+
+
+def test_access_list_unreadable_listing_serves_empty(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("list failed")
+
+    assert lease_mod.live_sessions(boom, repo) is None
+    assert lease_mod.access_list(boom, repo) == []
+
+
+def test_release_session_stops_strays_and_refuses_records(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab(alive={"stray"})
+    lease_mod.acquire(fake, repo, "standard", now_dt=PNOW)
+    lease_mod.save_unattributed(repo, {"stray": {"first_seen": PNOW.isoformat(), "endpoint": None, "shape_class": None}})
+    monkeypatch.setattr(lease_mod, "stop_session_safe", lambda colab, session: "stopped")
+    out = lease_mod.release_session(fake, repo, "stray")
+    assert out["action"] == "session-released" and out["stop"] == "stopped"
+    assert lease_mod.load_unattributed(repo) == {}
+    out = lease_mod.release_session(fake, repo, "standard")
+    assert out["action"] == "session-has-record"
+
+
+def _spool_kinds(repo, kind):
+    p = Path(repo) / "var" / "reaper-events.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(line) for line in p.read_text().splitlines() if line.strip() and json.loads(line).get("kind") == kind]
+
+
+def test_reap_detects_unattributed_once_and_clears_on_claim(tmp_path, monkeypatch):
+    """Step 6: a live session with no record and no claim is
+    stamped and spooled exactly once; a later claim clears it with
+    its own event. Record-backed and claimed sessions never flag."""
+    repo = parallel_repo(tmp_path, monkeypatch)
+    fake = FakeColab(alive={"stray", "ghost"})
+    lease_mod.acquire(fake, repo, "standard", now_dt=PNOW)
+    lease_mod.append_caller_claim(repo, "ghost", "beta", "colab-sh")
+    out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    assert out["unattributed"] == {"detected": ["stray"], "cleared": []}
+    stamps = lease_mod.load_unattributed(repo)
+    assert stamps["stray"]["first_seen"] == PNOW.isoformat()
+    events = _spool_kinds(repo, "unattributed-session")
+    assert len(events) == 1 and events[0]["session"] == "stray"
+    # A second pass re-spools nothing and keeps the first_seen.
+    out = lease_mod.reap(fake, repo, now_dt=PNOW + timedelta(minutes=5))
+    assert out["unattributed"] == {"detected": [], "cleared": []}
+    assert len(_spool_kinds(repo, "unattributed-session")) == 1
+    assert lease_mod.load_unattributed(repo)["stray"]["first_seen"] == PNOW.isoformat()
+    # The stray gains a claim: the next pass clears the stamp.
+    lease_mod.append_caller_claim(repo, "stray", "alpha", "colab-sh")
+    out = lease_mod.reap(fake, repo, now_dt=PNOW + timedelta(minutes=10))
+    assert out["unattributed"] == {"detected": [], "cleared": ["stray"]}
+    assert lease_mod.load_unattributed(repo) == {}
+    cleared = _spool_kinds(repo, "unattributed-cleared")
+    assert len(cleared) == 1 and cleared[0]["session"] == "stray"
+
+
+def test_detect_unattributed_never_acts_on_an_unreadable_list(tmp_path, monkeypatch):
+    repo = parallel_repo(tmp_path, monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("list failed")
+
+    assert lease_mod.detect_unattributed(boom, repo, PNOW) == {"detected": [], "cleared": []}
+    assert lease_mod.load_unattributed(repo) == {}
