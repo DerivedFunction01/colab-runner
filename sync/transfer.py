@@ -69,7 +69,11 @@ def sha256_bytes(b: bytes) -> str:
 
 
 def _exec_file(session: str, code: str, timeout: int = 600) -> subprocess.CompletedProcess:
-    f = REPO / "var" / "transfer-exec.py"
+    # Unique staging name per call: a fixed name made concurrent
+    # transfers clobber each other's scripts (and made the fake
+    # CLI serve the first script staged under that name for every
+    # later call — the 2026-11-05 chunked-upload proof failure).
+    f = REPO / "var" / f"transfer-exec-{os.getpid()}-{time.time_ns()}.py"
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(code)
     return colab("exec", "-s", session, "--timeout", str(timeout), "-f", str(f), timeout=timeout + 120)
@@ -102,13 +106,20 @@ def _remote_part_hashes(session: str, names: list) -> dict:
     and the end-to-end hash still gates the result.
     """
     names_json = json.dumps(names)
+    # The generated scripts address session files through BASE:
+    # /content on a real VM (where the exec's cwd is /content),
+    # the working dir under the fake CLI (whose session root is
+    # the cwd) — the same dual-world seam the runner and shell_job
+    # use. The upload/download commands keep their /content-
+    # absolute remote paths; that is the CLI's own contract.
     r = _exec_file(session, (
         "# transfer:part-hashes\n"
         "import hashlib, json, os\n"
+        "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
         f"NAMES = {names_json}\n"
         "out = {}\n"
         "for name in NAMES:\n"
-        "    p = '/content/' + name\n"
+        "    p = os.path.join(BASE, name)\n"
         "    if os.path.exists(p):\n"
         "        h = hashlib.sha256()\n"
         "        with open(p, 'rb') as f:\n"
@@ -157,12 +168,13 @@ def chunked_upload(session: str, local: Path, remote_name: str) -> dict:
     names = json.dumps([m["name"] for m in metas])
     r = _exec_file(session, (
         "# transfer:reassemble\n"
-        "import hashlib, json\n"
+        "import hashlib, json, os\n"
+        "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
         f"parts = {names}\n"
-        f"out = open('/content/{remote_name}', 'wb')\n"
+        f"out = open(os.path.join(BASE, '{remote_name}'), 'wb')\n"
         "h = hashlib.sha256()\n"
         "for name in parts:\n"
-        "    with open('/content/' + name, 'rb') as f:\n"
+        "    with open(os.path.join(BASE, name), 'rb') as f:\n"
         "        while c := f.read(1024*1024):\n"
         "            out.write(c); h.update(c)\n"
         "out.close()\n"
@@ -189,8 +201,9 @@ def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
     r = _exec_file(session, (
         "# transfer:split\n"
         "import hashlib, json, os\n"
+        "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
         f"REMOTE = {json.dumps(remote_name)}\n"
-        "path = '/content/' + REMOTE\n"
+        "path = os.path.join(BASE, REMOTE)\n"
         "size = os.path.getsize(path)\n"
         "CH = 32 * 1024 * 1024\n"
         "whole = hashlib.sha256()\n"
@@ -199,7 +212,7 @@ def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
         "    i = 0\n"
         "    while c := f.read(CH):\n"
         "        name = REMOTE + '.dl-' + format(i, '03d')\n"
-        "        open('/content/' + name, 'wb').write(c)\n"
+        "        open(os.path.join(BASE, name), 'wb').write(c)\n"
         "        whole.update(c)\n"
         "        parts.append({'name': name, 'size': len(c), 'sha256': hashlib.sha256(c).hexdigest()})\n"
         "        i += 1\n"

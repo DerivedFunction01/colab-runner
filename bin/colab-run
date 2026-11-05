@@ -2,7 +2,7 @@
 """Run a named job on Colab: sweep orphans, sync in, execute detached, poll,
 pull results, stop the session on every exit path.
 
-Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [-- <job args>...]
+Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [-- <job args>...]
 Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
 --caller TAG (or the manifest's "caller" key, or $COLAB_CALLER)
 attributes the run to its thread: it rides the lease acquire and
@@ -33,6 +33,14 @@ import importlib.util
 _spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
 lease = importlib.util.module_from_spec(_spec_l)
 _spec_l.loader.exec_module(lease)
+
+_spec_r = importlib.util.spec_from_file_location("repo_registry", REPO / "sync" / "repo_registry.py")
+repo_registry = importlib.util.module_from_spec(_spec_r)
+_spec_r.loader.exec_module(repo_registry)
+
+_spec_t = importlib.util.spec_from_file_location("transfer", REPO / "sync" / "transfer.py")
+transfer = importlib.util.module_from_spec(_spec_t)
+_spec_t.loader.exec_module(transfer)
 
 
 def colab_bin() -> str:
@@ -193,6 +201,7 @@ def main() -> int:
     # as a job name; it bit a consumer following shorthand in a
     # message, 2026-11-05.)
     resume = caller_flag = None
+    seed_flag = False
     extra_args = []
     positional = []
     i = 0
@@ -203,7 +212,10 @@ def main() -> int:
             # env_build.sh without a manifest per repo).
             extra_args = args[i + 1:]
             break
-        if args[i] == "--resume" and i + 1 < len(args):
+        if args[i] == "--seed":
+            seed_flag = True
+            i += 1
+        elif args[i] == "--resume" and i + 1 < len(args):
             resume = args[i + 1]
             i += 2
         elif args[i] == "--caller" and i + 1 < len(args):
@@ -213,7 +225,7 @@ def main() -> int:
             positional.append(args[i])
             i += 1
     if not positional:
-        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [-- <job args>...]", file=sys.stderr)
+        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [-- <job args>...]", file=sys.stderr)
         return 2
     job_name = positional[0]
     manifest_path = REPO / "jobs" / job_name / "job.json"
@@ -253,6 +265,41 @@ def main() -> int:
     if caller:
         rec["caller"] = caller
     save_record(rec)
+    # Bundle seed (--seed — env-build's private-repo route): the
+    # job's target repo reaches the VM as a snapshot bundle, never
+    # as a VM-side clone. A private repo's plain HTTPS clone
+    # cannot authenticate on the VM (no credential lives there by
+    # design), so before launch the runner builds the bundle from
+    # the registry entry's local checkout (the same builder
+    # colab-check ships), uploads it, and seeds the dest from it
+    # (sync/apply_bundle_remote.py's seed mode); the job then runs
+    # with --skip-clone. Built here, before any session is held,
+    # so a local build failure holds nothing.
+    seed_ctx = None
+    if seed_flag and not resume:
+        def _extra(flag):
+            return extra_args[extra_args.index(flag) + 1] if flag in extra_args and extra_args.index(flag) + 1 < len(extra_args) else None
+        try:
+            registry = repo_registry.load_local_registry(REPO)
+            seed_repo_id, seed_entry = repo_registry.get_entry(registry, _extra("--repo"))
+            seed_dest = repo_registry.variant_dest(seed_entry, _extra("--variant"))
+        except ValueError as exc:
+            rec.update(state="failed", error=f"bundle seed: {exc}")
+            save_record(rec)
+            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+            return 1
+        bundle_env = dict(os.environ)
+        bundle_env["COLAB_REPO_SRC"] = str(Path(os.path.expanduser(seed_entry["local_path"])))
+        bundle = subprocess.run(["bash", str(REPO / "sync" / "make_snapshot_bundle.sh")], capture_output=True, text=True, env=bundle_env)
+        if bundle.returncode != 0:
+            rec.update(state="failed", error=f"bundle seed: snapshot build failed: {bundle.stderr[-300:]}")
+            save_record(rec)
+            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+            return 1
+        seed_manifest = json.loads(bundle.stdout)
+        seed_ctx = {"repo": seed_repo_id, "dest": seed_dest, "clone_url": seed_entry["clone_url"], "bundle_path": Path(seed_manifest["bundle"]), "manifest": seed_manifest}
+        rec["bundle_seed"] = {"repo": seed_repo_id, "dest": seed_dest, "sha256": seed_manifest["sha256"], "bytes": seed_manifest["bytes"], "snapshot_commit": seed_manifest["snapshot_commit"], "tree": seed_manifest["tree"]}
+        save_record(rec)
     usage_before = colab("usage", timeout=120).stdout.strip()
     # Lease model (sync/lease.py): adopt-or-acquire the shared session and
     # leave it up at the end; the reaper owns its lifecycle. With the lease
@@ -312,6 +359,35 @@ def main() -> int:
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
             colab("upload", "-s", session, str(src), f"/content/{src.name}", timeout=600)
+        seeded = False
+        if seed_ctx is not None:
+            # Move the bundle (chunked — it can exceed the
+            # single-file ceiling), its manifest, and the apply
+            # script, then seed the dest on the VM and verify the
+            # manifest's tree in the seed's own output before any
+            # launch: a seed that did not land is a failed run,
+            # never a job launched against a missing tree.
+            up = transfer.chunked_upload(session, seed_ctx["bundle_path"], seed_ctx["bundle_path"].name)
+            if not up["ok"]:
+                rec.update(state="failed", error=f"bundle seed: chunked upload failed: {json.dumps(up)[:300]}")
+                save_record(rec)
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
+            colab("upload", "-s", session, str(seed_ctx["bundle_path"]) + ".manifest.json", f"/content/{seed_ctx['bundle_path'].name}.manifest.json", timeout=300)
+            colab("upload", "-s", session, str(REPO / "sync" / "apply_bundle_remote.py"), "/content/apply_bundle_remote.py", timeout=300)
+            seed_remote = REPO / "var" / f"seed-{run_id}.py"
+            seed_remote.write_text(
+                "import subprocess\n"
+                f"r = subprocess.run(['python3','apply_bundle_remote.py','{seed_ctx['bundle_path'].name}','{seed_ctx['dest']}','--origin-url','{seed_ctx['clone_url']}'], capture_output=True, text=True)\n"
+                "print(r.stdout); print(r.stderr[-500:])\n"
+            )
+            sr = colab("exec", "-s", session, "--timeout", "1800", "-f", str(seed_remote), timeout=1900)
+            if '"applied": true' not in sr.stdout or seed_ctx["manifest"]["tree"] not in sr.stdout:
+                rec.update(state="failed", error=f"bundle seed: seed did not verify: {sr.stdout.strip()[-300:]}")
+                save_record(rec)
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
+            seeded = True
         # Relative to the session working dir (/content on a real Colab VM;
         # the fake CLI's sandbox root under test) so the same code runs both.
         # Per-run: a fixed dir leaks the previous run's heartbeat tail,
@@ -321,7 +397,7 @@ def main() -> int:
         save_record(rec)
         # Detached launch (default pending the kill-matrix verdict): a short
         # exec starts the job under nohup; the CLI is never the job's lifeline.
-        job_args = "".join(f",'{a}'" for a in list(job.get("args", [])) + extra_args)
+        job_args = "".join(f",'{a}'" for a in list(job.get("args", [])) + (["--skip-clone"] if seeded else []) + extra_args)
         launch = (
             f"import subprocess; subprocess.Popen(['nohup','python3','{script.name}',"
             f"'--out','{remote_out}'{job_args}], stdout=open('{remote_out}.log','w'), stderr=subprocess.STDOUT, start_new_session=True)"

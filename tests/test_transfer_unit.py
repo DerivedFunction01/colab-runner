@@ -75,7 +75,7 @@ class FakeColab:
             return ok({n: sha(self.remote[n]) for n in names if n in self.remote})
         if "# transfer:reassemble" in code:
             parts = json.loads(re.search(r"parts = (\[.*\])", code).group(1))
-            out_name = re.search(r"open\('/content/([^']+)', 'wb'\)", code).group(1)
+            out_name = re.search(r"open\(os\.path\.join\(BASE, '([^']+)'\), 'wb'\)", code).group(1)
             blob = b"".join(self.remote[p] for p in parts)
             self.remote[out_name] = blob
             return ok({"sha256": sha(blob)})

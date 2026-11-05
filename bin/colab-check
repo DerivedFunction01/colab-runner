@@ -141,8 +141,10 @@ def main() -> int:
         setup.parent.mkdir(parents=True, exist_ok=True)
         setup.write_text(
             "import subprocess, json\n"
-            f"subprocess.run(['bash','base_clone.sh','{repo_url}','/content/{dest}'], check=True)\n"
-            f"r = subprocess.run(['python3','apply_bundle_remote.py','{bundle_path.name}','{dest}'], capture_output=True, text=True)\n"
+            f"base = subprocess.run(['bash','base_clone.sh','{repo_url}','/content/{dest}'], capture_output=True, text=True)\n"
+            "if base.returncode != 0:\n"
+            "    print('base clone failed (a private repo cannot authenticate a plain HTTPS clone on the VM); seeding from the snapshot bundle'); print(base.stderr[-300:])\n"
+            f"r = subprocess.run(['python3','apply_bundle_remote.py','{bundle_path.name}','{dest}','--origin-url','{repo_url}'], capture_output=True, text=True)\n"
             "print(r.stdout); print(r.stderr[-500:])\n"
         )
         r = cr.colab("exec", "-s", session, "--timeout", "1800", "-f", str(setup), timeout=1900)
