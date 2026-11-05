@@ -273,6 +273,22 @@ def main() -> int:
                 return 1
         script = REPO / job["script"]
         colab("upload", "-s", session, str(script), f"/content/{script.name}", timeout=600)
+        # Manifest-declared extra uploads land at /content/<name>
+        # before launch: a shell_job payload names its script in
+        # args (--script /content/env_build.sh) and the registry it
+        # reads (/content/repos.json), and neither is the runner
+        # script itself. Until this loop existed nothing uploaded
+        # them, so env-build's shell_job refused in its first
+        # second (2026-11-05) — a declared upload missing locally
+        # fails the run here, never launches a job that cannot run.
+        for extra in job.get("uploads", []):
+            src = REPO / extra
+            if not src.is_file():
+                rec.update(state="failed", error=f"manifest upload missing locally: {extra}")
+                save_record(rec)
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
+            colab("upload", "-s", session, str(src), f"/content/{src.name}", timeout=600)
         # Relative to the session working dir (/content on a real Colab VM;
         # the fake CLI's sandbox root under test) so the same code runs both.
         # Per-run: a fixed dir leaks the previous run's heartbeat tail,
@@ -300,8 +316,11 @@ def main() -> int:
             f"d = Path('{remote_out}')\n"
             "ck = d / 'checkpoint.json'\n"
             "log = d / 'heartbeat.log'\n"
+            f"jlog = Path('{remote_out}.log')\n"
             "out = {'checkpoint': json.loads(ck.read_text()) if ck.exists() else None,\n"
             "       'heartbeat_tail': log.read_text().strip().split('\\n')[-3:] if log.exists() else [],\n"
+            f"       'job_log_tail': jlog.read_text(errors='replace').strip().split('\\n')[-5:] if jlog.exists() else [],\n"
+            f"       'job_pids': subprocess.run(['pgrep','-f','{remote_out}'], capture_output=True, text=True).stdout.split(),\n"
             "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split()}\n"
             "print(json.dumps(out))\n"
         )
@@ -321,6 +340,22 @@ def main() -> int:
             log = state.get("heartbeat_tail") or []
             if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]):
                 break
+            if not state.get("job_pids") and state.get("job_log_tail"):
+                # The launched process is gone and its launcher log
+                # is all that exists: the job died before producing
+                # a checkpoint — shell_job refusing a never-uploaded
+                # --script file is the proven case (2026-11-05: its
+                # one-line refusal sat in this log while the poller
+                # polled an empty out dir through two timeouts,
+                # ~40 min of apparent progress). A completed job
+                # always trips the completion check above in the
+                # same poll, so reaching here means death, not
+                # completion: fail with the log tail in hand.
+                tail = "\n".join(state["job_log_tail"])
+                rec.update(state="failed", error=(f"job exited before completing; remote log tail: {tail}")[-500:])
+                save_record(rec)
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
         # Pull expected outputs and verify by the job's own unit hashes.
         pulled = []
         for name in job.get("outputs", []):

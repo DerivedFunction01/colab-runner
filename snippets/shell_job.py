@@ -37,11 +37,22 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.script:
-        if not Path(args.script).is_file():
+        script_path = Path(args.script)
+        if not script_path.is_file() and script_path.is_absolute():
+            # The runner addresses session files as /content/<name>;
+            # under the fake CLI the session root is the working dir
+            # instead (the same dual-world seam as the runner's
+            # relative out dir), so fall back to the bare name there.
+            # On a real VM the cwd is /content and a genuinely
+            # missing file refuses exactly as before.
+            alt = Path(script_path.name)
+            if alt.is_file():
+                script_path = alt
+        if not script_path.is_file():
             print(f"shell_job: --script file not found: {args.script} "
                   "(upload it to the VM first, e.g. /content/env_build.sh)", file=sys.stderr)
             return 2
-        script = Path(args.script).read_text()
+        script = script_path.read_text()
     else:
         if sys.stdin.isatty():
             print("shell_job: no --script and stdin is a TTY (pipe a heredoc)", file=sys.stderr)
@@ -58,12 +69,19 @@ def main() -> int:
     ckpt = out / "checkpoint.json"
     ckpt.write_text(json.dumps({"completed_units": 0, "state": "running"}))
 
+    cwd = Path(args.cwd)
+    if not cwd.is_dir():
+        # Same dual-world seam as the script path above: under the
+        # fake CLI the session root is the working dir, not /content.
+        # On a real VM /content always exists.
+        cwd = Path.cwd()
+
     with open(out / "heartbeat.log", "a") as log:
-        log.write(f"start shell_job cwd={args.cwd} t={time.time():.1f}\n")
+        log.write(f"start shell_job cwd={cwd} t={time.time():.1f}\n")
         log.flush()
         env = dict(os.environ)
         env["SHELL_JOB_OUT"] = str(out)
-        r = subprocess.run(["bash", str(job)], cwd=args.cwd, stdout=log, stderr=subprocess.STDOUT, env=env)
+        r = subprocess.run(["bash", str(job)], cwd=cwd, stdout=log, stderr=subprocess.STDOUT, env=env)
         log.write(f"complete exit_code={r.returncode} t={time.time():.1f}\n")
         log.flush()
     ckpt.write_text(json.dumps({"completed_units": 1, "exit_code": r.returncode}))
