@@ -34,7 +34,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--script", help="shell script file (default: read stdin)")
     ap.add_argument("--cwd", default="/content", help="working directory for the script")
-    args = ap.parse_args()
+    args, payload_args = ap.parse_known_args()
 
     if args.script:
         script_path = Path(args.script)
@@ -86,7 +86,7 @@ def main() -> int:
         log.flush()
         env = dict(os.environ)
         env["SHELL_JOB_OUT"] = str(out)
-        r = subprocess.run(["bash", str(job)], cwd=cwd, stdout=log, stderr=subprocess.STDOUT, env=env)
+        r = subprocess.run(["bash", str(job), *payload_args], cwd=cwd, stdout=log, stderr=subprocess.STDOUT, env=env)
         log.write(f"complete exit_code={r.returncode} t={time.time():.1f}\n")
         log.flush()
     ckpt.write_text(json.dumps({"completed_units": 1, "exit_code": r.returncode}))

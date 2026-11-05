@@ -2,7 +2,7 @@
 """Run a named job on Colab: sweep orphans, sync in, execute detached, poll,
 pull results, stop the session on every exit path.
 
-Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG]
+Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [-- <job args>...]
 Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
 --caller TAG (or the manifest's "caller" key, or $COLAB_CALLER)
 attributes the run to its thread: it rides the lease acquire and
@@ -193,9 +193,16 @@ def main() -> int:
     # as a job name; it bit a consumer following shorthand in a
     # message, 2026-11-05.)
     resume = caller_flag = None
+    extra_args = []
     positional = []
     i = 0
     while i < len(args):
+        if args[i] == "--":
+            # Everything after -- is the job's own argv (the repo
+            # selection seam: env-build -- --repo <id> reaches
+            # env_build.sh without a manifest per repo).
+            extra_args = args[i + 1:]
+            break
         if args[i] == "--resume" and i + 1 < len(args):
             resume = args[i + 1]
             i += 2
@@ -206,7 +213,7 @@ def main() -> int:
             positional.append(args[i])
             i += 1
     if not positional:
-        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG]", file=sys.stderr)
+        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [-- <job args>...]", file=sys.stderr)
         return 2
     job_name = positional[0]
     manifest_path = REPO / "jobs" / job_name / "job.json"
@@ -310,11 +317,11 @@ def main() -> int:
         # Per-run: a fixed dir leaks the previous run's heartbeat tail,
         # checkpoint, and outputs into this run's completion check.
         remote_out = f"{job_name}-out-{run_id}"
-        rec.update(state="running", remote_out=remote_out)
+        rec.update(state="running", remote_out=remote_out, extra_args=extra_args)
         save_record(rec)
         # Detached launch (default pending the kill-matrix verdict): a short
         # exec starts the job under nohup; the CLI is never the job's lifeline.
-        job_args = "".join(f",'{a}'" for a in job.get("args", []))
+        job_args = "".join(f",'{a}'" for a in list(job.get("args", [])) + extra_args)
         launch = (
             f"import subprocess; subprocess.Popen(['nohup','python3','{script.name}',"
             f"'--out','{remote_out}'{job_args}], stdout=open('{remote_out}.log','w'), stderr=subprocess.STDOUT, start_new_session=True)"
@@ -380,6 +387,22 @@ def main() -> int:
             colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
             if dest.exists():
                 pulled.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()})
+        exit_code = (state.get("checkpoint") or {}).get("exit_code")
+        if exit_code not in (None, 0):
+            # The payload ran and stamped its own failure in the
+            # checkpoint (shell_job carries the script's exit code):
+            # the outputs above are pulled regardless — reports and
+            # verdicts land locally either way — but the run record
+            # tells the truth about the outcome. (2026-11-05: an
+            # workload env-build whose init_venv.py failed recorded
+            # "complete" with a clean-looking pull; only a human
+            # reading the pulled report saw assertions_passed:
+            # false.) Jobs whose checkpoints carry no exit_code are
+            # unaffected.
+            rec.update(state="failed", finished_at=now(), error=f"job payload exited {exit_code}", pulled=pulled, usage_before=usage_before, usage_after=colab("usage", timeout=120).stdout.strip())
+            save_record(rec)
+            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"], "pulled": pulled}, indent=2))
+            return 1
         rec.update(state="complete", finished_at=now(), pulled=pulled, usage_before=usage_before, usage_after=colab("usage", timeout=120).stdout.strip())
         save_record(rec)
         print(json.dumps({"run_id": run_id, "state": "complete", "pulled": pulled}, indent=2))
