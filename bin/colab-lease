@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """Thin CLI over sync/lease.py — the shared-session lease.
 
-Usage: colab-lease status|acquire [profile] [--hours H] [--via TAG] [--caller TAG]|extend [profile] --hours H [--caller TAG]|release [profile]|release-session SESSION|reap|keepalive|auto|request [profile] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst PROFILE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|parallel PROFILE --on|--off|admission [profile] [--via TAG] [--caller TAG]
+Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG]|extend SESSION --hours H [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
-orphan reconciliation across all profile records); `auto` is the
+orphan reconciliation across all lease records); `auto` is the
 hook's auto-acquire duty (inert unless enabled in config/lease.json);
 `request` records a lease demand that `auto` consumes; `--at ISO-TIME`
 makes it a timed start the duty fires when due — data, not an agent
 job. `grant` opens
-a two-tier window whose lobby the `standing` duty keeps up; `extend`
+a two-tier window whose standing lease the `standing` duty keeps up; `extend`
 moves a lease's deadline later (delta-priced, flags the lease as a
 renewable window) and `extend-grant` moves the grant's end the same
 way; `state` is the UI's single read (records + grant + specs +
 budget). `budget-caps` updates the budget caps in config/lease.json
 (the panel's editor rides it); each value is a non-negative number
 or `none` for no cap, and an omitted flag leaves its cap untouched.
-`parallel` sets a base profile's parallel-instance toggle in
-config/lease.json (the panel's per-profile switch rides it); exactly
-one of --on/--off is required. `admission` is the session shape
-gate's verdict for one profile (the session-creating wrappers that
+`admission` is the session shape
+gate's verdict for one shape (the session-creating wrappers that
 bypass the lease core consult it): prints admitted, or the
-shape-refused verdict with exit 1.
+shape-refused verdict with exit 1. `plan` mints a generated session
+name plus the CLI args for one shape without creating anything
+(the session-creating wrappers ride it, so name generation and
+shape flags live in exactly one place).
 """
 
 import importlib.util
@@ -98,21 +99,21 @@ def resolve_cli_caller(flag: str | None) -> tuple[str | None, str | None]:
     return lease.resolve_caller(REPO, flag=flag, env=env), None
 
 
-def configured_default_profile() -> str | None:
-    """The default profile id from config/profiles.json — the only
-    source executable code may resolve it from. None when the config
-    or the key is absent; callers fail loudly rather than
-    substituting a workload name."""
-    try:
-        name = json.loads((REPO / "config" / "profiles.json").read_text()).get("default_profile")
-    except (OSError, json.JSONDecodeError):
-        return None
-    return name or None
+def shape_arg(rest: list[str]) -> tuple[str | None, list[str], str | None]:
+    """The shape a verb acts on: the --shape flag, else the first
+    positional. Returns (shape, remaining, error)."""
+    shape, rest, err = parse_flag(rest, "--shape")
+    if err:
+        return None, rest, err
+    positional = [t for t in rest if not t.startswith("--")]
+    if shape is None and positional:
+        shape = positional[0]
+    return shape, rest, None
 
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args or args[0] not in ("status", "acquire", "extend", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "parallel", "admission"):
+    if not args or args[0] not in ("status", "acquire", "extend", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "admission", "plan"):
         print(__doc__.strip().split("\n")[2], file=sys.stderr)
         return 2
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
@@ -121,7 +122,8 @@ def main() -> int:
     cr.mirror("restore")
     cmd = args[0]
     if cmd == "status":
-        result = lease.status(cr.colab, REPO)
+        session = args[1] if len(args) > 1 else None
+        result = lease.status(cr.colab, REPO, session)
     elif cmd == "acquire":
         hours, rest, err = parse_hours(args[1:])
         via = None
@@ -133,15 +135,15 @@ def main() -> int:
         caller = None
         if err is None:
             caller, err = resolve_cli_caller(caller_flag)
+        shape = None
+        if err is None:
+            shape, rest, err = shape_arg(rest)
+        if err is None and shape is None:
+            err = "acquire requires --shape ID"
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
-        positional = [t for t in rest if not t.startswith("--")]
-        profile = positional[0] if positional else configured_default_profile()
-        if profile is None:
-            print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
-            return 2
-        result = lease.acquire(cr.colab, REPO, profile, hours=hours, via=via, caller=caller)
+        result = lease.acquire(cr.colab, REPO, shape, hours=hours, via=via, caller=caller)
         if result.get("host_changed") and result.get("record"):
             # Initiation-time approval, Step 2: this entry point just
             # birthed (or adopted) a session on a new tunnel host —
@@ -158,18 +160,16 @@ def main() -> int:
             caller, err = resolve_cli_caller(caller_flag)
         if err is None and hours is None:
             err = "extend requires --hours H (H > 0)"
+        positional = [t for t in rest if not t.startswith("--")]
+        if err is None and not positional:
+            err = "extend requires a session name"
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
-        positional = [t for t in rest if not t.startswith("--")]
-        profile = positional[0] if positional else configured_default_profile()
-        if profile is None:
-            print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
-            return 2
-        result = lease.extend(cr.colab, REPO, profile, hours, caller=caller)
+        result = lease.extend(cr.colab, REPO, positional[0], hours, caller=caller)
     elif cmd == "release":
-        profile = args[1] if len(args) > 1 else None
-        result = lease.release(cr.colab, REPO, profile=profile)
+        session = args[1] if len(args) > 1 else None
+        result = lease.release(cr.colab, REPO, session=session)
     elif cmd == "grant":
         hours, rest, err = parse_hours(args[1:])
         burst = None
@@ -182,12 +182,12 @@ def main() -> int:
                 i += 1
         if err is None and hours is None:
             err = "grant requires --hours H (H > 0)"
-        if err is None and burst is not None and burst not in lease.catalog_profiles(REPO, cr.colab):
-            err = f"unknown burst profile {burst!r}"
+        if err is None and burst is not None and burst not in lease.catalog_shapes(REPO, cr.colab):
+            err = f"unknown burst shape {burst!r}"
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
-        result = lease.write_grant(REPO, hours, burst_profile=burst)
+        result = lease.write_grant(REPO, hours, burst_shape=burst)
     elif cmd == "extend-grant":
         hours, rest, err = parse_hours(args[1:])
         if err is None and hours is None:
@@ -243,14 +243,6 @@ def main() -> int:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
         result = lease.set_budget_caps(REPO, **updates)
-    elif cmd == "parallel":
-        rest = args[1:]
-        positional = [t for t in rest if not t.startswith("--")]
-        flags = [t for t in rest if t.startswith("--")]
-        if len(positional) != 1 or len(flags) != 1 or flags[0] not in ("--on", "--off"):
-            print("colab-lease: parallel needs exactly one profile and one of --on/--off", file=sys.stderr)
-            return 2
-        result = lease.set_parallel(REPO, positional[0], flags[0] == "--on")
     elif cmd == "admission":
         via, rest, err = parse_flag(args[1:], "--via")
         caller_flag = None
@@ -259,19 +251,31 @@ def main() -> int:
         caller = None
         if err is None:
             caller, err = resolve_cli_caller(caller_flag)
+        shape = None
+        if err is None:
+            shape, rest, err = shape_arg(rest)
+        if err is None and shape is None:
+            err = "admission requires --shape ID"
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
-        positional = [t for t in rest if not t.startswith("--")]
-        profile = positional[0] if positional else configured_default_profile()
-        if profile is None:
-            print("colab-lease: no profile given and config/profiles.json has no default_profile", file=sys.stderr)
-            return 2
-        if profile not in lease.catalog_profiles(REPO):
-            result = {"action": "unknown-profile", "profile": profile}
+        if shape not in lease.catalog_shapes(REPO):
+            result = {"action": "unknown-shape", "shape": shape}
         else:
-            refusal = lease.enforce_session_admission(REPO, profile, via=via, seam="wrapper", caller=caller)
-            result = refusal if refusal is not None else {"action": "admitted", "profile": profile, "caller": caller}
+            refusal = lease.enforce_session_admission(REPO, shape, via=via, seam="wrapper", caller=caller)
+            result = refusal if refusal is not None else {"action": "admitted", "shape": shape, "caller": caller}
+    elif cmd == "plan":
+        shape, rest, err = shape_arg(args[1:])
+        if err is None and shape is None:
+            err = "plan requires --shape ID"
+        if err is None and shape not in lease.catalog_shapes(REPO, cr.colab):
+            err = f"unknown shape {shape!r}"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        entry = lease.catalog_shapes(REPO, cr.colab)[shape]
+        session = lease.generate_session_name(REPO, cr.colab)
+        result = {"action": "planned", "shape": shape, "session": session, "args": ["new", "-s", session] + lease._session_shape_args(entry)}
     elif cmd == "keepalive":
         rec = lease.load_record(REPO)
         if not rec:
@@ -286,7 +290,7 @@ def main() -> int:
     elif cmd == "auto":
         result = lease.auto_acquire(cr.colab, REPO)
     elif cmd == "request":
-        profile, reason, claim, at = None, "", None, None
+        shape, reason, claim, at = None, "", None, None
         rest = args[1:]
         while rest:
             tok, rest = rest[0], rest[1:]
@@ -296,10 +300,12 @@ def main() -> int:
                 # --via is the caller claim's legacy spelling; both
                 # feed the one governed claim.
                 claim, rest = rest[0], rest[1:]
+            elif tok == "--shape" and rest:
+                shape, rest = rest[0], rest[1:]
             elif tok == "--at" and rest:
                 at, rest = rest[0], rest[1:]
             elif not tok.startswith("--"):
-                profile = tok
+                shape = tok
         caller, err = resolve_cli_caller(claim)
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
@@ -310,7 +316,7 @@ def main() -> int:
             except ValueError:
                 print("colab-lease: --at needs an ISO timestamp", file=sys.stderr)
                 return 2
-        result = lease.write_request(REPO, reason=reason, profile=profile, caller=caller, not_before=at)
+        result = lease.write_request(REPO, reason=reason, shape=shape, caller=caller, not_before=at)
     elif cmd == "release-session":
         if len(args) < 2:
             print("colab-lease: release-session needs a session name", file=sys.stderr)
@@ -324,7 +330,7 @@ def main() -> int:
         result = lease.reap(cr.colab, REPO)
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
-    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed") else 1
+    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed") else 1
 
 
 if __name__ == "__main__":

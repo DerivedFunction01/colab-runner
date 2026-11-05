@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Thin CLI over the lobby bridge (plan: .plans/2026-11-01-lobby-bridge.md).
+"""Thin CLI over the standing bridge (plan: .plans/2026-11-01-lobby-bridge.md).
 
-Usage: colab-bridge status|children|log [--tail N]|ping [--wait S]|cmd [--target T] [--timeout S] [--wait S] <shell...>|mint <profile> [--name N] [--wait S]|stop <name> [--wait S]
+Usage: colab-bridge status|children|log [--tail N]|ping [--wait S]|cmd [--target T] [--timeout S] [--wait S] <shell...>|mint <shape> [--name N] [--wait S]|stop <name> [--wait S]
 
 The client plants a signed command file into the bridge queue in
-the standing lobby and waits (bounded) for its terminal line in the
+the standing lease and waits (bounded) for its terminal line in the
 bridge log. Exit codes: for `cmd`, the command's own rc when a
-result arrived; 2 for bridge-level failures (no lobby, plant
+result arrived; 2 for bridge-level failures (no standing lease, plant
 failed, wait timed out — the command may still land later; `log`
 and the local mirror keep it). File-only drivers skip this client
 entirely: drop a signed command into var/bridge-outbox/ and read
@@ -35,14 +35,11 @@ spec_l.loader.exec_module(lease)
 TERMINAL = ("result", "mint", "stop", "pong", "error", "duplicate")
 
 
-def lobby_session() -> tuple[str | None, str | None]:
-    grant = lease.load_grant(REPO)
-    cfg = lease.load_config(REPO)
-    profile = (grant or {}).get("lobby_profile") or cfg.get("standing", {}).get("profile", "lobby")
-    rec = lease.load_record(REPO, profile)
+def standing_session() -> tuple[str | None, str | None]:
+    rec = lease.standing_record(REPO)
     if not rec:
-        return None, profile
-    return rec["session"], profile
+        return None, lease.standing_shape(REPO)
+    return rec["session"], lease.standing_shape(REPO)
 
 
 def plant(session: str, cmd: dict) -> bool:
@@ -118,7 +115,7 @@ def main() -> int:
         print(__doc__)
         return 2
     cmd, rest = args[0], args[1:]
-    session, _profile = lobby_session()
+    session, _shape = standing_session()
 
     if cmd == "status":
         block = lease._bridge_block(cr.colab, REPO)
@@ -157,7 +154,7 @@ def main() -> int:
         return 0
 
     if session is None:
-        print(json.dumps({"bridge": "no-lobby"}))
+        print(json.dumps({"bridge": "no-standing"}))
         return 2
 
     if cmd == "children":
@@ -191,9 +188,9 @@ def main() -> int:
     if cmd == "mint":
         opts, out, err = parse_opts(rest, {"--name": "name", "--wait": "wait_s"})
         if err or not out:
-            print(f"colab-bridge: {err or 'mint needs a profile'}", file=sys.stderr)
+            print(f"colab-bridge: {err or 'mint needs a shape'}", file=sys.stderr)
             return 2
-        fields = {"profile": out[0]}
+        fields = {"shape": out[0]}
         if opts.get("name"):
             fields["name"] = opts["name"]
         line = plant_and_wait(session, lease.bridge_command("mint", **fields), opts.get("wait_s", 300.0))

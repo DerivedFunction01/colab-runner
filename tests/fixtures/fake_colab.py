@@ -53,6 +53,32 @@ def main() -> int:
     elif cmd == "new":
         root.mkdir(parents=True, exist_ok=True)
         (root / "ACTIVE").write_text("1")
+        # The real CLI records a local binding for a session it
+        # creates; the fake does the same, with an endpoint whose
+        # class names the shape it was handed (m-hm- for a
+        # --high-mem create, m-s- otherwise). FAKE_COLAB_FORCE_CLASS
+        # ("hm"/"s") overrides the class, for the post-start shape
+        # assertion's mismatch tests.
+        cls = os.environ.get("FAKE_COLAB_FORCE_CLASS") or ("hm" if "--high-mem" in sys.argv else "s")
+        binding_path = Path.home() / ".config" / "colab-cli" / "sessions.json"
+        # Belt and braces against a leaked HOME: the binding is
+        # written only into a test home, recognised by the dummy
+        # token every harness plants beside it. Under a real home
+        # the write is skipped — a fake create must never touch
+        # the real binding file (2026-11-05 pollution incident).
+        try:
+            token_text = (binding_path.parent / "token.json").read_text()
+        except OSError:
+            token_text = ""
+        if "fake" in token_text:
+            try:
+                binding = json.loads(binding_path.read_text()) if binding_path.exists() else {}
+            except (OSError, json.JSONDecodeError):
+                binding = {}
+            if isinstance(binding, dict):
+                binding[name] = {"endpoint": f"https://m-{cls}-fake.prod.r.colab.dev"}
+                binding_path.parent.mkdir(parents=True, exist_ok=True)
+                binding_path.write_text(json.dumps(binding))
         print(f"session {name} created (fake)")
     elif cmd == "stop":
         (root / "ACTIVE").unlink(missing_ok=True)

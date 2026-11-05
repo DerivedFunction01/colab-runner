@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
-"""The Colab lease: one shared session per profile, treated as a VM.
+"""The Colab lease: a session held by a caller at a shape, treated as a VM.
 
-All session-lifecycle logic for the lease model lives here (plan:
-.plans/2026-10-29-colab-lease-model.md). The module is written against an
-injected `colab` callable with bin/colab-run's signature —
-`colab(*args, timeout=...) -> CompletedProcess` — so the fake CLI tests it
-with no network. bin/colab-lease is the thin CLI; bin/colab-run and
-bin/colab-check call acquire/finish_job; the reaper hook calls reap and,
-when enabled in config, auto_acquire.
+All session-lifecycle logic for the lease model lives here (plans:
+.plans/2026-10-29-colab-lease-model.md for the model,
+.plans/2026-11-05-profile-retirement.md for the current shape of it).
+The module is written against an injected `colab` callable with
+bin/colab-run's signature — `colab(*args, timeout=...) ->
+CompletedProcess` — so the fake CLI tests it with no network.
+bin/colab-lease is the thin CLI; bin/colab-run and bin/colab-check
+call acquire/finish_job; the reaper hook calls reap and, when
+enabled in config, auto_acquire.
 
-State: one record per profile, var/lease-<profile>.json (override the
-var dir with $COLAB_RUNNER_VAR, used by tests), with a read fallback to
-the legacy var/lease.json for a profile whose record still lives there
-— a save migrates that profile's record to its per-profile path. A
-two-tier grant lives in var/grant.json. The budget guard's spend is
-attributed: completed session segments are journaled to
-var/lease-spend-journal.jsonl and live records contribute their
-running segment, so spend counts only this repo's own leases.
-Config:
-config/lease.json + profiles from config/profiles.json. Nothing here
-prints file contents from the transient registry; the sessions binding
-is read for its endpoint on the release fallback path, and for its
-tunnel host when a session is born (acquire / renewal swap / adoption).
+A lease is {session, caller, shape, window}: the session's name is
+generated at creation (sync/naming.py) and never reused, the caller
+is the governed attribution claim, and the shape is a catalog shape
+descriptor from the CLI-parsed catalog. State: one record per
+lease, var/lease-<session>.json (override the var dir with
+$COLAB_RUNNER_VAR, used by tests). Records written before the
+profile retirement (keyed per profile, carrying a profile id) are
+translated on read — shape and rate derived from the legacy catalog
+entry the profile named — and a save migrates the record to its
+session path, so no session is ever stopped or recreated by the
+migration. A two-tier grant lives in var/grant.json. The budget
+guard's spend is attributed: completed session segments are
+journaled to var/lease-spend-journal.jsonl and live records
+contribute their running segment, so spend counts only this repo's
+own leases. Config: config/lease.json. Nothing here prints file
+contents from the transient registry; the sessions binding is read
+for its endpoint on the release fallback path, and for its tunnel
+host when a session is born (acquire / renewal swap / adoption).
 """
 
+import importlib.util as _ilu
 import json
 import math
 import os
@@ -35,6 +43,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+
+_naming_spec = _ilu.spec_from_file_location("colab_naming", Path(__file__).resolve().parent / "naming.py")
+naming = _ilu.module_from_spec(_naming_spec)
+_naming_spec.loader.exec_module(naming)
 
 
 def var_dir(repo: Path) -> Path:
@@ -52,35 +64,61 @@ def load_config(repo: Path) -> dict:
     return load_json(repo / "config" / "lease.json", {"enabled": False})
 
 
-def load_profiles(repo: Path) -> dict:
+def _legacy_profiles(repo: Path) -> dict:
+    """The pre-retirement named profiles from config/profiles.json
+    — a LEGACY read, kept only so records and grants written under
+    the profile model can be translated (their shape and rate
+    derived from the entry the profile named) and so a legacy
+    profile's measured rate can seed its shape's rate while the
+    file still exists. New code never resolves work through this;
+    the file is deleted at the retirement's landing, after which
+    this returns {} and translation has nothing left to translate."""
     return load_json(repo / "config" / "profiles.json", {"profiles": {}}).get("profiles", {})
 
 
-def catalog_profiles(repo: Path, colab=None) -> dict:
-    """The full spec catalog: the configured profiles merged with the
-    dynamic CLI shapes they do not cover (see _cli_shapes), plus the
-    derived parallel-instance profiles whose toggles are on (see the
-    parallel-instances section below). Callers without a colab
-    callable get the configured profiles plus whatever the cache
-    holds."""
-    configured = load_profiles(repo)
-    shapes, _err = _cli_shapes(repo, colab)
-    merged = {**configured, **_dynamic_profiles(shapes, configured)} if shapes else dict(configured)
-    return _with_parallel_instances(repo, merged)
+def _legacy_profile_entry(repo: Path, profile_id: str | None) -> dict | None:
+    """One legacy profile's catalog entry, from data alone: the
+    configured entry when the id names one, else the derived
+    parallel instance's entry — an instance was its base's entry
+    under the base id + "2" (the derivation rule, applied to the
+    data), so the instance's shape and rate are its base's. None
+    when the id names nothing the legacy catalog knew."""
+    if not profile_id:
+        return None
+    configured = _legacy_profiles(repo)
+    if profile_id in configured:
+        return configured[profile_id]
+    if profile_id.endswith("2") and profile_id[:-1] in configured:
+        return configured[profile_id[:-1]]
+    return None
 
 
-# --- The dynamic spec catalog -------------------------------------------------
+def shape_id_for(gpu, tpu, high_mem) -> str:
+    """The mechanical catalog id for a shape's fields — the same
+    derivation the dynamic catalog always used (a GPU variant's
+    lowercased name, a TPU's prefixed name, "cpu" for plain CPU;
+    "-highram" appended for a high-memory variant). Translation
+    derives a legacy record's shape through this, from the legacy
+    entry's own fields — never from the profile's name."""
+    if gpu:
+        return str(gpu).lower() + ("-highram" if high_mem else "")
+    if tpu:
+        return "tpu-" + str(tpu).lower() + ("-highram" if high_mem else "")
+    return "cpu" + ("-highram" if high_mem else "")
+
+
+# --- The dynamic shape catalog ------------------------------------------------
 # The picker's option set is NOT hand-listed: the shapes Colab offers
 # are parsed from `colab new --help` (the supported GPU/TPU variants
 # and the high-RAM ignore list), cached in var/cli-catalog.json for a
-# day. config/profiles.json holds only the named workload profiles
-# (roles, sessions, measured rates); any CLI shape they do not cover
-# is served as a dynamic profile with an unconfirmed (null) rate.
-# A parse failure never breaks the lease: the configured profiles
-# still serve, and state() surfaces the failure as catalog_error.
+# day. A shape's rate is null (unconfirmed) until a real lease
+# measures it (see shape_rate); a help-format change surfaces as
+# `catalog_error` in state rather than a silently invented or
+# missing option set. A parse failure never breaks the lease: the
+# CPU shapes always serve, and state() surfaces the failure.
 
 CLI_CATALOG_TTL_S = 24 * 3600
-DYNAMIC_PROFILE_TIMEOUT_S = 18000  # the configured accelerator profiles' timeout
+SHAPE_TIMEOUT_S = 18000  # the configured accelerator shapes' timeout
 
 
 def parse_cli_shapes(help_text: str) -> dict | None:
@@ -136,7 +174,7 @@ def _cli_shapes(repo: Path, colab=None):
     except Exception as exc:  # noqa: BLE001
         if cached is not None:
             return cached, f"cli catalog refresh failed ({exc}); serving the cached shape list"
-        return None, f"cli catalog unavailable ({exc}); serving configured profiles only"
+        return None, f"cli catalog unavailable ({exc}); serving the CPU shapes only"
     try:
         p = _catalog_cache_path(repo)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -146,159 +184,136 @@ def _cli_shapes(repo: Path, colab=None):
     return shapes, None
 
 
-def _dynamic_profiles(shapes: dict, configured: dict) -> dict:
-    """Profiles for every CLI shape the configured catalog does not
-    already cover (same accelerator + high_mem = covered). Ids and
-    labels are mechanical; the rate is null (unconfirmed) until an
-    on-account lease measures one — never fabricated."""
-    covered = {(p.get("gpu"), p.get("tpu"), bool(p.get("high_mem"))) for p in configured.values()}
+def _shape_entries(shapes: dict | None) -> dict:
+    """Catalog entries for every CLI shape: {id: {id, label, gpu,
+    tpu, high_mem, timeout}} — identity, label, and shape fields
+    only; the rate joins in catalog_shapes (it has another home).
+    Ids and labels are mechanical. With no parsed CLI space, the
+    two CPU shapes still serve — plain CPU and High-RAM CPU exist
+    in every Colab shape space the CLI has ever printed."""
     out: dict = {}
 
-    def add(pid, label, gpu, tpu, high_mem):
-        if pid in configured or pid in out or (gpu, tpu, high_mem) in covered:
-            return
-        out[pid] = {"label": label, "gpu": gpu, "tpu": tpu, "high_mem": high_mem,
-                    "rate_cu_per_hour": None, "session": pid, "timeout": DYNAMIC_PROFILE_TIMEOUT_S}
+    def add(label, gpu, tpu, high_mem):
+        sid = shape_id_for(gpu, tpu, high_mem)
+        if sid not in out:
+            out[sid] = {"id": sid, "label": label, "gpu": gpu, "tpu": tpu, "high_mem": high_mem, "timeout": SHAPE_TIMEOUT_S}
 
-    for gpu in shapes["gpu"]:
-        for hm in (False, True):
-            if hm and gpu in shapes["no_high_mem"]:
-                continue
-            add(gpu.lower() + ("-highram" if hm else ""), gpu + (" High-RAM" if hm else ""), gpu, None, hm)
-    for tpu in shapes["tpu"]:
-        for hm in (False, True):
-            if hm and tpu in shapes["no_high_mem"]:
-                continue
-            add("tpu-" + tpu.lower() + ("-highram" if hm else ""), "TPU " + tpu + (" High-RAM" if hm else ""), None, tpu, hm)
+    if shapes:
+        for gpu in shapes["gpu"]:
+            for hm in (False, True):
+                if hm and gpu in shapes["no_high_mem"]:
+                    continue
+                add(gpu + (" High-RAM" if hm else ""), gpu, None, hm)
+        for tpu in shapes["tpu"]:
+            for hm in (False, True):
+                if hm and tpu in shapes["no_high_mem"]:
+                    continue
+                add("TPU " + tpu + (" High-RAM" if hm else ""), None, tpu, hm)
     for hm in (False, True):
-        add("cpu" + ("-highram" if hm else ""), "CPU" + (" High-RAM" if hm else ""), None, None, hm)
+        add("CPU" + (" High-RAM" if hm else ""), None, None, hm)
     return out
 
 
-def default_profile(repo: Path) -> str:
-    """The default profile id, resolved only from
-    config/profiles.json's `default_profile` — executable code
-    carries no workload-name fallback. A config without the key is
-    a configuration error and fails loudly here rather than
-    silently naming a workload."""
-    name = load_json(repo / "config" / "profiles.json", {}).get("default_profile")
-    if not name:
-        raise ValueError("config/profiles.json has no default_profile")
-    return name
+# --- Per-shape measured rates ---------------------------------------------------
+# A shape's rate lives in the measured-rate table
+# (var/shape-rates.json: {shape_id: CU/hour}) — runtime state, the
+# catalog cache's home. A shape absent from the table falls back,
+# while the legacy config still exists, to a legacy profile's
+# measured rate for the same shape, and a CPU shape falls back to
+# config/lease.json's per-tier rate map (the map the budget guard
+# always carried). Anything else is null: unconfirmed, and no cost
+# projection is fabricated for it.
 
 
-# --- Parallel instances ---------------------------------------------------------
-# A low-tier CPU profile may run ONE extra session next to its primary
-# (plan: .plans/2026-11-03-parallel-cpu-sessions.md). The instance is a
-# derived profile — base id + "2", base session + "2", same shape and
-# measured rate, its own per-profile record — so every profile-keyed
-# path (acquire, reap, keepalive, spend, state, panel start/stop)
-# covers it with no parallel code path. Eligibility is a backend
-# determination, served ready by specs(): CPU shapes only. GPU and
-# TPU shapes are excluded — per-account accelerator concurrency is
-# unverified and accelerator rates are unmeasured. The toggle is per
-# base profile in config/lease.json ("parallel": {profile: true}),
-# default off; toggling on registers the instance in the catalog and
-# starts nothing, and toggling off refuses while the instance lease
-# exists (the toggle never stops a session).
+def shape_rates_path(repo: Path) -> Path:
+    return var_dir(repo) / "shape-rates.json"
 
 
-def parallel_eligible(profile: dict) -> bool:
-    """CPU shapes only: no GPU, no TPU (see the section note above)."""
-    return not profile.get("gpu") and not profile.get("tpu")
+def load_shape_rates(repo: Path) -> dict:
+    raw = load_json(shape_rates_path(repo), {})
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
-def instance_profile_id(base_profile: str) -> str:
-    return base_profile + "2"
-
-
-def parallel_toggles(repo: Path) -> dict:
-    raw = load_config(repo).get("parallel")
-    return dict(raw) if isinstance(raw, dict) else {}
-
-
-def parallel_enabled(repo: Path, profile_name: str) -> bool:
-    return bool(parallel_toggles(repo).get(profile_name))
-
-
-def _with_parallel_instances(repo: Path, profiles: dict) -> dict:
-    """Add the derived instance profile for every toggled-on eligible
-    base in `profiles`. An instance never derives further (one extra
-    per profile), and a pre-existing profile under the instance id
-    wins — derivation never shadows a configured profile."""
-    toggles = parallel_toggles(repo)
-    if not toggles:
-        return profiles
-    out = dict(profiles)
-    for base_id, profile in profiles.items():
-        if profile.get("parallel_of") or not toggles.get(base_id) or not parallel_eligible(profile):
+def _legacy_shape_rate(repo: Path, shape_id: str):
+    """A legacy profile's measured rate for this shape, derived
+    from the legacy entries' own fields (see _legacy_profile_entry)
+    — the transition path that carries the workspace's measured
+    rates across the profiles config's deletion. The first legacy
+    entry whose fields derive this shape and that carries a rate
+    wins."""
+    for entry in _legacy_profiles(repo).values():
+        if not isinstance(entry, dict):
             continue
-        inst_id = instance_profile_id(base_id)
-        if inst_id in out:
-            continue
-        inst = dict(profile)
-        inst["session"] = (profile.get("session") or base_id) + "2"
-        inst["label"] = f"{profile.get('label') or base_id} (parallel)"
-        inst["parallel_of"] = base_id
-        out[inst_id] = inst
-    return out
+        if shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem"))) == shape_id:
+            rate = entry.get("rate_cu_per_hour")
+            if rate is not None:
+                return rate
+    return None
 
 
-def parallel_sibling(repo: Path, profile_name: str) -> str | None:
-    """The other half of a parallel pair: for an instance profile its
-    base, for a base profile its registered instance, else None."""
-    catalog = catalog_profiles(repo)
-    profile = catalog.get(profile_name)
-    if profile is None:
-        return None
-    if profile.get("parallel_of"):
-        return profile["parallel_of"]
-    inst_id = instance_profile_id(profile_name)
-    return inst_id if inst_id in catalog else None
+def shape_rate(repo: Path, shape_id: str):
+    """A shape's measured CU/hour rate, or None (unconfirmed):
+    the measured-rate table first, then the legacy overlay, then
+    the config tier map for the CPU shapes."""
+    table = load_shape_rates(repo)
+    if shape_id in table:
+        return table[shape_id]
+    legacy = _legacy_shape_rate(repo, shape_id)
+    if legacy is not None:
+        return legacy
+    if shape_id in ("cpu", "cpu-highram"):
+        tier = load_config(repo).get("rate_cu_per_hour")
+        if isinstance(tier, dict):
+            return tier.get("high_mem" if shape_id == "cpu-highram" else "standard")
+    return None
 
 
-def set_parallel(repo: Path, profile_name: str, enabled: bool) -> dict:
-    """Set one base profile's parallel toggle in config/lease.json —
-    the panel's per-profile switch (the budget caps' sibling seam:
-    validated here in the core, written atomically as a tmp sibling +
-    rename in the file's compact sorted style, every other key
-    preserved). Enabling registers the derived instance profile in
-    the served catalog; it starts nothing.
+def catalog_shapes(repo: Path, colab=None) -> dict:
+    """The full shape catalog: every CLI shape with its measured
+    rate joined (null = unconfirmed). Callers without a colab
+    callable get whatever the day-cache holds, plus the CPU
+    shapes, which always serve."""
+    shapes, _err = _cli_shapes(repo, colab)
+    entries = _shape_entries(shapes)
+    for sid, entry in entries.items():
+        entry["rate_cu_per_hour"] = shape_rate(repo, sid)
+    return entries
 
-    Refusals: parallel-invalid (config unreadable, or the parallel
-    section is not an object), parallel-unknown-profile (not in the
-    catalog), parallel-ineligible (an accelerator shape, or the
-    profile is itself an instance), parallel-instance-live
-    (disabling while the instance lease exists)."""
-    path = repo / "config" / "lease.json"
-    try:
-        cfg = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {"action": "parallel-invalid", "error": "config/lease.json is unreadable"}
-    if not isinstance(cfg, dict):
-        return {"action": "parallel-invalid", "error": "config/lease.json is not a JSON object"}
-    raw = cfg.get("parallel")
-    if raw is not None and not isinstance(raw, dict):
-        return {"action": "parallel-invalid", "error": "config parallel section is not an object"}
-    profile = catalog_profiles(repo).get(profile_name)
-    if profile is None:
-        return {"action": "parallel-unknown-profile", "profile": profile_name}
-    inst_id = instance_profile_id(profile_name)
-    if profile.get("parallel_of") or not parallel_eligible(profile):
-        return {"action": "parallel-ineligible", "profile": profile_name}
-    if not enabled and load_record(repo, inst_id) is not None:
-        return {"action": "parallel-instance-live", "profile": profile_name, "instance": inst_id}
-    previous = bool((raw or {}).get(profile_name))
-    toggles = dict(raw or {})
-    if enabled:
-        toggles[profile_name] = True
-    else:
-        toggles.pop(profile_name, None)
-    cfg["parallel"] = toggles
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, sort_keys=True, separators=(",", ":")))
-    os.replace(tmp, path)
-    return {"action": "parallel-updated", "profile": profile_name, "enabled": bool(enabled), "instance": inst_id, "previous": previous}
+
+def default_shape(repo: Path) -> str | None:
+    """The config's default shape id (config/lease.json's
+    `default_shape`) — the fallback a manifest or wrapper resolves
+    when it names no shape. None when the key is absent: callers
+    fail loudly rather than substituting a shape."""
+    name = load_config(repo).get("default_shape")
+    return name if isinstance(name, str) and name else None
+
+
+def standing_caller(repo: Path) -> str:
+    """The standing duty's caller: config/lease.json's
+    standing.caller, defaulting to the machinery infra actor —
+    the standing lease is identified by its caller (and its
+    record's standing flag), never by a profile name."""
+    raw = load_config(repo).get("standing", {}).get("caller")
+    return raw if isinstance(raw, str) and raw else GATE_DEFAULT_INFRA_ACTOR
+
+
+def standing_shape(repo: Path) -> str:
+    """The standing lease's shape: config/lease.json's
+    standing.shape when set; while the legacy config still names
+    the standing profile, that profile's derived shape; else the
+    plain CPU shape (the standing lease's historical tier)."""
+    cfg = load_config(repo)
+    raw = cfg.get("standing", {}).get("shape")
+    if isinstance(raw, str) and raw:
+        return raw
+    legacy_id = cfg.get("standing", {}).get("profile")
+    entry = _legacy_profile_entry(repo, legacy_id) if legacy_id else None
+    if entry is not None:
+        return shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
+    return "cpu"
 
 
 # --- Session shape gate -------------------------------------------------------
@@ -334,15 +349,15 @@ GATE_DEFAULT_BYPASS_ACTORS = (PANEL_ACTOR,)
 GATE_DEFAULT_INFRA_ACTOR = "standing"
 
 
-def shape_class(profile: dict) -> str:
+def shape_class(shape: dict) -> str:
     """A catalog entry's shape class: "gpu" / "tpu" for accelerator
     shapes (an accelerator is its own class even with high_mem),
     else "high_ram" for a high-memory CPU shape, else "standard"."""
-    if profile.get("gpu"):
+    if shape.get("gpu"):
         return "gpu"
-    if profile.get("tpu"):
+    if shape.get("tpu"):
         return "tpu"
-    return "high_ram" if profile.get("high_mem") else "standard"
+    return "high_ram" if shape.get("high_mem") else "standard"
 
 
 def session_gate_policy(repo: Path) -> dict:
@@ -387,10 +402,10 @@ def append_gate_journal(repo: Path, event: dict) -> bool:
         return False
 
 
-def check_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None, caller: str | None = None) -> dict:
-    """Admission verdict for creating a session for `profile_name`
+def check_session_admission(repo: Path, shape_id: str, via: str | None = None, shape: dict | None = None, caller: str | None = None, standing: bool = False) -> dict:
+    """Admission verdict for creating a session of `shape_id`
     (pure: no journaling, no colab calls). The verdict names the
-    profile, its shape class, the actor evidence, and the basis:
+    shape, its class, the actor evidence, and the basis:
     disabled / agent-allowed / bypass / infra / refused. The
     caller rides the verdict as attribution evidence only — it
     never changes the shape decision.
@@ -398,27 +413,27 @@ def check_session_admission(repo: Path, profile_name: str, via: str | None = Non
     Bypass: the env claim names a whitelisted bypass actor; the
     panel claim additionally requires the via tag to corroborate
     it (the panel's two halves — see the section note). Infra: the
-    standing exemption — the infra actor admitting exactly the
-    configured standing profile, nothing else."""
-    if profile is None:
-        profile = catalog_profiles(repo).get(profile_name) or {}
+    standing exemption — the infra actor admitting the standing
+    duty's own lease creation (standing=True, a marker only the
+    standing duty's acquire passes), nothing else."""
+    if shape is None:
+        shape = catalog_shapes(repo).get(shape_id) or {}
     policy = session_gate_policy(repo)
-    cls = shape_class(profile)
+    cls = shape_class(shape)
     env = os.environ.get(ACTOR_ENV_CLAIM) or None
-    verdict = {"allowed": False, "profile": profile_name, "shape_class": cls, "via": via, "env_actor": env, "bypass": False, "caller": caller}
+    verdict = {"allowed": False, "shape": shape_id, "shape_class": cls, "via": via, "env_actor": env, "bypass": False, "caller": caller}
     if not policy["enabled"]:
         return {**verdict, "allowed": True, "basis": "disabled"}
     if cls in policy["agent_classes"]:
         return {**verdict, "allowed": True, "basis": "agent-allowed"}
     if env is not None and env in policy["bypass_actors"] and (env != PANEL_ACTOR or via == PANEL_ACTOR):
         return {**verdict, "allowed": True, "basis": "bypass", "bypass": True}
-    standing_profile = load_config(repo).get("standing", {}).get("profile", "lobby")
-    if via is not None and via == policy["infra_actor"] and profile_name == standing_profile:
+    if via is not None and via == policy["infra_actor"] and standing:
         return {**verdict, "allowed": True, "basis": "infra"}
     return {**verdict, "basis": "refused", "action": "shape-refused", "actor": via or env or "agent", "agent_classes": policy["agent_classes"]}
 
 
-def enforce_session_admission(repo: Path, profile_name: str, via: str | None = None, profile: dict | None = None, seam: str = "acquire", caller: str | None = None, creation: bool = True, duty: bool = False) -> dict | None:
+def enforce_session_admission(repo: Path, shape_id: str, via: str | None = None, shape: dict | None = None, seam: str = "acquire", caller: str | None = None, creation: bool = True, duty: bool = False, standing: bool = False) -> dict | None:
     """check_session_admission plus journaling, for the creation
     seams: a refusal returns the verdict (action shape-refused) for
     the caller to surface; an admission returns None, journaling
@@ -437,20 +452,20 @@ def enforce_session_admission(repo: Path, profile_name: str, via: str | None = N
     With the gate disabled the whole admission layer is off, this
     refusal included. Non-creation consults (a demand write) pass
     creation=False and see the shape check only."""
-    verdict = check_session_admission(repo, profile_name, via=via, profile=profile, caller=caller)
+    verdict = check_session_admission(repo, shape_id, via=via, shape=shape, caller=caller, standing=standing)
     if not verdict["allowed"]:
-        append_gate_journal(repo, {"kind": "shape-refused", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller, "agent_classes": verdict.get("agent_classes")})
+        append_gate_journal(repo, {"kind": "shape-refused", "seam": seam, "shape": shape_id, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller, "agent_classes": verdict.get("agent_classes")})
         return verdict
     if verdict["basis"] in ("bypass", "infra"):
-        append_gate_journal(repo, {"kind": f"shape-{verdict['basis']}", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller})
+        append_gate_journal(repo, {"kind": f"shape-{verdict['basis']}", "seam": seam, "shape": shape_id, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller})
         return None
-    if creation and not duty and verdict["basis"] == "agent-allowed" and not _actor_privileged(repo, profile_name, via, verdict):
-        append_gate_journal(repo, {"kind": "caller-start-refused", "seam": seam, "profile": profile_name, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller})
+    if creation and not duty and verdict["basis"] == "agent-allowed" and not _actor_privileged(repo, via, verdict, standing=standing):
+        append_gate_journal(repo, {"kind": "caller-start-refused", "seam": seam, "shape": shape_id, "shape_class": verdict["shape_class"], "via": via, "env_actor": verdict["env_actor"], "caller": caller})
         return {**verdict, "allowed": False, "basis": "agent-creation-denied", "action": "caller-start-refused", "actor": via or verdict["env_actor"] or "agent"}
     return None
 
 
-def _actor_privileged(repo: Path, profile_name: str, via: str | None, verdict: dict) -> bool:
+def _actor_privileged(repo: Path, via: str | None, verdict: dict, standing: bool = False) -> bool:
     """Whether the presenting actor carries creation authority
     independent of the shape class. The shape verdict's basis
     cannot answer this: an agent-allowed shape admits on basis
@@ -459,25 +474,24 @@ def _actor_privileged(repo: Path, profile_name: str, via: str | None, verdict: d
     plain agent. The evidence rules mirror
     check_session_admission's: a whitelisted env claim (the panel
     claim additionally needing its via half), or the infra actor
-    admitting exactly the configured standing profile."""
+    admitting the standing duty's own creation."""
     policy = session_gate_policy(repo)
     env = verdict.get("env_actor")
     if env is not None and env in policy.get("bypass_actors", []) and (env != PANEL_ACTOR or via == PANEL_ACTOR):
         return True
-    standing_profile = load_config(repo).get("standing", {}).get("profile", "lobby")
-    return via is not None and via == policy.get("infra_actor") and profile_name == standing_profile
+    return via is not None and via == policy.get("infra_actor") and standing
 
 
-def renewal_admission(repo: Path, profile_name: str | None, profile: dict) -> dict:
+def renewal_admission(repo: Path, shape_id: str | None, shape: dict) -> dict:
     """Admission for a renewal re-creation: no actor bypass applies
     (a renewal is the system's continuation of an existing window,
     never a panel or probe act) and standing records never reach
     the renewal drivers, so this is the bare class check under the
     policy."""
     policy = session_gate_policy(repo)
-    cls = shape_class(profile)
+    cls = shape_class(shape)
     allowed = not policy["enabled"] or cls in policy["agent_classes"]
-    return {"allowed": allowed, "profile": profile_name, "shape_class": cls, "agent_classes": policy["agent_classes"]}
+    return {"allowed": allowed, "shape": shape_id, "shape_class": cls, "agent_classes": policy["agent_classes"]}
 
 
 # --- Caller attribution -------------------------------------------------------
@@ -602,90 +616,164 @@ def load_caller_claims(repo: Path) -> dict:
 
 
 def record_path(repo: Path) -> Path:
-    """The legacy single-lease record path. Current records live per
-    profile (profile_record_path); this file is only the migration
-    fallback."""
+    """The legacy single-lease record path. Current records live
+    per session (session_record_path); this file is only the
+    migration fallback."""
     return var_dir(repo) / "lease.json"
 
 
-def profile_record_path(repo: Path, profile: str) -> Path:
-    return var_dir(repo) / f"lease-{profile}.json"
+def session_record_path(repo: Path, session: str) -> Path:
+    return var_dir(repo) / f"lease-{session}.json"
 
 
 def _valid_record(data) -> dict | None:
     return data if isinstance(data, dict) and data.get("session") else None
 
 
-def _load_profile_record(repo: Path, profile: str) -> dict | None:
-    """One profile's record: its per-profile file first, then the legacy
-    var/lease.json when that file holds this profile's record (the
-    pre-two-tier layout — lease #8 was live on it at migration time, and
-    the first post-landing reap must still see it)."""
-    rec = _valid_record(load_json(profile_record_path(repo, profile), None))
-    if rec is not None and rec.get("profile") == profile:
+def _translate_record(repo: Path, rec: dict) -> dict:
+    """Translate a pre-retirement record in memory: a record that
+    carries a profile id but no shape gains its shape, its shape
+    descriptor, and its rate snapshot from the legacy catalog entry
+    the profile named (derived from the entry's own fields — see
+    shape_id_for), and the profile id is dropped. The caller stamp
+    is kept exactly as written (an unstamped record stays
+    unstamped). A record whose profile names nothing the legacy
+    catalog knew is returned untranslated — its shape stays absent
+    and every consumer treats it on its unknown paths, never on a
+    guessed shape. Idempotent: a translated record has a shape and
+    is never re-derived."""
+    if rec.get("shape") or not rec.get("profile"):
         return rec
-    legacy = _valid_record(load_json(record_path(repo), None))
-    if legacy is not None and legacy.get("profile") == profile:
-        return legacy
-    return None
+    entry = _legacy_profile_entry(repo, rec.get("profile"))
+    if entry is None:
+        return rec
+    rec["shape"] = shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
+    rec["shape_spec"] = {"gpu": entry.get("gpu"), "tpu": entry.get("tpu"), "high_mem": bool(entry.get("high_mem"))}
+    if "rate_cu_per_hour" not in rec:
+        rec["rate_cu_per_hour"] = entry.get("rate_cu_per_hour")
+    del rec["profile"]
+    return rec
 
 
-def all_records(repo: Path) -> list[dict]:
-    """Every lease record on disk; a per-profile file wins over the
-    legacy file for the same profile. Order: config profile order,
-    then any remaining profiles by name."""
-    by_profile: dict[str, dict] = {}
-    legacy = _valid_record(load_json(record_path(repo), None))
-    if legacy is not None and legacy.get("profile"):
-        by_profile[legacy["profile"]] = legacy
+def _record_files(repo: Path) -> list[Path]:
+    """Every file that may hold a lease record: the per-session
+    files, the retired per-profile files (same glob — the name a
+    file carries says nothing; its record's session is the key),
+    and the legacy single-record file."""
     var = var_dir(repo)
+    files = []
     if var.exists():
         for path in sorted(var.glob("lease-*.json")):
             if path.name in ("lease-spend.json", "lease-request.json"):
                 continue
-            rec = _valid_record(load_json(path, None))
-            if rec is not None and rec.get("profile"):
-                by_profile[rec["profile"]] = rec
-    order = list(load_profiles(repo).keys())
-    return [by_profile[p] for p in order if p in by_profile] + [by_profile[p] for p in sorted(by_profile) if p not in order]
+            files.append(path)
+    legacy = record_path(repo)
+    if legacy.exists():
+        files.append(legacy)
+    return files
 
 
-def load_record(repo: Path, profile: str | None = None) -> dict | None:
-    """With a profile: that profile's record (legacy fallback included).
-    Without: the historical single-record reading kept for existing
-    callers — the default profile's record when one exists, else the
-    sole record when exactly one lease is on disk, else None."""
-    if profile is not None:
-        return _load_profile_record(repo, profile)
+def all_records(repo: Path) -> list[dict]:
+    """Every lease record on disk, translated to the current model.
+    One record per session: when two files hold the same session
+    (a per-session file and its legacy predecessor, mid-migration),
+    the session-keyed file wins. Order: acquisition order."""
+    by_session: dict[str, dict] = {}
+    canonical: set[str] = set()
+    for path in _record_files(repo):
+        rec = _valid_record(load_json(path, None))
+        if rec is None:
+            continue
+        session = rec["session"]
+        if path.name == f"lease-{session}.json":
+            by_session[session] = rec
+            canonical.add(session)
+        elif session not in canonical:
+            by_session.setdefault(session, rec)
+    recs = [_translate_record(repo, rec) for rec in by_session.values()]
+    recs.sort(key=lambda r: (r.get("acquired_at") or "", r.get("session") or ""))
+    return recs
+
+
+def load_record(repo: Path, session: str | None = None) -> dict | None:
+    """With a session: that session's record. Without: the most
+    recently used record (the lease a job call most plausibly
+    belongs to), or None when no lease is on disk."""
     recs = all_records(repo)
+    if session is not None:
+        return next((r for r in recs if r.get("session") == session), None)
     if not recs:
         return None
-    default = default_profile(repo)
-    for rec in recs:
-        if rec.get("profile") == default:
-            return rec
-    return recs[0] if len(recs) == 1 else None
+    return max(recs, key=lambda r: (r.get("last_used_at") or "", r.get("acquired_at") or ""))
 
 
-def save_record(repo: Path, rec: dict | None, profile: str | None = None) -> None:
-    """Write (or, for None, delete) one profile's record at its
-    per-profile path. A save migrates: when the legacy file holds this
-    profile's record it is removed, so the fallback can never resurrect
-    a stale copy; a delete clears both locations for the same reason."""
-    profile = profile or (rec.get("profile") if rec else None) or default_profile(repo)
-    p = profile_record_path(repo, profile)
-    legacy = record_path(repo)
-    legacy_rec = _valid_record(load_json(legacy, None))
-    legacy_holds = legacy_rec is not None and legacy_rec.get("profile") == profile
-    if rec is None:
-        p.unlink(missing_ok=True)
-        if legacy_holds:
-            legacy.unlink(missing_ok=True)
-    else:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(rec, indent=2))
-        if legacy_holds:
-            legacy.unlink(missing_ok=True)
+def save_record(repo: Path, rec: dict) -> None:
+    """Write one lease's record at its session path. A save
+    migrates: any other file holding a record for the same session
+    (a per-profile predecessor, the legacy single file) is removed,
+    so a stale copy can never resurrect the lease's old shape."""
+    session = rec["session"]
+    p = session_record_path(repo, session)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rec, indent=2))
+    for other in _record_files(repo):
+        if other == p:
+            continue
+        held = _valid_record(load_json(other, None))
+        if held is not None and held.get("session") == session:
+            other.unlink(missing_ok=True)
+
+
+def delete_record(repo: Path, session: str) -> None:
+    """Remove a lease's record, wherever it lives (its session
+    file, a per-profile predecessor, or the legacy single file) —
+    for the same reason save migrates: no stale copy may resurrect
+    a released lease."""
+    for path in _record_files(repo):
+        held = _valid_record(load_json(path, None))
+        if held is not None and held.get("session") == session:
+            path.unlink(missing_ok=True)
+
+
+# --- Generated session names ----------------------------------------------------
+# A created lease's session name is generated (sync/naming.py) and
+# never reused: the taken set is every name this workspace has ever
+# bound to a lease or an attach — the live sessions, the current
+# records, the caller-claims journal, and the spend journal (which
+# names every completed lease segment). A name that once referred
+# to one lease can therefore never come to refer to another, which
+# is what makes a claims-journal attribution unambiguous for all
+# time (the caller-attribution proof's stale-claim defect was a
+# reused name; generated names close it by construction).
+
+
+def _taken_session_names(repo: Path, colab=None) -> set:
+    taken: set = set()
+    for rec in all_records(repo):
+        taken.add(rec["session"])
+    taken |= set(load_caller_claims(repo).keys())
+    try:
+        lines = spend_journal_path(repo).read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            seg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(seg, dict) and seg.get("session"):
+            taken.add(seg["session"])
+    if colab is not None:
+        live = live_sessions(colab, repo)
+        if live:
+            taken |= {e["session"] for e in live}
+    return taken
+
+
+def generate_session_name(repo: Path, colab=None) -> str:
+    """A fresh generated session name, checked against every name
+    ever taken (see the section note)."""
+    return naming.generate_name(_taken_session_names(repo, colab))
 
 
 def parse_dt(text: str) -> datetime:
@@ -729,15 +817,15 @@ def session_alive(colab, session: str) -> bool:
 # day/month spend as balance-baseline deltas, so every balance
 # movement booked as repo spend — external Colab usage, and credit
 # expirations like the ~66 CU step that day, which produced a
-# day_spent of 71.17 against a 15 CU cap and refused a 0.08 CU lobby
+# day_spent of 71.17 against a 15 CU cap and refused a 0.08 CU standing
 # start with 699 CU in the bank. The CLI's usage output carries no
 # per-source breakdown, so attribution is built from what the repo
-# itself knows: a session burns its profile's rate for exactly the
+# itself knows: a session burns its shape's rate for exactly the
 # time it is assigned, and every assignment is a lease record.
 #
 # Completed assignments are journaled as segments
-# (var/lease-spend-journal.jsonl: profile, session, start, end,
-# rate) at the seams that end them — release, renewal swap,
+# (var/lease-spend-journal.jsonl: session, shape, caller, start,
+# end, rate) at the seams that end them — release, renewal swap,
 # confirmed-dead clear. Live records contribute their running
 # segment at read time. Day/month figures split segments at the
 # period boundary. A segment journaled at a confirmed-dead clear
@@ -747,7 +835,7 @@ def session_alive(colab, session: str) -> bool:
 # journaled and are not reconstructed: counters are exact from the
 # first full UTC day after landing. An assignment with no record
 # (an orphan) burns uncounted — the orphan sweep is its cure, as
-# before. A profile with an unconfirmed (null) rate contributes
+# before. A shape with an unconfirmed (null) rate contributes
 # nothing: no number is fabricated for it.
 
 
@@ -755,27 +843,22 @@ def spend_journal_path(repo: Path) -> Path:
     return var_dir(repo) / "lease-spend-journal.jsonl"
 
 
-def _profile_rate(repo: Path, profile_name: str | None):
-    """A profile's catalog rate (may be None = unconfirmed)."""
-    if profile_name is None:
-        return None
-    profile = catalog_profiles(repo).get(profile_name)
-    return profile.get("rate_cu_per_hour") if isinstance(profile, dict) else None
-
-
 def append_spend_segment(repo: Path, rec: dict, end_dt: datetime) -> bool:
     """Journal the completed segment of the session `rec` currently
-    names: [rec.acquired_at, end_dt] at the profile's rate. Called
-    at every seam that ends a session's assignment under a record.
-    Best-effort — a failed journal write never breaks the lifecycle
-    action it records."""
+    names: [rec.acquired_at, end_dt] at the record's rate snapshot.
+    Called at every seam that ends a session's assignment under a
+    record. Best-effort — a failed journal write never breaks the
+    lifecycle action it records."""
     try:
         start = parse_dt(rec["acquired_at"])
     except (KeyError, ValueError):
         return False
     if end_dt <= start:
         return False
-    line = {"profile": rec.get("profile"), "session": rec.get("session"), "start": rec["acquired_at"], "end": end_dt.isoformat(), "rate": _profile_rate(repo, rec.get("profile"))}
+    rate = rec.get("rate_cu_per_hour")
+    if rate is None and rec.get("shape"):
+        rate = shape_rate(repo, rec["shape"])
+    line = {"session": rec.get("session"), "shape": rec.get("shape"), "start": rec["acquired_at"], "end": end_dt.isoformat(), "rate": rate}
     if rec.get("caller"):
         line["caller"] = rec["caller"]
     try:
@@ -800,7 +883,7 @@ def _journal_segments(repo: Path) -> list[dict]:
             continue
         try:
             seg = json.loads(line)
-            out.append({"profile": seg.get("profile"), "start": parse_dt(seg["start"]), "end": parse_dt(seg["end"]), "rate": seg.get("rate")})
+            out.append({"session": seg.get("session"), "caller": seg.get("caller"), "shape": seg.get("shape"), "profile": seg.get("profile"), "start": parse_dt(seg["start"]), "end": parse_dt(seg["end"]), "rate": seg.get("rate")})
         except (json.JSONDecodeError, KeyError, ValueError):
             continue
     return out
@@ -815,73 +898,95 @@ def _overlap_cu(start: datetime, end: datetime, rate, period_start: datetime, pe
 
 def attributed_spend(repo: Path, now_dt: datetime | None = None) -> dict:
     """This repo's own lease burn for the current UTC day and month:
-    {"day_spent", "month_spent", "profiles": {name: {"day_spent",
-    "month_spent"}}}, derived from the segment journal plus live
-    records' running segments (see the accounting note above)."""
+    {"day_spent", "month_spent", "sessions": {name: {...}},
+    "callers": {caller: {...}}}, derived from the segment journal
+    plus live records' running segments (see the accounting note
+    above). A pre-retirement segment carries its profile instead of
+    a shape; it still counts toward its session and caller, and a
+    caller-less segment from the legacy standing profile's leases
+    counts toward the standing caller — the sub-cap's history
+    survives translation."""
     now = now_dt or datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = day_start.replace(day=1)
     totals = {"day": 0.0, "month": 0.0}
-    per: dict[str, dict] = {}
+    per_session: dict[str, dict] = {}
+    per_caller: dict[str, dict] = {}
+    legacy_standing_profile = load_config(repo).get("standing", {}).get("profile")
+    standing = standing_caller(repo)
 
-    def add(profile, start, end, rate):
+    def add(session, caller, start, end, rate):
         d = _overlap_cu(start, end, rate, day_start, now)
         m = _overlap_cu(start, end, rate, month_start, now)
         if not d and not m:
             return
         totals["day"] += d
         totals["month"] += m
-        entry = per.setdefault(profile, {"day_spent": 0.0, "month_spent": 0.0})
-        entry["day_spent"] += d
-        entry["month_spent"] += m
+        if session:
+            entry = per_session.setdefault(session, {"day_spent": 0.0, "month_spent": 0.0})
+            entry["day_spent"] += d
+            entry["month_spent"] += m
+        if caller:
+            entry = per_caller.setdefault(caller, {"day_spent": 0.0, "month_spent": 0.0})
+            entry["day_spent"] += d
+            entry["month_spent"] += m
 
     for seg in _journal_segments(repo):
-        add(seg["profile"], seg["start"], seg["end"], seg["rate"])
+        caller = seg["caller"]
+        if caller is None and legacy_standing_profile and seg.get("profile") == legacy_standing_profile:
+            caller = standing
+        add(seg["session"], caller, seg["start"], seg["end"], seg["rate"])
     for rec in all_records(repo):
         try:
             start = parse_dt(rec["acquired_at"])
         except (KeyError, ValueError):
             continue
-        add(rec.get("profile"), start, now, _profile_rate(repo, rec.get("profile")))
-    for entry in per.values():
-        entry["day_spent"] = round(entry["day_spent"], 2)
-        entry["month_spent"] = round(entry["month_spent"], 2)
-    return {"day_spent": round(totals["day"], 2), "month_spent": round(totals["month"], 2), "profiles": per}
+        rate = rec.get("rate_cu_per_hour")
+        if rate is None and rec.get("shape"):
+            rate = shape_rate(repo, rec["shape"])
+        add(rec.get("session"), rec.get("caller"), start, now, rate)
+    for bucket in (per_session, per_caller):
+        for entry in bucket.values():
+            entry["day_spent"] = round(entry["day_spent"], 2)
+            entry["month_spent"] = round(entry["month_spent"], 2)
+    return {"day_spent": round(totals["day"], 2), "month_spent": round(totals["month"], 2), "sessions": per_session, "callers": per_caller}
 
 
-def budget_check(colab, repo: Path, cfg: dict, profile: dict, hours: float | None = None, profile_name: str | None = None, caps_override: dict | None = None, now_dt: datetime | None = None) -> dict:
+def budget_check(colab, repo: Path, cfg: dict, shape: dict, hours: float | None = None, caps_override: dict | None = None, now_dt: datetime | None = None, standing_lease: bool = False, exclude_session: str | None = None) -> dict:
     """Project this lease's window cost against the daily/monthly
     budgets. Spend is attributed (see the accounting note above):
-    day/month/profile figures are this repo's own lease burn from
-    the segment journal plus live records — balance movements the
+    day/month figures are this repo's own lease burn from the
+    segment journal plus live records — balance movements the
     repo did not cause (external usage, credit expirations) never
     enter them. The balance itself remains a floor: a window whose
     projected cost exceeds the whole balance refuses
     ("balance-insufficient"), so a real credit loss still cannot be
     overspent. The projected window is `hours` when given (the
-    acquire's effective window), else the config max_hours. The
-    standing (lobby) profile additionally answers to
-    standing.daily_cu_cap (reason "standing-budget"); that sub-cap
-    is only ever checked against the standing profile, so a burst
-    acquire can never be refused by it.
+    acquire's effective window), else the config max_hours.
 
-    Pricing is per profile: the profile's own rate_cu_per_hour (the
-    spec catalog in config/profiles.json) wins; a profile without one
-    falls back to the config rate map by tier. A profile whose rate is
-    explicitly null has an unconfirmed rate: no projection is
-    fabricated — the check returns ok with "rate_unconfirmed": true
-    and a null projection.
+    Pricing is per shape: the shape entry's rate_cu_per_hour (the
+    catalog's measured rate for the shape). A shape whose rate is
+    null has an unconfirmed rate: no projection is fabricated —
+    the check returns ok with "rate_unconfirmed": true and a null
+    projection.
 
     `caps_override` (a grant's snapshot caps, served shape) replaces
     the config caps for this check; without it the live config caps
     price the window, exactly as before the envelope.
 
-    Parallel instances: when the profile has a parallel sibling with
-    a live record, the sibling's remaining window (rate x time to
-    its deadline) is added to this window's projection for the
-    floor and the daily/monthly caps, and reported as
-    "sibling_projected" — the pair is priced as the sum it commits.
-    Returns {"ok": bool, ...}."""
+    `standing_lease` marks the standing duty's lease: it
+    additionally answers to standing.daily_cu_cap, checked against
+    the standing caller's own day spend (reason "standing-budget");
+    no other lease is ever refused by that sub-cap.
+
+    Concurrency: every other live lease's remaining window (rate x
+    time to its deadline) is already committed burn, added to this
+    window's projection for the floor and the caps and reported as
+    "committed_projected" — concurrent windows are priced as the
+    sum they commit, so two windows must not each pass a guard
+    their sum would fail. The other leases' elapsed burn is already
+    inside day/month spent via their live records. Returns
+    {"ok": bool, ...}."""
     try:
         usage_res = colab("usage", timeout=120)
     except Exception:  # noqa: BLE001
@@ -899,10 +1004,7 @@ def budget_check(colab, repo: Path, cfg: dict, profile: dict, hours: float | Non
     balance = parse_balance(usage)
     if balance is None:
         return {"ok": False, "reason": "usage-unparseable", "usage": usage.strip()[-200:]}
-    if "rate_cu_per_hour" in profile:
-        rate = profile.get("rate_cu_per_hour")
-    else:
-        rate = cfg.get("rate_cu_per_hour", {}).get("high_mem" if profile.get("high_mem") else "standard", 0.26)
+    rate = shape.get("rate_cu_per_hour")
     window = float(hours) if hours is not None else float(cfg.get("max_hours", 8))
     projected = rate * window if rate is not None else None
     # Envelope pricing (two-tier envelope plan): a caps override —
@@ -916,70 +1018,63 @@ def budget_check(colab, repo: Path, cfg: dict, profile: dict, hours: float | Non
     spend = attributed_spend(repo, now_dt)
     day_spent = spend["day_spent"]
     month_spent = spend["month_spent"]
-    profile_day_spent = spend["profiles"].get(profile_name, {}).get("day_spent", 0.0) if profile_name is not None else None
     if projected is None:
-        out = {"ok": True, "balance": balance, "projected": None, "rate_unconfirmed": True, "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
-        if profile_day_spent is not None:
-            out["profile_day_spent"] = round(profile_day_spent, 2)
-        return out
-    # Parallel instances: the sibling instance's remaining window is
-    # already committed burn, so it prices into this guard alongside
-    # the new window — two concurrent windows must not each pass a
-    # guard that their sum would fail. The sibling's elapsed burn is
-    # already inside day/month spent via its live record.
-    sibling_projected = _sibling_projection(repo, profile_name, now_dt or datetime.now(timezone.utc)) if profile_name is not None else 0.0
-    committed = projected + sibling_projected
+        return {"ok": True, "balance": balance, "projected": None, "rate_unconfirmed": True, "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
+    committed = projected + _committed_projection(repo, now_dt or datetime.now(timezone.utc), exclude_session)
+    committed_extra = round(committed - projected, 2)
     if committed > balance:
         # The floor: caps throttle the repo's own burn, but no
         # window may promise more than the account actually holds.
         out = {"ok": False, "reason": "balance-insufficient", "projected": round(projected, 2), "balance": balance, "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
-        if sibling_projected:
-            out["sibling_projected"] = round(sibling_projected, 2)
+        if committed_extra:
+            out["committed_projected"] = committed_extra
         return out
     daily_cap = cap("daily", cfg.get("daily_cu_budget"))
     monthly_cap = cap("monthly", cfg.get("monthly_cu_budget"))
     if daily_cap is not None and day_spent + committed > daily_cap:
         out = {"ok": False, "reason": "daily-budget", "day_spent": round(day_spent, 2), "projected": round(projected, 2), "cap": daily_cap, "balance": balance}
-        if sibling_projected:
-            out["sibling_projected"] = round(sibling_projected, 2)
+        if committed_extra:
+            out["committed_projected"] = committed_extra
         return out
     if monthly_cap is not None and month_spent + committed > monthly_cap:
         out = {"ok": False, "reason": "monthly-budget", "month_spent": round(month_spent, 2), "projected": round(projected, 2), "cap": monthly_cap, "balance": balance}
-        if sibling_projected:
-            out["sibling_projected"] = round(sibling_projected, 2)
+        if committed_extra:
+            out["committed_projected"] = committed_extra
         return out
-    standing_cfg = cfg.get("standing", {})
-    if profile_name is not None and profile_name == standing_cfg.get("profile", "lobby"):
+    if standing_lease:
+        standing_cfg = cfg.get("standing", {})
         standing_cap = cap("standing_daily", standing_cfg.get("daily_cu_cap"))
-        if standing_cap is not None and profile_day_spent is not None and profile_day_spent + projected > float(standing_cap):
-            return {"ok": False, "reason": "standing-budget", "profile": profile_name, "profile_day_spent": round(profile_day_spent, 2), "projected": round(projected, 2), "cap": standing_cap, "balance": balance}
+        standing_spent = spend["callers"].get(standing_caller(repo), {}).get("day_spent", 0.0)
+        if standing_cap is not None and standing_spent + projected > float(standing_cap):
+            return {"ok": False, "reason": "standing-budget", "standing_day_spent": round(standing_spent, 2), "projected": round(projected, 2), "cap": standing_cap, "balance": balance}
     out = {"ok": True, "balance": balance, "projected": round(projected, 2), "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
-    if sibling_projected:
-        out["sibling_projected"] = round(sibling_projected, 2)
-    if profile_day_spent is not None:
-        out["profile_day_spent"] = round(profile_day_spent, 2)
+    if committed_extra:
+        out["committed_projected"] = committed_extra
     return out
 
 
-def _sibling_projection(repo: Path, profile_name: str, now_dt: datetime) -> float:
-    """The parallel sibling's remaining committed window cost: its
-    catalog rate x the time left to its record's deadline. Zero when
-    there is no sibling, no sibling record, an expired sibling
-    window, or an unconfirmed sibling rate (nothing fabricated)."""
-    sibling = parallel_sibling(repo, profile_name)
-    if sibling is None:
-        return 0.0
-    rec = load_record(repo, sibling)
-    if rec is None:
-        return 0.0
-    try:
-        remaining_h = (parse_dt(rec["deadline"]) - now_dt).total_seconds() / 3600.0
-    except (KeyError, ValueError):
-        return 0.0
-    if remaining_h <= 0:
-        return 0.0
-    rate = _profile_rate(repo, sibling)
-    return rate * remaining_h if rate is not None else 0.0
+def _committed_projection(repo: Path, now_dt: datetime, exclude_session: str | None = None) -> float:
+    """Every other live lease's remaining committed window cost:
+    rate x the time left to its record's deadline, summed. Zero for
+    an expired window or an unconfirmed rate (nothing fabricated).
+    The lease being priced excludes itself (exclude_session) — its
+    own window is the projection it rides beside."""
+    total = 0.0
+    for rec in all_records(repo):
+        if exclude_session is not None and rec.get("session") == exclude_session:
+            continue
+        try:
+            remaining_h = (parse_dt(rec["deadline"]) - now_dt).total_seconds() / 3600.0
+        except (KeyError, ValueError):
+            continue
+        if remaining_h <= 0:
+            continue
+        rate = rec.get("rate_cu_per_hour")
+        if rate is None and rec.get("shape"):
+            rate = shape_rate(repo, rec["shape"])
+        if rate is not None:
+            total += rate * remaining_h
+    return total
 
 
 def local_sessions_path() -> Path:
@@ -1011,11 +1106,11 @@ def session_host(session: str) -> str | None:
     return None
 
 
-def created_shape_mismatch(session: str, profile: dict) -> dict | None:
+def created_shape_mismatch(session: str, shape: dict) -> dict | None:
     """Post-start shape assertion (session shape gate): the shape
     the server actually assigned, read from the local binding's
     endpoint host (an m-hm- host is high-RAM, an m-s- host is
-    standard), against the profile's declared RAM class — the RAM
+    standard), against the shape's declared RAM class — the RAM
     dimension only, the one the incident proved can silently differ
     from the name the session was created under. A dict naming the
     mismatch, or None — including when the evidence is unreadable
@@ -1028,9 +1123,9 @@ def created_shape_mismatch(session: str, profile: dict) -> dict | None:
     if actual is None:
         return None
     actual_high = actual == "high_ram"
-    if actual_high == bool(profile.get("high_mem")):
+    if actual_high == bool(shape.get("high_mem")):
         return None
-    return {"action": "shape-mismatch", "session": session, "declared_high_mem": bool(profile.get("high_mem")), "actual_class": actual, "host": host}
+    return {"action": "shape-mismatch", "session": session, "declared_high_mem": bool(shape.get("high_mem")), "actual_class": actual, "host": host}
 
 
 # The fallback's unassign replay, run under the CLI's own interpreter.
@@ -1171,7 +1266,7 @@ HANDOVER_READ_TIMEOUT_S = 30
 RENEWAL_KIT_REMOTE = "/content/renewal-kit"
 BRIDGE_KIT_REMOTE = "/content/bridge-kit"
 BRIDGE_REMOTE = "/content/bridge"
-BRIDGE_PROTOCOL = 1
+BRIDGE_PROTOCOL = 2
 BRIDGE_READ_TIMEOUT_S = 10
 BRIDGE_INSTALL_COOLDOWN_S = 600
 BRIDGE_HEARTBEAT_STALE_S = 45
@@ -1235,6 +1330,21 @@ def kernel_pulse(colab, repo: Path, session: str) -> str:
         return "failed"
 
 
+def _shape_spec_for(repo: Path, shape_id: str | None, rec: dict | None = None) -> dict:
+    """A shape's descriptor fields ({gpu, tpu, high_mem}): the
+    catalog entry when the catalog knows the shape, else the
+    descriptor the lease record itself carries (stamped at
+    creation/translation, so a lease's own shape survives a cold
+    catalog cache), else plain CPU."""
+    entry = catalog_shapes(repo).get(shape_id) if shape_id else None
+    if entry is not None:
+        return {"gpu": entry.get("gpu"), "tpu": entry.get("tpu"), "high_mem": bool(entry.get("high_mem"))}
+    if rec is not None and isinstance(rec.get("shape_spec"), dict):
+        spec = rec["shape_spec"]
+        return {"gpu": spec.get("gpu"), "tpu": spec.get("tpu"), "high_mem": bool(spec.get("high_mem"))}
+    return {"gpu": None, "tpu": None, "high_mem": False}
+
+
 def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = None) -> dict:
     """Install the renewal kit in a renew-flagged lease's session
     (driver 1 of the lease-extension plan): snippets/renewal.py plus
@@ -1255,19 +1365,20 @@ def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = 
     token_src = Path.home() / ".config" / "colab-cli" / "token.json"
     if not token_src.exists():
         return {"kit": "install-failed", "stage": "token-missing"}
-    profile = load_profiles(repo).get(rec.get("profile"), {})
+    spec = _shape_spec_for(repo, rec.get("shape"), rec)
     var = var_dir(repo)
     var.mkdir(parents=True, exist_ok=True)
-    cfg_local = var / f"renewal-config-{rec.get('profile')}.json"
+    cfg_local = var / f"renewal-config-{session}.json"
     cfg_local.write_text(json.dumps({
-        "profile": rec.get("profile"),
+        "shape": rec.get("shape"),
         "session": session,
         "deadline": rec.get("deadline"),
         "acquired_at": rec.get("acquired_at"),
         "cap_seconds": SESSION_CAP_HOURS * 3600,
         "margin_seconds": RENEWAL_MARGIN.total_seconds(),
-        "high_mem": bool(profile.get("high_mem")),
-        "gpu": profile.get("gpu"),
+        "high_mem": spec["high_mem"],
+        "gpu": spec["gpu"],
+        "tpu": spec["tpu"],
     }, indent=2))
     if not _ensure_remote_dirs(colab, repo, session, [RENEWAL_KIT_REMOTE], "renewal"):
         return {"kit": "install-failed", "stage": "mkdir"}
@@ -1284,7 +1395,7 @@ def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = 
             return {"kit": "install-failed", "stage": "upload"}
         if r.returncode != 0:
             return {"kit": "install-failed", "stage": "upload"}
-    launcher = var / f"launch-renewal-kit-{rec.get('profile')}.py"
+    launcher = var / f"launch-renewal-kit-{session}.py"
     launcher.write_text(
         "import os, subprocess\n"
         "env = dict(os.environ)\n"
@@ -1301,11 +1412,16 @@ def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = 
     return {"kit": "installed"}
 
 
-def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False) -> dict:
-    """Adopt the live lease for this profile or create it. The only entry
-    point that ever creates a session under the lease model. Works for
-    any profile in the spec catalog; each profile's lease lives in its
-    own record, so tiers coexist.
+def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False) -> dict:
+    """Adopt the caller's live lease at this shape or create it. The
+    only entry point that ever creates a session under the lease
+    model. A lease is identified by (caller, shape): an acquire
+    whose caller already holds a live, unexpired lease at the
+    shape adopts it; any other acquire creates a fresh lease with
+    a generated session name — so a caller may hold several leases
+    at once (across shapes, or across its own lane suffixes, which
+    are distinct caller claims), and no lease is ever shared across
+    callers.
 
     `hours` sets this lease's window: the deadline is now + hours
     and the budget projection prices that window, exactly as given —
@@ -1316,7 +1432,7 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     only clamp.
 
     Envelope attribution (two-tier envelope plan): when a grant is
-    active and this profile is inside its scope, a created or
+    active and this shape is inside its scope, a created or
     adopted record is stamped with the grant's id (`envelope_id` =
     its granted_at). A created record also carries the requester
     tag `via` when the caller supplies one (a demand request's tag,
@@ -1328,31 +1444,29 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
 
     Caller attribution (caller-attribution plan): `caller` is the
     resolved thread claim from the wrapper seam (the seams
-    validate; the core stamps what it is given). A created or
-    adopt-foreign record carries it; an adopted record keeps its
-    creator's caller, filling the field only when the record
-    predates attribution and the adopting call supplies one.
-
-    Adopt-foreign (parallel instances): an instance profile with no
-    record whose session already exists live — created outside the
-    lease, e.g. by a direct CLI call — is adopted instead of created:
-    the budget check prices a fresh window from now, the record is
-    written against the existing session, and keepalive + pulse
-    prove it, with no `new` and no `stop` issued against it. An
-    unreadable session list refuses (acquire-unknown), never acts."""
+    validate; the core stamps what it is given). A created record
+    carries it; an adopted record keeps its creator's caller,
+    filling the field only when the record predates attribution
+    and the adopting call supplies one."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     if not cfg.get("enabled"):
         return {"action": "lease-disabled"}
-    profiles = catalog_profiles(repo, colab)
-    if profile_name not in profiles:
-        return {"action": "unknown-profile", "profile": profile_name}
-    profile = profiles[profile_name]
-    session = profile["session"]
+    shapes = catalog_shapes(repo, colab)
+    if shape_id not in shapes:
+        return {"action": "unknown-shape", "shape": shape_id}
+    shape = shapes[shape_id]
     grant = active_grant(repo, now_dt)
-    in_scope = profile_in_grant(grant, profile_name)
-    rec = load_record(repo, profile_name)
-    if rec:
+    in_scope = shape_in_grant(repo, grant, shape_id)
+    candidates = [r for r in all_records(repo) if r.get("shape") == shape_id and r.get("caller") in (caller, None)]
+    # An unstamped record (pre-attribution, or created by an
+    # unattributed call) is adoptable by the first caller to ask —
+    # the adoption stamps it (below) — while a stamped record is
+    # its creator's alone. An exact caller match wins over an
+    # unstamped candidate.
+    rec = max(candidates, key=lambda r: (caller is not None and r.get("caller") == caller, r.get("deadline") or ""), default=None)
+    if rec is not None:
+        session = rec["session"]
         state = session_state(colab, session)
         if state == "unknown":
             # Never stop, delete, or recreate on an unreadable session
@@ -1383,7 +1497,7 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
             # is still billing (release()'s rule, same reason).
             return {"action": "acquire-stop-failed", "record": rec, "session": session}
         append_spend_segment(repo, rec, now_dt or datetime.now(timezone.utc))
-        save_record(repo, None, profile=profile_name)
+        delete_record(repo, session)
     effective_hours = float(hours) if hours is not None else float(cfg.get("max_hours", 8))
     if max_hours_cap is not None:
         # Only a caller passing its own cap clamps the window. Until
@@ -1394,57 +1508,49 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     # never the live config (Step 3): the grant tap authorized those
     # numbers. Out-of-scope and no-grant pricing is unchanged.
     caps_override = grant_caps(grant) if in_scope else None
-    budget = budget_check(colab, repo, cfg, profile, hours=effective_hours, profile_name=profile_name, caps_override=caps_override, now_dt=now_dt)
+    budget = budget_check(colab, repo, cfg, shape, hours=effective_hours, caps_override=caps_override, now_dt=now_dt, standing_lease=standing)
     if not budget["ok"]:
         return {"action": "refused-budget", "budget": budget}
-    # Adopt-foreign: an instance profile whose session is already
-    # live takes the record below without a `new` (see the docstring).
-    adopted_foreign = False
-    if profile.get("parallel_of"):
-        fstate = session_state(colab, session)
-        if fstate == "unknown":
-            return {"action": "acquire-unknown", "session": session}
-        adopted_foreign = fstate == "alive"
-    if not adopted_foreign:
-        # Session shape gate: the creation branch only — adopting
-        # or reusing a live session above is never gated. `duty`
-        # marks the lease duty creating on a demand (auto_acquire
-        # is its only passer): the shape check still applies, the
-        # agent creation denial does not.
-        refusal = enforce_session_admission(repo, profile_name, via=via, profile=profile, seam="acquire", caller=caller, duty=duty)
-        if refusal is not None:
-            return refusal
-        args = ["new", "-s", session] + _session_shape_args(profile)
-        r = colab(*args, timeout=600)
-        if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
-            return {"action": "create-failed", "error": (r.stderr or r.stdout).strip()[-300:]}
-        if r.returncode == 0 and session_gate_policy(repo)["enabled"]:
-            # Post-start shape assertion: the profile the CLI was
-            # handed is not proof of the shape the server assigned
-            # (the 2026-11-04 Standard session bound under a
-            # High-RAM profile name). Only a fresh create is
-            # asserted — the "already" path above is a reuse, which
-            # is never gated. A proven mismatch is stopped and
-            # refused: no lease record is written for a session of
-            # the wrong shape. The assertion is part of the gate: a
-            # policy disabled in config stands it down too.
-            mismatch = created_shape_mismatch(session, profile) if session_state(colab, session) == "alive" else None
-            if mismatch is not None:
-                stop = stop_session_safe(colab, session)
-                append_gate_journal(repo, {"kind": "shape-mismatch", "seam": "acquire", "profile": profile_name, "declared_high_mem": mismatch["declared_high_mem"], "actual_class": mismatch["actual_class"], "stop": stop})
-                return {**mismatch, "profile": profile_name, "stop": stop}
+    # Session shape gate: the creation branch only — adopting
+    # or reusing a live session above is never gated. `duty`
+    # marks the lease duty creating on a demand (auto_acquire
+    # is its only passer): the shape check still applies, the
+    # agent creation denial does not.
+    refusal = enforce_session_admission(repo, shape_id, via=via, shape=shape, seam="acquire", caller=caller, duty=duty, standing=standing)
+    if refusal is not None:
+        return refusal
+    session = generate_session_name(repo, colab)
+    args = ["new", "-s", session] + _session_shape_args(shape)
+    r = colab(*args, timeout=600)
+    if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
+        return {"action": "create-failed", "error": (r.stderr or r.stdout).strip()[-300:]}
+    if r.returncode == 0 and session_gate_policy(repo)["enabled"]:
+        # Post-start shape assertion: the shape the CLI was
+        # handed is not proof of the shape the server assigned
+        # (the 2026-11-04 Standard session bound under a
+        # High-RAM profile name). Only a fresh create is
+        # asserted — the "already" path above is a reuse, which
+        # is never gated. A proven mismatch is stopped and
+        # refused: no lease record is written for a session of
+        # the wrong shape. The assertion is part of the gate: a
+        # policy disabled in config stands it down too.
+        mismatch = created_shape_mismatch(session, shape) if session_state(colab, session) == "alive" else None
+        if mismatch is not None:
+            stop = stop_session_safe(colab, session)
+            append_gate_journal(repo, {"kind": "shape-mismatch", "seam": "acquire", "shape": shape_id, "declared_high_mem": mismatch["declared_high_mem"], "actual_class": mismatch["actual_class"], "stop": stop})
+            return {**mismatch, "shape": shape_id, "stop": stop}
     deadline = now_dt + timedelta(hours=effective_hours)
     rec = {
-        "profile": profile_name,
         "session": session,
+        "shape": shape_id,
+        "shape_spec": {"gpu": shape.get("gpu"), "tpu": shape.get("tpu"), "high_mem": bool(shape.get("high_mem"))},
+        "rate_cu_per_hour": shape.get("rate_cu_per_hour"),
         "acquired_at": now_dt.isoformat(),
         "deadline": deadline.isoformat(),
         "last_used_at": now_dt.isoformat(),
         "jobs": [],
         "budget_at_acquire": budget,
     }
-    if adopted_foreign:
-        rec["adopted_foreign"] = True
     if in_scope:
         rec["envelope_id"] = grant["granted_at"]
     if via and (grant is None or in_scope):
@@ -1462,10 +1568,10 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     rec["last_pulse_at"] = now_dt.isoformat()
     rec["last_pulse_result"] = pulse_result
     save_record(repo, rec)
-    host_changed = _capture_session_host(repo, rec, "adopt-foreign" if adopted_foreign else "acquire", spool_on_first=True)
+    host_changed = _capture_session_host(repo, rec, "acquire", spool_on_first=True)
     if host_changed:
         save_record(repo, rec)
-    out = {"action": "adopted-foreign" if adopted_foreign else "created", "record": rec, "pulse": pulse_result, **ka}
+    out = {"action": "created", "record": rec, "pulse": pulse_result, **ka}
     if host_changed:
         out["host_changed"] = True
         out["host"] = rec["host"]
@@ -1480,38 +1586,40 @@ def acquire(colab, repo: Path, profile_name: str, now_dt: datetime | None = None
     return out
 
 
-def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime | None = None, caller: str | None = None) -> dict:
-    """Move a lease's deadline later by `hours` without touching its
-    session (plan .plans/2026-11-01-lease-extension.md). The budget
-    guard prices only the delta (the profile's rate x hours) before
-    anything changes; a refusal changes nothing. A successful
-    extension sets renew: true — the lease becomes a window lease and
-    the reaper renews its session as needed to reach the new end —
-    and, while the session is alive, installs the renewal kit if it
-    is not already installed.
+def extend(colab, repo: Path, session: str, hours: float, now_dt: datetime | None = None, caller: str | None = None) -> dict:
+    """Move one lease's deadline later by `hours` without touching
+    its session (plan .plans/2026-11-01-lease-extension.md). The
+    budget guard prices only the delta (the shape's rate x hours)
+    before anything changes; a refusal changes nothing. A
+    successful extension sets renew: true — the lease becomes a
+    window lease and the reaper renews its session as needed to
+    reach the new end — and, while the session is alive, installs
+    the renewal kit if it is not already installed.
 
-    Refusals: extend-no-lease (no record, or the session is confirmed
-    absent on a non-window lease — the lease is over and a fresh start
-    is a new lease), extend-unknown (session state unreadable; never
-    act on an unreadable list), extend-standing-managed (the lobby's
-    lifetime belongs to the grant), refused-budget."""
+    Refusals: extend-no-lease (no record for the session, or the
+    session is confirmed absent on a non-window lease — the lease
+    is over and a fresh start is a new lease), extend-unknown
+    (session state unreadable; never act on an unreadable list),
+    extend-standing-managed (the standing lease's lifetime belongs
+    to the grant), refused-budget."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     if not cfg.get("enabled"):
         return {"action": "lease-disabled"}
-    rec = load_record(repo, profile_name)
+    rec = load_record(repo, session)
     if rec is None:
         return {"action": "extend-no-lease"}
-    standing_profile = cfg.get("standing", {}).get("profile", "lobby")
-    if profile_name == standing_profile and (rec.get("standing") or grant_active(load_grant(repo), now_dt)):
+    if rec.get("standing") and grant_active(load_grant(repo), now_dt):
         return {"action": "extend-standing-managed"}
-    state = session_state(colab, rec["session"])
+    state = session_state(colab, session)
     if state == "unknown":
-        return {"action": "extend-unknown", "session": rec["session"]}
+        return {"action": "extend-unknown", "session": session}
     if state == "absent" and not rec.get("renew"):
-        return {"action": "extend-no-lease", "session": rec["session"]}
-    profile = catalog_profiles(repo)[profile_name]
-    budget = budget_check(colab, repo, cfg, profile, hours=float(hours), profile_name=profile_name, now_dt=now_dt)
+        return {"action": "extend-no-lease", "session": session}
+    shape = catalog_shapes(repo).get(rec.get("shape"))
+    if shape is None:
+        shape = {"id": rec.get("shape"), "rate_cu_per_hour": rec.get("rate_cu_per_hour"), **_shape_spec_for(repo, rec.get("shape"), rec)}
+    budget = budget_check(colab, repo, cfg, shape, hours=float(hours), now_dt=now_dt, standing_lease=bool(rec.get("standing")), exclude_session=session)
     if not budget["ok"]:
         return {"action": "refused-budget", "budget": budget}
     old_deadline = rec["deadline"]
@@ -1524,7 +1632,7 @@ def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime 
         # record keeps its creator's caller (as on adopt).
         rec["caller"] = caller
     save_record(repo, rec)
-    out = {"action": "extended", "profile": profile_name, "hours": float(hours), "old_deadline": old_deadline, "new_deadline": new_deadline, "record": rec, "budget": budget}
+    out = {"action": "extended", "session": session, "shape": rec.get("shape"), "hours": float(hours), "old_deadline": old_deadline, "new_deadline": new_deadline, "record": rec, "budget": budget}
     if caller:
         out["caller"] = caller
     if state == "alive" and rec.get("kit") != "installed":
@@ -1538,19 +1646,22 @@ def extend(colab, repo: Path, profile_name: str, hours: float, now_dt: datetime 
 
 def extend_grant(colab, repo: Path, hours: float, now_dt: datetime | None = None) -> dict:
     """Move the two-tier grant's `until` later by `hours`; the
-    standing duty follows the new end on its own. Only the lobby's
-    delta is priced (lobby rate x hours) — against the standing
-    sub-cap and the global caps; the burst is neither extended nor
-    charged. An absent or expired grant refuses (grant-inactive): a
-    new window is a new grant."""
+    standing duty follows the new end on its own. Only the standing
+    lease's delta is priced (its shape's rate x hours) — against
+    the standing sub-cap and the global caps; the burst is neither
+    extended nor charged. An absent or expired grant refuses
+    (grant-inactive): a new window is a new grant."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     grant = load_grant(repo)
     if not grant_active(grant, now_dt):
         return {"action": "grant-inactive"}
-    lobby_profile = grant.get("lobby_profile") or cfg.get("standing", {}).get("profile", "lobby")
-    profile = load_profiles(repo)[lobby_profile]
-    budget = budget_check(colab, repo, cfg, profile, hours=float(hours), profile_name=lobby_profile, now_dt=now_dt)
+    shape_id = standing_shape(repo)
+    shape = catalog_shapes(repo).get(shape_id)
+    standing_rec = standing_record(repo)
+    if shape is None:
+        shape = {"id": shape_id, "rate_cu_per_hour": standing_rec.get("rate_cu_per_hour") if standing_rec else shape_rate(repo, shape_id), **_shape_spec_for(repo, shape_id, standing_rec)}
+    budget = budget_check(colab, repo, cfg, shape, hours=float(hours), now_dt=now_dt, standing_lease=True, exclude_session=standing_rec.get("session") if standing_rec else None)
     if not budget["ok"]:
         return {"action": "refused-budget", "budget": budget}
     old_until = grant["until"]
@@ -1576,8 +1687,8 @@ def _job_record(repo: Path, run_id: str | None = None) -> dict | None:
     return max(recs, key=lambda r: r.get("last_used_at", ""))
 
 
-def touch_job(repo: Path, run_id: str, now_dt: datetime | None = None, profile: str | None = None) -> None:
-    rec = load_record(repo, profile) if profile is not None else _job_record(repo, run_id)
+def touch_job(repo: Path, run_id: str, now_dt: datetime | None = None, session: str | None = None) -> None:
+    rec = load_record(repo, session) if session is not None else _job_record(repo, run_id)
     if not rec:
         return
     now_dt = now_dt or datetime.now(timezone.utc)
@@ -1587,8 +1698,8 @@ def touch_job(repo: Path, run_id: str, now_dt: datetime | None = None, profile: 
     save_record(repo, rec)
 
 
-def finish_job(repo: Path, run_id: str, now_dt: datetime | None = None, profile: str | None = None) -> None:
-    rec = load_record(repo, profile) if profile is not None else _job_record(repo, run_id)
+def finish_job(repo: Path, run_id: str, now_dt: datetime | None = None, session: str | None = None) -> None:
+    rec = load_record(repo, session) if session is not None else _job_record(repo, run_id)
     if not rec:
         return
     now_dt = now_dt or datetime.now(timezone.utc)
@@ -1597,11 +1708,11 @@ def finish_job(repo: Path, run_id: str, now_dt: datetime | None = None, profile:
     save_record(repo, rec)
 
 
-def release(colab, repo: Path, reason: str = "manual", profile: str | None = None, now_dt: datetime | None = None) -> dict:
-    """Release one profile's lease. Without a profile: the default
-    profile's record, or the sole record when only one lease exists —
-    the historical single-lease behaviour."""
-    rec = load_record(repo, profile) if profile is not None else load_record(repo)
+def release(colab, repo: Path, reason: str = "manual", session: str | None = None, now_dt: datetime | None = None) -> dict:
+    """Release one lease, by session. Without a session: the most
+    recently used record — the historical single-lease behaviour
+    in a world that usually holds one lease the operator means."""
+    rec = load_record(repo, session)
     if not rec:
         return {"action": "no-lease"}
     # Release guard (lease-extension plan): re-read the record
@@ -1609,7 +1720,7 @@ def release(colab, repo: Path, reason: str = "manual", profile: str | None = Non
     # caller's read moves the on-disk deadline into the future, and
     # the extension wins — abort rather than stop a lease whose end
     # just moved.
-    fresh = load_record(repo, rec["profile"])
+    fresh = load_record(repo, rec["session"])
     if fresh is not None and fresh.get("deadline") and rec.get("deadline"):
         try:
             moved = parse_dt(fresh["deadline"]) > parse_dt(rec["deadline"])
@@ -1624,26 +1735,32 @@ def release(colab, repo: Path, reason: str = "manual", profile: str | None = Non
         # forgetting a live assignment.
         return {"action": "release-failed", "reason": reason, "stop": outcome, "record_kept": True}
     append_spend_segment(repo, rec, now_dt or datetime.now(timezone.utc))
-    save_record(repo, None, profile=rec["profile"])
+    delete_record(repo, rec["session"])
     _note_envelope_lease_released(repo, fresh if fresh and fresh.get("envelope_id") else rec, reason)
-    return {"action": "released", "reason": reason, "stop": outcome, "was": {k: rec.get(k) for k in ("profile", "session", "acquired_at", "deadline")}}
+    return {"action": "released", "reason": reason, "stop": outcome, "was": {k: rec.get(k) for k in ("session", "shape", "caller", "acquired_at", "deadline")}}
 
 
-def _session_shape_args(profile: dict) -> list[str]:
-    return (["--high-mem"] if profile.get("high_mem") else []) + (["--gpu", profile["gpu"]] if profile.get("gpu") else []) + (["--tpu", profile["tpu"]] if profile.get("tpu") else [])
+def _session_shape_args(shape: dict) -> list[str]:
+    return (["--high-mem"] if shape.get("high_mem") else []) + (["--gpu", shape["gpu"]] if shape.get("gpu") else []) + (["--tpu", shape["tpu"]] if shape.get("tpu") else [])
 
 
 def _swap_session(colab, repo: Path, rec: dict, new_session: str, acquired_at: str, now_dt: datetime) -> None:
     """The record half of a renewal, shared by both drivers: only the
     session and the session's acquired_at change — deadline, jobs,
-    and profile are the window's and stay put. The keepalive is
+    and shape are the window's and stay put. The keepalive is
     relaunched on the new session and the kernel pulsed, as at
     acquire."""
     append_spend_segment(repo, rec, now_dt)  # the old session's segment closes here
+    old_session = rec["session"]
     rec["session"] = new_session
     rec["acquired_at"] = acquired_at
     rec["last_used_at"] = now_dt.isoformat()
     save_record(repo, rec)
+    if old_session != new_session:
+        # The record's file is keyed by session: the old session's
+        # file still holds the pre-swap record under the old name
+        # and must not survive as a second, stale lease.
+        delete_record(repo, old_session)
     if _capture_session_host(repo, rec, "renewal", spool_on_first=True):
         save_record(repo, rec)
     ensure_keepalive(colab, repo, new_session)
@@ -1674,14 +1791,32 @@ def _adopt_handover(colab, repo: Path, cfg: dict, rec: dict, now_dt: datetime) -
     if not child or not isinstance(binding, dict) or child not in binding:
         return None
     sessions_file = local_sessions_path()
-    local = load_json(sessions_file, {})
-    if not isinstance(local, dict):
+    # The merge must never rebuild the binding map from a failed
+    # read: the CLI writes this file non-atomically, so a read can
+    # catch a partial write, and starting from {} would clobber
+    # every other session's binding on write-back — blinding the
+    # machinery to live sessions (the 2026-11-05 orphan incident).
+    # Absent file: start empty. Present but unparseable: abort.
+    try:
+        raw = sessions_file.read_text()
+    except FileNotFoundError:
         local = {}
+    except OSError:
+        return None
+    else:
+        try:
+            local = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(local, dict):
+            return None
     local[child] = binding[child]
     try:
         sessions_file.parent.mkdir(parents=True, exist_ok=True)
-        sessions_file.write_text(json.dumps(local, indent=2))
-        os.chmod(sessions_file, 0o600)
+        tmp = sessions_file.with_name(sessions_file.name + ".tmp")
+        tmp.write_text(json.dumps(local, indent=2))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, sessions_file)
     except OSError:
         return None
     if session_state(colab, child) != "alive":
@@ -1695,29 +1830,38 @@ def _adopt_handover(colab, repo: Path, cfg: dict, rec: dict, now_dt: datetime) -
 
 def _renew_fresh_session(colab, repo: Path, cfg: dict, rec: dict, now_dt: datetime) -> dict | None:
     """Renewal driver 2 (reaper fallback): create a fresh session for
-    the profile against the same window end and swap the record onto
-    it. No budget check — the window was priced at acquire/extend
+    the lease's shape against the same window end and swap the record
+    onto it. No budget check — the window was priced at acquire/extend
     time and renewal never re-prices it. The fresh session gets the
     renewal kit, so the next renewal can be driver 1. The old session
     is stopped once the record has swapped."""
-    # The catalog, not the configured profiles alone: a parallel
-    # instance's shape (and its renewal session naming) derives from
-    # its base through the derived catalog entry.
-    profile = catalog_profiles(repo).get(rec.get("profile"), {})
+    # The lease's shape descriptor: the catalog entry when it knows
+    # the shape, else the descriptor the record itself carries — a
+    # renewal must mint the shape the lease was created at even with
+    # a cold catalog cache.
+    shape_id = rec.get("shape")
+    shape = catalog_shapes(repo).get(shape_id)
+    if shape is None:
+        shape = {"id": shape_id, "rate_cu_per_hour": rec.get("rate_cu_per_hour"), **_shape_spec_for(repo, shape_id, rec)}
     # Session shape gate: a renewal re-creates the session, so the
     # record's shape is re-checked (renewal_admission — no actor
     # bypass). A refusal recreates nothing: returning None keeps
     # the record for the next cycle, whose reap surfaces
     # renewal-failed until the window's end releases it — the shape
     # is surfaced, never silently perpetuated.
-    gate = renewal_admission(repo, rec.get("profile"), profile)
+    gate = renewal_admission(repo, shape_id, shape)
     if not gate["allowed"]:
-        append_gate_journal(repo, {"kind": "shape-refused", "seam": "renewal", "profile": rec.get("profile"), "shape_class": gate["shape_class"], "agent_classes": gate["agent_classes"]})
+        append_gate_journal(repo, {"kind": "shape-refused", "seam": "renewal", "shape": shape_id, "shape_class": gate["shape_class"], "agent_classes": gate["agent_classes"]})
         return None
-    base = profile.get("session") or rec["session"]
+    # The renewal child derives from the lease's own name: the
+    # generated name with any earlier renewal suffixes stripped, so
+    # a lease's sessions read as one family for its whole window.
+    base = rec["session"]
+    while re.search(r"-r\d+$", base):
+        base = re.sub(r"-r\d+$", "", base)
     new_session = f"{base}-r{int(now_dt.timestamp())}"
     try:
-        r = colab(*(["new", "-s", new_session] + _session_shape_args(profile)), timeout=600)
+        r = colab(*(["new", "-s", new_session] + _session_shape_args(shape)), timeout=600)
     except Exception:  # noqa: BLE001
         return None
     if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
@@ -1816,7 +1960,7 @@ def _capture_session_host(repo: Path, rec: dict, origin: str, spool_on_first: bo
         return False
     rec["host"] = host
     if previous is not None or spool_on_first:
-        event = {"kind": "approval-needed", "profile": rec.get("profile"), "session": rec.get("session"), "host": host, "previous_host": previous, "origin": origin}
+        event = {"kind": "approval-needed", "shape": rec.get("shape"), "session": rec.get("session"), "host": host, "previous_host": previous, "origin": origin}
         if rec.get("caller"):
             # The approval announcement names whose work the host
             # serves (caller-attribution plan) — present only when
@@ -1832,8 +1976,8 @@ def _note_envelope_lease_started(repo: Path, rec: dict) -> None:
     envelope-lease-started event the companion drains into the UI
     outbox (the drain is kind-generic; the panel renders this kind).
     The record's caller rides both events when it carries one."""
-    ledger = {"kind": "lease-attributed", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), "via": rec.get("via"), "session": rec.get("session"), "deadline": rec.get("deadline")}
-    spool = {"kind": "envelope-lease-started", "profile": rec.get("profile"), "envelope_id": rec.get("envelope_id"), "via": rec.get("via")}
+    ledger = {"kind": "lease-attributed", "envelope_id": rec.get("envelope_id"), "shape": rec.get("shape"), "via": rec.get("via"), "session": rec.get("session"), "deadline": rec.get("deadline")}
+    spool = {"kind": "envelope-lease-started", "shape": rec.get("shape"), "envelope_id": rec.get("envelope_id"), "via": rec.get("via")}
     if rec.get("caller"):
         ledger["caller"] = rec["caller"]
         spool["caller"] = rec["caller"]
@@ -1844,8 +1988,8 @@ def _note_envelope_lease_started(repo: Path, rec: dict) -> None:
 def _note_envelope_lease_released(repo: Path, rec: dict, reason: str) -> None:
     if not rec.get("envelope_id"):
         return
-    ledger = {"kind": "lease-released", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), "via": rec.get("via"), "reason": reason}
-    spool = {"kind": "envelope-lease-released", "profile": rec.get("profile"), "envelope_id": rec.get("envelope_id"), "reason": reason}
+    ledger = {"kind": "lease-released", "envelope_id": rec.get("envelope_id"), "shape": rec.get("shape"), "via": rec.get("via"), "reason": reason}
+    spool = {"kind": "envelope-lease-released", "shape": rec.get("shape"), "envelope_id": rec.get("envelope_id"), "reason": reason}
     if rec.get("caller"):
         ledger["caller"] = rec["caller"]
         spool["caller"] = rec["caller"]
@@ -1871,9 +2015,9 @@ def _attempt_renewal(colab, repo: Path, cfg: dict, rec: dict, state: str, now_dt
         if result is None:
             result = _renew_fresh_session(colab, repo, cfg, rec, now_dt)
         if result is not None:
-            append_reaper_event(repo, {"kind": "lease-renewed", "profile": rec.get("profile"), **result})
+            append_reaper_event(repo, {"kind": "lease-renewed", "shape": rec.get("shape"), **result})
             if rec.get("envelope_id"):
-                append_grant_ledger(repo, {"kind": "lease-renewed", "envelope_id": rec.get("envelope_id"), "profile": rec.get("profile"), **result})
+                append_grant_ledger(repo, {"kind": "lease-renewed", "envelope_id": rec.get("envelope_id"), "shape": rec.get("shape"), **result})
         return result
     except Exception:  # noqa: BLE001
         return None
@@ -1885,7 +2029,6 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
     plus grant-expiry enforcement for standing leases — a standing
     lease whose grant has lapsed (or vanished) is released even before
     its own deadline."""
-    profile = rec.get("profile")
     state = session_state(colab, rec["session"])
     if state == "unknown":
         return {"action": "kept-unknown", "session": rec["session"]}
@@ -1902,18 +2045,18 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
             return {"action": "renewal-failed", "session": rec["session"]}
         append_spend_segment(repo, rec, now_dt)
         _note_envelope_lease_released(repo, rec, "cleared-dead")
-        save_record(repo, None, profile=profile)
+        delete_record(repo, rec["session"])
         return {"action": "cleared-dead", "session": rec["session"]}
     if rec.get("standing") and not grant_active(grant, now_dt):
-        rel = release(colab, repo, reason="grant-expired", profile=profile, now_dt=now_dt)
+        rel = release(colab, repo, reason="grant-expired", session=rec["session"], now_dt=now_dt)
         return {"action": "released-standing-expired", "stop": rel.get("stop"), "was": rel.get("was")}
     if now_dt >= parse_dt(rec["deadline"]):
-        rel = release(colab, repo, reason="deadline", profile=profile, now_dt=now_dt)
+        rel = release(colab, repo, reason="deadline", session=rec["session"], now_dt=now_dt)
         return {"action": "released-deadline", "stop": rel.get("stop"), "was": rel.get("was")}
     idle = cfg.get("idle_shutdown_minutes")
     if idle is not None and not rec.get("jobs"):
         if now_dt - parse_dt(rec["last_used_at"]) > timedelta(minutes=float(idle)):
-            rel = release(colab, repo, reason="idle", profile=profile, now_dt=now_dt)
+            rel = release(colab, repo, reason="idle", session=rec["session"], now_dt=now_dt)
             return {"action": "released-idle", "stop": rel.get("stop"), "was": rel.get("was")}
     renewal_failed = False
     if rec.get("renew") and not rec.get("standing"):
@@ -1952,13 +2095,12 @@ _REAP_PRIORITY = ("released-deadline", "cleared-dead", "released-standing-expire
 
 
 def reap(colab, repo: Path, now_dt: datetime | None = None) -> dict:
-    """Hook duty: reap every profile's lease record. The top-level
-    action/fields are the default profile's per-record result — or the
-    sole record's, in a one-lease world — so the hook's existing
-    parsing (kept/none/released-deadline/cleared-dead for the default
-    profile) keeps its meaning; every record's outcome is also listed
-    under "records". With several non-default records and no default,
-    the most consequential outcome wins the top level."""
+    """Hook duty: reap every lease record. The top-level
+    action/fields are the most consequential per-record result —
+    or the sole record's, in a one-lease world — so the hook's
+    parsing (kept/none/released-deadline/cleared-dead) keeps its
+    meaning; every record's outcome is also listed under
+    "records"."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     recs = all_records(repo)
@@ -1974,32 +2116,30 @@ def reap(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         # record's first saves and the capture save are seconds
         # apart (keepalive + pulse run between them), and a
         # concurrent writer holding a pre-capture copy (a keepwarm
-        # pulse, a reap save) restores a hostless record; the
-        # adopt-foreign workload2 lease ran exactly that race and the
-        # reaper's approval gate stayed blind to its host for hours
-        # while the acquire output reported the capture fine.
+        # pulse, a reap save) restores a hostless record; an
+        # adopted lease ran exactly that race and the reaper's
+        # approval gate stayed blind to its host for hours while
+        # the acquire output reported the capture fine.
         # Re-derive the host from the local binding every pass: a
         # fill is silent (the birth event already spooled), a real
         # change spools as origin "reconcile".
         if _capture_session_host(repo, rec, "reconcile", spool_on_first=False):
             save_record(repo, rec)
-    results = [{"profile": rec.get("profile"), **_reap_record(colab, repo, cfg, rec, grant, now_dt)} for rec in recs]
-    top = next((r for r in results if r["profile"] == default_profile(repo)), None)
-    if top is None and len(results) == 1:
-        top = results[0]
+    results = [{"session": rec.get("session"), **_reap_record(colab, repo, cfg, rec, grant, now_dt)} for rec in recs]
+    top = results[0] if len(results) == 1 else None
     if top is None:
         for action in _REAP_PRIORITY:
             top = next((r for r in results if r["action"] == action), None)
             if top is not None:
                 break
-    out = {k: v for k, v in top.items() if k != "profile"}
+    out = dict(top)
     out["records"] = results
     out["unattributed"] = unattributed
     return out
 
 
-def status(colab, repo: Path, profile: str | None = None) -> dict:
-    rec = load_record(repo, profile) if profile is not None else load_record(repo)
+def status(colab, repo: Path, session: str | None = None) -> dict:
+    rec = load_record(repo, session)
     if not rec:
         return {"action": "no-lease"}
     out = {"action": "active" if session_alive(colab, rec["session"]) else "recorded-but-dead", "record": rec}
@@ -2022,24 +2162,38 @@ def grant_active(grant: dict | None, now_dt: datetime) -> bool:
     return grant is not None and now_dt < parse_dt(grant["until"])
 
 
-def grant_scope(cfg: dict, lobby_profile: str, burst_profile: str) -> dict:
+def grant_scope(cfg: dict, standing: str, burst: str) -> dict:
     """The scope a grant sanctions (two-tier envelope plan): the
-    profiles it covers and a snapshot of the budget caps in force at
+    shapes it covers and a snapshot of the budget caps in force at
     grant time, in the shape state serves caps in. The snapshot is
     the authorization the operator's tap granted — later config
     edits move future grants and ordinary leases, never this one."""
-    profiles = [lobby_profile] if lobby_profile == burst_profile else [lobby_profile, burst_profile]
-    return {"caps": _served_caps(cfg), "lobby_profile": lobby_profile, "burst_profile": burst_profile, "profiles": profiles}
+    shapes = [standing] if standing == burst else [standing, burst]
+    return {"caps": _served_caps(cfg), "standing_shape": standing, "burst_shape": burst, "shapes": shapes}
 
 
-def grant_profiles(grant: dict) -> list:
-    """The profiles inside a grant's scope. Grants written before
-    the envelope carried no scope block; their sanctioned profiles
-    are the grant's own lobby/burst fields."""
+def grant_shapes(repo: Path, grant: dict) -> list:
+    """The shapes inside a grant's scope. A grant written before
+    the retirement carried no shapes list; its sanctioned shapes
+    are derived from the profile ids its scope named, through the
+    legacy catalog."""
     scope = grant.get("scope")
-    if isinstance(scope, dict) and isinstance(scope.get("profiles"), list) and scope["profiles"]:
-        return list(scope["profiles"])
-    return [p for p in (grant.get("lobby_profile"), grant.get("burst_profile")) if p]
+    if isinstance(scope, dict) and isinstance(scope.get("shapes"), list) and scope["shapes"]:
+        return list(scope["shapes"])
+    out = []
+    candidates = []
+    if isinstance(scope, dict):
+        candidates = [scope.get("lobby_profile"), scope.get("burst_profile")]
+    candidates += [grant.get("lobby_profile"), grant.get("burst_profile")]
+    for pid in candidates:
+        if not pid:
+            continue
+        entry = _legacy_profile_entry(repo, pid)
+        if entry is not None:
+            sid = shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
+            if sid not in out:
+                out.append(sid)
+    return out
 
 
 def grant_caps(grant: dict) -> dict | None:
@@ -2056,28 +2210,28 @@ def active_grant(repo: Path, now_dt: datetime) -> dict | None:
     return grant if grant_active(grant, now_dt) else None
 
 
-def profile_in_grant(grant: dict | None, profile_name: str) -> bool:
-    return grant is not None and profile_name in grant_profiles(grant)
+def shape_in_grant(repo: Path, grant: dict | None, shape_id: str | None) -> bool:
+    return grant is not None and shape_id is not None and shape_id in grant_shapes(repo, grant)
 
 
-def write_grant(repo: Path, hours: float, burst_profile: str | None = None, now_dt: datetime | None = None) -> dict:
+def write_grant(repo: Path, hours: float, burst_shape: str | None = None, now_dt: datetime | None = None) -> dict:
     """Record a two-tier grant: for the next `hours`, the standing duty
-    keeps the lobby tier up alongside the burst tier. The burst is the
-    default profile unless --burst names another catalog profile. The
+    keeps the standing tier up alongside the burst tier. The burst is
+    the default shape unless --burst names another catalog shape. The
     grant is an authorization envelope: its `granted_at` is its id and
-    its `scope` snapshots the profiles and budget caps the grant tap
+    its `scope` snapshots the shapes and budget caps the grant tap
     sanctioned."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
-    lobby_profile = cfg.get("standing", {}).get("profile", "lobby")
-    burst = burst_profile or default_profile(repo)
+    standing = standing_shape(repo)
+    burst = burst_shape or default_shape(repo) or standing
     grant = {
         "kind": "two-tier",
         "granted_at": now_dt.isoformat(),
         "until": (now_dt + timedelta(hours=float(hours))).isoformat(),
-        "lobby_profile": lobby_profile,
-        "burst_profile": burst,
-        "scope": grant_scope(cfg, lobby_profile, burst),
+        "standing_shape": standing,
+        "burst_shape": burst,
+        "scope": grant_scope(cfg, standing, burst),
     }
     p = grant_path(repo)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -2094,51 +2248,85 @@ def clear_grant(repo: Path) -> None:
 
 
 def ungrant(colab, repo: Path) -> dict:
-    """Remove the grant and release the lobby lease it sanctioned."""
-    grant = load_grant(repo)
-    lobby_profile = (grant or {}).get("lobby_profile") or load_config(repo).get("standing", {}).get("profile", "lobby")
+    """Remove the grant and release the standing lease it sanctioned."""
     clear_grant(repo)
-    rel = release(colab, repo, reason="ungrant", profile=lobby_profile)
-    return {"action": "ungranted", "lobby": rel}
+    rec = standing_record(repo)
+    if rec is None:
+        return {"action": "ungranted", "standing": {"action": "no-lease"}}
+    rel = release(colab, repo, reason="ungrant", session=rec["session"])
+    return {"action": "ungranted", "standing": rel}
+
+
+def standing_record(repo: Path) -> dict | None:
+    """The standing duty's lease record: stamped standing:true at
+    creation; identified by its caller for a record the duty wrote
+    before caller stamps existed. The standing duty holds one
+    lease; when flag and caller disagree, the flag wins."""
+    recs = all_records(repo)
+    for rec in recs:
+        if rec.get("standing"):
+            return rec
+    caller = standing_caller(repo)
+    for rec in recs:
+        if rec.get("caller") == caller:
+            return rec
+    # Legacy tier: a record written before the standing flag and
+    # caller stamps existed is identified by its file's own legacy
+    # profile id matching the config's legacy standing profile —
+    # read from the data, never from a hardcoded name.
+    legacy_id = load_config(repo).get("standing", {}).get("profile")
+    if legacy_id:
+        for path in _record_files(repo):
+            raw = _valid_record(load_json(path, None))
+            if raw is not None and raw.get("profile") == legacy_id:
+                match = next((r for r in recs if r.get("session") == raw.get("session")), None)
+                if match is not None:
+                    return match
+    return None
 
 
 def standing_duty(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     """Hook duty for the two-tier grant. While a grant is active, keep
-    the lobby (standing) lease live: acquire it when absent or dead,
-    with a session deadline of min(grant end, now + standing
+    the standing lease live: acquire it when absent or dead, with a
+    session deadline of min(grant end, now + standing
     .max_session_hours); a created standing lease is marked
     "standing": true on its record, plus "warm": "pending" when
     standing.warm_on_renew is set (the warm run itself is a later
-    step). When the grant has expired, release the lobby if it is a
-    standing lease, clear the grant, and report standing-expired.
-    With no grant on file the duty is inert — an orphaned standing
-    record is the reaper's to enforce."""
+    step). When the grant has expired, release the standing lease,
+    clear the grant, and report standing-expired. With no grant on
+    file the duty is inert — an orphaned standing record is the
+    reaper's to enforce."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     standing_cfg = cfg.get("standing", {})
-    lobby_profile = standing_cfg.get("profile", "lobby")
     grant = load_grant(repo)
     if grant is None:
         return {"action": "no-grant"}
-    rec = load_record(repo, lobby_profile)
+    rec = standing_record(repo)
     if not grant_active(grant, now_dt):
-        out: dict = {"action": "standing-expired", "lobby": {"action": "no-lease"}}
+        out: dict = {"action": "standing-expired", "standing": {"action": "no-lease"}}
         if rec is not None and rec.get("standing"):
-            out["lobby"] = release(colab, repo, reason="grant-expired", profile=lobby_profile)
+            out["standing"] = release(colab, repo, reason="grant-expired", session=rec["session"])
         elif rec is not None:
-            out["lobby"] = {"action": "not-standing", "session": rec["session"]}
+            out["standing"] = {"action": "not-standing", "session": rec["session"]}
         clear_grant(repo)
         return out
-    if rec is not None:
-        if not rec.get("standing"):
-            # A manually acquired lobby lease already satisfies "up";
-            # it is not adopted into standing semantics.
-            return {"action": "satisfied-live", "session": rec["session"], "standing": False}
+    shape_id = standing_shape(repo)
+    if rec is None:
+        # A live lease at the standing shape held by another caller
+        # already satisfies "up"; it is not adopted into standing
+        # semantics (the pre-retirement single-slot behaviour, kept
+        # for the standing shape only).
+        others = [r for r in all_records(repo) if r.get("shape") == shape_id]
+        other = max(others, key=lambda r: r.get("deadline") or "", default=None)
+        if other is not None and now_dt < parse_dt(other["deadline"]) and session_alive(colab, other["session"]):
+            return {"action": "satisfied-live", "session": other["session"], "standing": False}
+    if rec is not None and rec.get("standing"):
         if now_dt < parse_dt(rec["deadline"]) and session_alive(colab, rec["session"]):
             return {"action": "standing-kept", "session": rec["session"], "deadline": rec["deadline"], "grant_until": grant["until"]}
     max_session_hours = float(standing_cfg.get("max_session_hours", 12))
     remaining_hours = (parse_dt(grant["until"]) - now_dt).total_seconds() / 3600.0
-    result = acquire(colab, repo, lobby_profile, now_dt=now_dt, hours=min(remaining_hours, max_session_hours), max_hours_cap=max_session_hours, via="standing")
+    result = acquire(colab, repo, shape_id, now_dt=now_dt, hours=min(remaining_hours, max_session_hours), max_hours_cap=max_session_hours, via=GATE_DEFAULT_INFRA_ACTOR, caller=standing_caller(repo), standing=True)
     action = result.get("action")
     if action == "created":
         new_rec = result["record"]
@@ -2155,40 +2343,26 @@ def standing_duty(colab, repo: Path, now_dt: datetime | None = None) -> dict:
 
 
 def specs(repo: Path, colab=None) -> list[dict]:
-    """The spec catalog for the UI's picker: every profile with the
-    fields the UI renders (identity, label, session, shape, rate,
-    timeout). The UI serves costs from this list only. The label is
-    the display name from the catalog (a profile id is an internal
-    name; the UI shows labels); a profile without one falls back to
-    its id."""
-    toggles = parallel_toggles(repo)
+    """The shape catalog for the UI's picker: every shape with the
+    fields the UI renders (identity, label, descriptor, rate). The
+    UI serves costs from this list only. The label is the display
+    name from the catalog (a shape id is an internal name; the UI
+    shows labels); a shape without one falls back to its id."""
     gate = session_gate_policy(repo)
     out = []
-    for profile_id, profile in catalog_profiles(repo, colab).items():
-        entry = {
-            "id": profile_id,
-            "label": profile.get("label") or profile_id,
-            "session": profile.get("session"),
-            "gpu": profile.get("gpu"),
-            "tpu": profile.get("tpu"),
-            "high_mem": bool(profile.get("high_mem", False)),
-            "rate_cu_per_hour": profile.get("rate_cu_per_hour"),
-            "timeout": profile.get("timeout"),
+    for shape_id, entry in catalog_shapes(repo, colab).items():
+        out.append({
+            "id": shape_id,
+            "label": entry.get("label") or shape_id,
+            "gpu": entry.get("gpu"),
+            "tpu": entry.get("tpu"),
+            "high_mem": bool(entry.get("high_mem", False)),
+            "rate_cu_per_hour": entry.get("rate_cu_per_hour"),
             # Session shape gate, served ready: whether an agent
-            # actor may start this profile (the panel itself is a
+            # actor may start this shape (the panel itself is a
             # bypass actor and can start any of them).
-            "agent_startable": not gate["enabled"] or shape_class(profile) in gate["agent_classes"],
-        }
-        # The parallel block is served ready (eligibility, toggle
-        # state, instance id): the UI renders it and decides nothing.
-        # An instance spec names its base and is itself ineligible —
-        # one extra instance per profile.
-        base = profile.get("parallel_of")
-        if base:
-            entry["parallel"] = {"eligible": False, "enabled": True, "instance": None, "parallel_of": base}
-        else:
-            entry["parallel"] = {"eligible": parallel_eligible(profile), "enabled": bool(toggles.get(profile_id)), "instance": instance_profile_id(profile_id)}
-        out.append(entry)
+            "agent_startable": not gate["enabled"] or shape_class(entry) in gate["agent_classes"],
+        })
     return out
 
 
@@ -2206,11 +2380,10 @@ def budget_snapshot(colab, repo: Path) -> dict:
         spend = attributed_spend(repo)
         day_spent = spend["day_spent"]
         month_spent = spend["month_spent"]
-        # The standing profile's day spend from the same derivation
+        # The standing caller's day spend from the same derivation
         # the guard enforces against — the number served is the
         # number enforced.
-        standing_profile = cfg.get("standing", {}).get("profile")
-        standing_day_spent = spend["profiles"].get(standing_profile, {}).get("day_spent", 0.0) if standing_profile else 0.0
+        standing_day_spent = spend["callers"].get(standing_caller(repo), {}).get("day_spent", 0.0)
     return {
         "balance": balance,
         "day_spent": day_spent,
@@ -2222,7 +2395,7 @@ def budget_snapshot(colab, repo: Path) -> dict:
 
 def _served_caps(cfg: dict) -> dict:
     """The caps in the shape state serves: config's daily/monthly
-    budgets plus the standing profile's daily sub-cap."""
+    budgets plus the standing caller's daily sub-cap."""
     standing = cfg.get("standing")
     return {
         "daily": cfg.get("daily_cu_budget"),
@@ -2292,10 +2465,10 @@ def _envelope_block(colab, repo: Path, grant: dict | None, budget: dict) -> dict
     to it (envelope_id = the grant's granted_at), and spend versus
     the snapshot caps.
 
-    Spend: per-profile figures come from the attributed accounting
-    (segment journal + live records) — the profile's own burn in the
+    Spend: per-lease figures come from the attributed accounting
+    (segment journal + live records) — the lease's own burn in the
     period, shared between envelope and non-envelope work on that
-    profile rather than metered per envelope. The totals are the
+    lease rather than metered per envelope. The totals are the
     budget snapshot's own numbers, the same ones the guard enforces
     against."""
     if grant is None:
@@ -2305,20 +2478,23 @@ def _envelope_block(colab, repo: Path, grant: dict | None, budget: dict) -> dict
         # Pre-envelope grant: synthesize the view from the grant's
         # own fields; its caps are the live ones (no snapshot was
         # taken), which grant_caps reports as None.
-        scope = {"caps": _served_caps(load_config(repo)), "lobby_profile": grant.get("lobby_profile"), "burst_profile": grant.get("burst_profile"), "profiles": grant_profiles(grant)}
+        scope = {"caps": _served_caps(load_config(repo)), "standing_shape": standing_shape(repo), "shapes": grant_shapes(repo, grant)}
     caps = grant_caps(grant) or scope["caps"]
     attributed = [rec for rec in all_records(repo) if rec.get("envelope_id") == grant.get("granted_at")]
     balance = budget.get("balance")
     spend = attributed_spend(repo) if balance is not None else None
-    profile_spend = []
+    session_spend = []
     for rec in attributed:
-        if spend is None or _profile_rate(repo, rec["profile"]) is None:
+        rate = rec.get("rate_cu_per_hour")
+        if rate is None and rec.get("shape"):
+            rate = shape_rate(repo, rec["shape"])
+        if spend is None or rate is None:
             day = month = None
         else:
-            entry = spend["profiles"].get(rec["profile"], {})
+            entry = spend["sessions"].get(rec["session"], {})
             day = entry.get("day_spent", 0.0)
             month = entry.get("month_spent", 0.0)
-        profile_spend.append({"profile": rec["profile"], "day_spent": day, "month_spent": month})
+        session_spend.append({"session": rec["session"], "day_spent": day, "month_spent": month})
     return {
         "id": grant.get("granted_at"),
         "grant": grant,
@@ -2326,15 +2502,15 @@ def _envelope_block(colab, repo: Path, grant: dict | None, budget: dict) -> dict
         "caps": caps,
         "records": attributed,
         "spend": {"balance": balance, "day_spent": budget.get("day_spent"), "month_spent": budget.get("month_spent"), "standing_day_spent": budget.get("standing_day_spent")},
-        "profile_spend": profile_spend,
+        "session_spend": session_spend,
     }
 
 
-# --- The lobby bridge (plan: .plans/2026-11-01-lobby-bridge.md) --------------
+# --- The standing bridge (plan: .plans/2026-11-01-lobby-bridge.md) -------------
 #
-# The bridge is a command/output relay living in the standing lobby:
+# The bridge is a command/output relay living in the standing lease:
 # an in-VM agent (snippets/bridge_agent.py) executes queued command
-# files — OS commands in the lobby, or relayed into bridge-minted
+# files — OS commands in the standing lease, or relayed into bridge-minted
 # child sessions — and appends every outcome to a segmented log.
 # The lease core installs the beachhead under an active grant,
 # re-arms it when its heartbeat dies, ferries commands and the log
@@ -2373,8 +2549,8 @@ def _bridge_arm_path(repo: Path) -> Path:
 
 
 def _bridge_arm(repo: Path, rec: dict) -> dict:
-    """The arm record ties a bridge generation to one lobby session
-    lifetime: a recycled or renewed lobby (new session or new
+    """The arm record ties a bridge generation to one standing session
+    lifetime: a recycled or renewed standing lease (new session or new
     acquired_at) starts a new generation; an agent death inside the
     same session re-installs under the same generation, so the
     agent resumes its log segments and registry."""
@@ -2427,35 +2603,36 @@ def _ensure_remote_dirs(colab, repo: Path, session: str, dirs: list[str], tag: s
 
 
 def install_bridge_kit(colab, repo: Path, rec: dict, generation: str) -> dict:
-    """Install the bridge beachhead into the lobby (the renewal kit's
-    pattern): the agent snippet plus its guard, the bridge config
-    (session, generation, limits, the full spec catalog for mints),
-    and the account token, staged under /content/bridge-kit; the
-    snippet's --setup places the token, builds the CLI venv, and
-    spawns the agent. Bounded and non-raising: a failure is a result,
-    and the duty retries after its cooldown."""
+    """Install the bridge beachhead into the standing lease's session
+    (the renewal kit's pattern): the agent snippet plus its guard,
+    the bridge config (session, generation, limits, the full shape
+    catalog for mints), and the account token, staged under
+    /content/bridge-kit; the snippet's --setup places the token,
+    builds the CLI venv, and spawns the agent. Bounded and
+    non-raising: a failure is a result, and the duty retries after
+    its cooldown."""
     session = rec["session"]
     token_src = Path.home() / ".config" / "colab-cli" / "token.json"
     if not token_src.exists():
         return {"bridge_install": "install-failed", "stage": "token-missing"}
     cfg = load_config(repo)
-    profiles = {}
-    for name, prof in catalog_profiles(repo, colab).items():
-        profiles[name] = {"high_mem": bool(prof.get("high_mem")), "gpu": prof.get("gpu"), "tpu": prof.get("tpu"), "rate_cu_per_hour": prof.get("rate_cu_per_hour")}
+    shapes = {}
+    for sid, entry in catalog_shapes(repo, colab).items():
+        shapes[sid] = {"high_mem": bool(entry.get("high_mem")), "gpu": entry.get("gpu"), "tpu": entry.get("tpu"), "rate_cu_per_hour": entry.get("rate_cu_per_hour")}
     var = var_dir(repo)
     var.mkdir(parents=True, exist_ok=True)
     # Session shape gate: the bridge agent mints children in-VM,
-    # beyond the core's reach, so the install stamps the profiles
+    # beyond the core's reach, so the install stamps the shapes
     # an agent mint may create under the current policy; the agent
-    # refuses any other profile at mint time.
+    # refuses any other shape at mint time.
     gate = session_gate_policy(repo)
-    agent_allowed = sorted(name for name, prof in profiles.items() if not gate["enabled"] or shape_class(prof) in gate["agent_classes"])
+    agent_allowed = sorted(sid for sid, entry in shapes.items() if not gate["enabled"] or shape_class(entry) in gate["agent_classes"])
     cfg_local = var / "bridge-config.json"
     # Caller attribution: the bridge mints children in-VM under
-    # this install's authority, so the config stamps the lobby
+    # this install's authority, so the config stamps the standing
     # record's caller (the machinery caller when the record
     # predates attribution); child reports inherit it.
-    cfg_local.write_text(json.dumps({"session": session, "generation": generation, "limits": bridge_limits(cfg), "profiles": profiles, "agent_allowed_profiles": agent_allowed, "caller": rec.get("caller") or "lease"}, indent=2))
+    cfg_local.write_text(json.dumps({"session": session, "generation": generation, "limits": bridge_limits(cfg), "shapes": shapes, "agent_allowed_shapes": agent_allowed, "caller": rec.get("caller") or "lease"}, indent=2))
     if not _ensure_remote_dirs(colab, repo, session, [BRIDGE_KIT_REMOTE, f"{BRIDGE_REMOTE}/queue", f"{BRIDGE_REMOTE}/log", f"{BRIDGE_REMOTE}/results"], "bridge"):
         return {"bridge_install": "install-failed", "stage": "mkdir"}
     uploads = [
@@ -2491,15 +2668,25 @@ def install_bridge_kit(colab, repo: Path, rec: dict, generation: str) -> dict:
 def _bridge_fold_stop(repo: Path, line: dict, folded: set) -> bool:
     """Fold one completed bridge-child segment into the attributed
     spend journal, once per child stop line (the ferry's folded set
-    is the guard). The stop line carries profile + minted_at, which
-    is everything the journal's segment writer needs."""
-    if line.get("kind") != "stop" or not line.get("profile") or not line.get("minted_at") or not line.get("name"):
+    is the guard). The stop line carries its shape + minted_at,
+    which is everything the journal's segment writer needs; an
+    agent that predates the retirement names the child's shape by
+    its legacy profile id, translated through the legacy catalog —
+    a line naming neither folds nothing."""
+    if line.get("kind") != "stop" or not line.get("minted_at") or not line.get("name"):
+        return False
+    shape_id = line.get("shape")
+    if not shape_id and line.get("profile"):
+        entry = _legacy_profile_entry(repo, line["profile"])
+        if entry is not None:
+            shape_id = shape_id_for(entry.get("gpu"), entry.get("tpu"), bool(entry.get("high_mem")))
+    if not shape_id:
         return False
     key = f"{line.get('gen')}:{line.get('seq')}"
     if key in folded:
         return False
     folded.add(key)
-    rec = {"profile": line["profile"], "session": line["name"], "acquired_at": line["minted_at"]}
+    rec = {"session": line["name"], "shape": shape_id, "rate_cu_per_hour": shape_rate(repo, shape_id), "acquired_at": line["minted_at"]}
     if line.get("caller"):
         rec["caller"] = line["caller"]
     try:
@@ -2602,7 +2789,7 @@ def _bridge_ferry(colab, repo: Path, session: str, status: dict, now_dt: datetim
 
 def bridge_duty(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     """Hook duty (rides the standing pass): while a grant is active,
-    keep the bridge armed in the lobby — install or re-arm when the
+    keep the bridge armed in the standing lease — install or re-arm when the
     agent's heartbeat is missing or stale (cooldown-bounded), and
     run one ferry pass when it is live. Never raises: the bridge is
     an auxiliary surface and must not take the standing duty down."""
@@ -2614,10 +2801,9 @@ def bridge_duty(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         grant = active_grant(repo, now_dt)
         if grant is None:
             return {"bridge": "no-grant"}
-        lobby_profile = grant.get("lobby_profile") or cfg.get("standing", {}).get("profile", "lobby")
-        rec = load_record(repo, lobby_profile)
+        rec = standing_record(repo)
         if not rec:
-            return {"bridge": "no-lobby"}
+            return {"bridge": "no-standing"}
         session = rec["session"]
         arm = _bridge_arm(repo, rec)
         status = bridge_status_read(colab, repo, session)
@@ -2655,10 +2841,9 @@ def _bridge_block(colab, repo: Path) -> dict | None:
     if grant is None:
         return None
     cfg = load_config(repo)
-    lobby_profile = grant.get("lobby_profile") or cfg.get("standing", {}).get("profile", "lobby")
-    rec = load_record(repo, lobby_profile)
+    rec = standing_record(repo)
     if not rec:
-        return {"armed": False, "reason": "no-lobby"}
+        return {"armed": False, "reason": "no-standing"}
     status = bridge_status_read(colab, repo, rec["session"])
     if status is None:
         return {"armed": False, "reason": "no-status"}
@@ -2748,6 +2933,12 @@ def live_sessions(colab, repo: Path) -> list[dict] | None:
             m = re.match(r"\[([^\]]+)\]\s*(.*)$", line.strip())
             if not m or not m.group(1).strip():
                 continue
+            if m.group(1).strip() == "colab":
+                # The CLI prefixes its own chatter with [colab]
+                # (e.g. "[colab] No active sessions.") — that is
+                # not a session name, and reading it as one invents
+                # a phantom session on an empty account.
+                continue
             entry = {"session": m.group(1).strip(), "endpoint": None, "shape_class": None}
             rest = m.group(2)
             for tok in rest.split():
@@ -2804,7 +2995,7 @@ def clear_unattributed(repo: Path, session: str) -> None:
 def access_list(colab, repo: Path) -> list[dict]:
     """Every live session with its attribution, served ready for
     the panel: record-backed sessions carry their record's caller
-    and acquired_at and their profile's declared shape class;
+    and acquired_at and their shape's declared shape class;
     claim-only sessions carry the latest claim and its time; the
     rest are unattributed (caller None, first_seen from the
     detection stamp). An unreadable live list serves an empty
@@ -2815,14 +3006,14 @@ def access_list(colab, repo: Path) -> list[dict]:
     records = {rec.get("session"): rec for rec in all_records(repo)}
     claims = load_caller_claims(repo)
     stamps = load_unattributed(repo)
-    profiles = catalog_profiles(repo)
+    shapes = catalog_shapes(repo)
     out = []
     for entry in live:
         name = entry["session"]
         rec = records.get(name)
         if rec is not None:
-            profile = profiles.get(rec.get("profile")) or {}
-            out.append({"session": name, "endpoint": entry["endpoint"], "shape_class": entry["shape_class"] or shape_class(profile), "caller": rec.get("caller"), "first_seen": rec.get("acquired_at")})
+            shape = shapes.get(rec.get("shape")) or {}
+            out.append({"session": name, "endpoint": entry["endpoint"], "shape_class": entry["shape_class"] or shape_class(shape), "caller": rec.get("caller"), "first_seen": rec.get("acquired_at")})
             continue
         claim = claims.get(name)
         if claim is not None:
@@ -2838,7 +3029,7 @@ def release_session(colab, repo: Path, session: str) -> dict:
     unattributed session) and clear its detection stamp. The stop
     goes through stop_session_safe — the server-verified stop —
     never a raw stop. A session with a lease record is refused
-    here: records release per profile through release(), which
+    here: records release per session through release(), which
     owns the record lifecycle and the spend fold."""
     if any(rec.get("session") == session for rec in all_records(repo)):
         return {"action": "session-has-record", "session": session}
@@ -2893,8 +3084,8 @@ def state_records(colab, repo: Path) -> dict:
     recs = all_records(repo)
 
     def entry(rec):
-        e = status(colab, repo, profile=rec["profile"])
-        e["profile"] = rec["profile"]
+        e = status(colab, repo, session=rec["session"])
+        e["session"] = rec["session"]
         e["warm"] = rec.get("warm")
         e["caller"] = rec.get("caller")
         return e
@@ -2963,7 +3154,7 @@ def request_path(repo: Path) -> Path:
     return var_dir(repo) / "lease-request.json"
 
 
-def write_request(repo: Path, reason: str = "", profile: str | None = None, now_dt: datetime | None = None, caller: str | None = None, via: str | None = None, not_before: datetime | str | None = None) -> dict:
+def write_request(repo: Path, reason: str = "", shape: str | None = None, now_dt: datetime | None = None, caller: str | None = None, via: str | None = None, not_before: datetime | str | None = None) -> dict:
     """Record a demand for a lease (var/lease-request.json). Any driver
     may write it (bin/colab-lease request); the auto-acquire duty is the
     only consumer. `caller` is the requester: auto_acquire copies it
@@ -2978,17 +3169,17 @@ def write_request(repo: Path, reason: str = "", profile: str | None = None, now_
     if caller is None:
         caller = via
     # Session shape gate, early refusal: a demand whose requester
-    # is identified (a caller claim) and whose profile is catalogued
+    # is identified (a caller claim) and whose shape is catalogued
     # is checked now, so a refused demand never sits in the file for
     # the duty to retry. An unattributed demand (no caller) defers
     # to the consumption check in auto_acquire, which re-checks
     # before acquiring. The check is shape-only (creation=False):
     # a demand is an ask, never a creation.
-    if caller is not None and profile is not None and profile in catalog_profiles(repo):
-        refusal = enforce_session_admission(repo, profile, seam="request", caller=caller, creation=False)
+    if caller is not None and shape is not None and shape in catalog_shapes(repo):
+        refusal = enforce_session_admission(repo, shape, seam="request", caller=caller, creation=False)
         if refusal is not None:
             return refusal
-    req = {"requested_at": now_dt.isoformat(), "reason": reason, "profile": profile}
+    req = {"requested_at": now_dt.isoformat(), "reason": reason, "shape": shape}
     if caller:
         req["caller"] = caller
     if not_before is not None:
@@ -3020,12 +3211,17 @@ def auto_enabled(cfg: dict) -> bool:
 
 def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     """Hook duty, inert unless auto-acquire is enabled: when a driver
-    has left a demand request and no live lease exists, acquire one
-    through acquire() — the same budget guard, keepalive launch, and
-    kernel pulse as a manual acquire. The request is consumed when a
-    lease is live or newly created; it is kept when acquisition was
+    has left a demand request and no live lease satisfies it, acquire
+    one through acquire() — the same budget guard, keepalive launch,
+    and kernel pulse as a manual acquire. The request is consumed when
+    a lease is live or newly created; it is kept when acquisition was
     refused or failed, so a later poll retries. Makes no colab calls at
-    all while disabled or when there is no demand."""
+    all while disabled or when there is no demand.
+
+    A demand is satisfied by a live lease at its shape held by its
+    own caller (an unattributed demand, by any live lease at the
+    shape): leases are per-caller, so another caller's lease at the
+    same shape never silently satisfies this caller's ask."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = load_config(repo)
     if not auto_enabled(cfg):
@@ -3043,12 +3239,14 @@ def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
             # A timed start that has not come due: the request is
             # neither consumed nor failed — it simply waits for a
             # later poll. No colab calls happen on this path.
-            return {"action": "not-due", "not_before": not_before, "profile": req.get("profile")}
-    profiles = catalog_profiles(repo, colab)
-    profile_name = req.get("profile") or default_profile(repo)
-    if profile_name not in profiles:
-        return {"action": "auto-failed", "error": f"unknown profile {profile_name!r}"}
-    rec = load_record(repo, profile_name)
+            return {"action": "not-due", "not_before": not_before, "shape": req.get("shape")}
+    shapes = catalog_shapes(repo, colab)
+    shape_id = req.get("shape") or default_shape(repo)
+    if shape_id not in shapes:
+        return {"action": "auto-failed", "error": f"unknown shape {shape_id!r}"}
+    demand_caller = req.get("caller") or req.get("via")
+    candidates = [r for r in all_records(repo) if r.get("shape") == shape_id and (demand_caller is None or r.get("caller") == demand_caller)]
+    rec = max(candidates, key=lambda r: r.get("deadline") or "", default=None)
     if rec:
         state = session_state(colab, rec["session"])
         if state == "alive":
@@ -3057,14 +3255,13 @@ def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         if state == "unknown":
             return {"action": "skipped-unknown", "session": rec["session"]}
         append_spend_segment(repo, rec, now_dt or datetime.now(timezone.utc))
-        save_record(repo, None, profile=profile_name)  # confirmed dead: clear before acquiring
+        delete_record(repo, rec["session"])  # confirmed dead: clear before acquiring
     # The duty creates on the demand: the demand's caller becomes
     # the lease's caller (a pre-attribution demand's via tag reads
     # as the same claim), and the duty marker carries the creation
     # past the agent creation denial — the shape check inside
     # acquire still applies in full.
-    demand_caller = req.get("caller") or req.get("via")
-    result = acquire(colab, repo, profile_name, now_dt=now_dt, caller=demand_caller, duty=True)
+    result = acquire(colab, repo, shape_id, now_dt=now_dt, caller=demand_caller, duty=True)
     action = result.get("action")
     if action == "created":
         clear_request(repo)
@@ -3079,10 +3276,12 @@ def auto_acquire(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         # refusal itself is journaled at the acquire seam; this
         # entry records the demand's disposition.
         clear_request(repo)
-        append_gate_journal(repo, {"kind": "demand-shape-refused", "seam": "auto", "profile": profile_name, "via": req.get("via"), "caller": demand_caller, "shape_class": result.get("shape_class")})
-        return {"action": "skipped-shape", "profile": profile_name, "shape_class": result.get("shape_class")}
+        append_gate_journal(repo, {"kind": "demand-shape-refused", "seam": "auto", "shape": shape_id, "via": req.get("via"), "caller": demand_caller, "shape_class": result.get("shape_class")})
+        return {"action": "skipped-shape", "shape": shape_id, "shape_class": result.get("shape_class")}
     if action == "refused-budget":
         return {"action": "skipped-budget", "budget": result.get("budget")}
     if action == "acquire-unknown":
         return {"action": "skipped-unknown", "session": result.get("session")}
     return {"action": "auto-failed", "error": result.get("error", action)}
+
+

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Bridge agent: the in-VM half of the lobby bridge
+"""Bridge agent: the in-VM half of the standing bridge
 (.plans/2026-11-01-lobby-bridge.md). Installed into the standing
-lobby by the lease core (sync/lease.py's install_bridge_kit)
+lease by the lease core (sync/lease.py's install_bridge_kit)
 alongside _remote_guard.py, the bridge config, and the account
 token. Two modes:
 
@@ -18,7 +18,7 @@ token. Two modes:
             on the same cadence the lease core reads it by.
 
 Protocol (v1): a command file queue/<id>.json is
-{"v": 1, "id": ..., "verb": "run"|"mint"|"stop"|"ping", ...,
+{"v": 2, "id": ..., "verb": "run"|"mint"|"stop"|"ping", ...,
 "sha256": <hash>} where the hash is SHA-256 over the canonical
 JSON of every other field — a partially planted file never
 executes. An id executes at most once per bridge generation
@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROTOCOL = 1
+PROTOCOL = 2
 KIT = Path("/content/bridge-kit")
 ROOT = Path("/content/bridge")
 QUEUE = ROOT / "queue"
@@ -102,8 +102,8 @@ def validate_command(obj) -> tuple[dict | None, str | None]:
             return None, "missing-cmd"
         if not isinstance(obj.get("target"), str) or not obj["target"]:
             return None, "missing-target"
-    if obj["verb"] == "mint" and not isinstance(obj.get("profile"), str):
-        return None, "missing-profile"
+    if obj["verb"] == "mint" and not isinstance(obj.get("shape"), str):
+        return None, "missing-shape"
     if obj["verb"] == "stop" and not isinstance(obj.get("name"), str):
         return None, "missing-name"
     return obj, None
@@ -349,25 +349,25 @@ class Agent:
         self.child_idle_s = float(limits.get("child_idle_minutes", 30)) * 60
         self.child_max_s = float(limits.get("child_max_hours", 4)) * 3600
         self.default_timeout = float(limits.get("command_timeout_seconds", 300))
-        self.profiles = cfg.get("profiles", {})
+        self.shapes = cfg.get("shapes", {})
         # Caller attribution: the caller this bridge installation
         # acts for, stamped into the config at kit install from the
-        # lobby record; child entries and stop lines inherit it, so
+        # standing record; child entries and stop lines inherit it, so
         # bridge-minted spend attributes like any lease record.
         # Absent in pre-attribution configs.
         self.caller = cfg.get("caller")
-        # Session shape gate: the profiles an agent-driven mint may
+        # Session shape gate: the shapes an agent-driven mint may
         # create, stamped into this config at kit install. A config
         # without the stamp (a bridge armed before the gate) derives
         # the same set from the snapshot's own shapes, restating the
         # core's classifier: gpu/tpu are their own classes, high_mem
         # is high-RAM, the rest standard — and only high-RAM is
         # agent-allowed.
-        stamped = cfg.get("agent_allowed_profiles")
+        stamped = cfg.get("agent_allowed_shapes")
         if isinstance(stamped, list):
             self.mint_allowed = {str(n) for n in stamped}
         else:
-            self.mint_allowed = {name for name, p in self.profiles.items() if not p.get("gpu") and not p.get("tpu") and p.get("high_mem")}
+            self.mint_allowed = {name for name, p in self.shapes.items() if not p.get("gpu") and not p.get("tpu") and p.get("high_mem")}
         for d in (QUEUE, LOGDIR, RESULTS):
             d.mkdir(parents=True, exist_ok=True)
         self.log = BridgeLog(LOGDIR, self.generation)
@@ -517,17 +517,17 @@ class Agent:
         sessions = self._sessions()
         if sessions is not None and child not in sessions:
             info = self.registry.remove_child(child)
-            self.log.write({"kind": "child-gone", "name": child, "profile": (info or {}).get("profile")})
+            self.log.write({"kind": "child-gone", "name": child, "shape": (info or {}).get("shape")})
             return {"rc": None, "error": "child-gone", "seconds": seconds}
         return {"rc": None, "error": "no-verdict", "relay_rc": res.returncode, "seconds": seconds}
 
     def do_mint(self, cmd: dict) -> None:
-        profile = self.profiles.get(cmd["profile"])
-        if profile is None:
-            self._error_line(cmd, "unknown-profile")
+        shape = self.shapes.get(cmd["shape"])
+        if shape is None:
+            self._error_line(cmd, "unknown-shape")
             return
-        if cmd["profile"] not in self.mint_allowed:
-            self._error_line(cmd, "shape-refused", profile=cmd["profile"])
+        if cmd["shape"] not in self.mint_allowed:
+            self._error_line(cmd, "shape-refused", shape=cmd["shape"])
             return
         if self.auth_down:
             self._error_line(cmd, "auth-failed")
@@ -535,7 +535,7 @@ class Agent:
         if len(self.registry.children) >= self.max_children:
             self._error_line(cmd, "bridge-cap", cap=self.max_children)
             return
-        name = cmd.get("name") or f"bridge-{cmd['profile']}-{cmd['id'][:6]}"
+        name = cmd.get("name") or f"bridge-{cmd['shape']}-{cmd['id'][:6]}"
         if not name.startswith("bridge-") or not all(c.isalnum() or c in "-_" for c in name):
             self._error_line(cmd, "bad-name")
             return
@@ -543,12 +543,12 @@ class Agent:
             self._error_line(cmd, "name-taken")
             return
         args = ["new", "-s", name]
-        if profile.get("high_mem"):
+        if shape.get("high_mem"):
             args.append("--high-mem")
-        if profile.get("gpu"):
-            args += ["--gpu", str(profile["gpu"])]
-        if profile.get("tpu"):
-            args += ["--tpu", str(profile["tpu"])]
+        if shape.get("gpu"):
+            args += ["--gpu", str(shape["gpu"])]
+        if shape.get("tpu"):
+            args += ["--tpu", str(shape["tpu"])]
         t0 = time.monotonic()
         res = self._cli(*args, timeout=600)
         if res is None or (res.returncode != 0 and "already" not in ((res.stdout or "") + (res.stderr or ""))):
@@ -557,9 +557,9 @@ class Agent:
             else:
                 self._error_line(cmd, "mint-failed")
             return
-        info = {"profile": cmd["profile"], "rate": profile.get("rate_cu_per_hour"), "minted_at": now_iso(), "last_used_at": now_iso(), "caller": self.caller}
+        info = {"shape": cmd["shape"], "rate": shape.get("rate_cu_per_hour"), "minted_at": now_iso(), "last_used_at": now_iso(), "caller": self.caller}
         self.registry.add_child(name, info)
-        line = self.log.write({"kind": "mint", "id": cmd["id"], "name": name, "profile": cmd["profile"], "rate": info["rate"], "seconds": round(time.monotonic() - t0, 1)})
+        line = self.log.write({"kind": "mint", "id": cmd["id"], "name": name, "shape": cmd["shape"], "rate": info["rate"], "seconds": round(time.monotonic() - t0, 1)})
         self.registry.mark_processed(cmd["id"], line["seq"])
 
     def _stop_child(self, name: str, reason: str, cmd_id: str | None = None) -> bool:
@@ -571,7 +571,7 @@ class Agent:
             if sessions is None or name in sessions:
                 return False
         info = self.registry.remove_child(name) or {}
-        line = {"kind": "stop", "name": name, "profile": info.get("profile"), "rate": info.get("rate"), "minted_at": info.get("minted_at"), "reason": reason, "caller": info.get("caller")}
+        line = {"kind": "stop", "name": name, "shape": info.get("shape"), "rate": info.get("rate"), "minted_at": info.get("minted_at"), "reason": reason, "caller": info.get("caller")}
         if cmd_id:
             line["id"] = cmd_id
         written = self.log.write(line)
@@ -667,7 +667,7 @@ class Agent:
                     sessions = self._sessions()
                     if sessions is not None and name not in sessions:
                         gone = self.registry.remove_child(name)
-                        self.log.write({"kind": "child-gone", "name": name, "profile": (gone or {}).get("profile")})
+                        self.log.write({"kind": "child-gone", "name": name, "shape": (gone or {}).get("shape")})
 
     def _reap_children(self) -> None:
         now = now_ts()
@@ -691,7 +691,7 @@ class Agent:
                 idle = round(now - datetime.fromisoformat(info["last_used_at"]).timestamp())
             except (KeyError, ValueError):
                 age = idle = None
-            children.append({"name": name, "profile": info.get("profile"), "age_s": age, "idle_s": idle, "caller": info.get("caller")})
+            children.append({"name": name, "shape": info.get("shape"), "age_s": age, "idle_s": idle, "caller": info.get("caller")})
         status = {"v": PROTOCOL, "gen": self.generation, "ts": now_iso(), "session": self.session, "auth_down": self.auth_down, "children": children, "processed": len(self.registry.processed), "queue": queue_depth, "log_segment": self.log.path.name}
         try:
             tmp = STATUS_FILE.with_name(STATUS_FILE.name + ".tmp")

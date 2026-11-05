@@ -177,7 +177,7 @@ def orphan_sweep() -> list[dict]:
     live = colab("sessions", timeout=120).stdout if TOKEN.exists() or os.environ.get("COLAB_BIN") else ""
     for f in sorted(RUNS.glob("*.json")):
         rec = json.loads(f.read_text())
-        if rec["state"] in ("running", "polling") and rec["session"] not in live:
+        if rec["state"] in ("running", "polling") and rec.get("session") not in live:
             rec["state"] = "orphaned"
             rec["orphan_noted_at"] = now()
             save_record(rec)
@@ -216,18 +216,17 @@ def main() -> int:
     for f in findings:
         print(f"orphan sweep: {f['run_id']} ({f['job']}) — {f['action']}")
 
-    profiles_cfg = json.loads((REPO / "config" / "profiles.json").read_text())
-    # A manifest may name its profile; otherwise the config's
-    # default_profile is the only fallback — no workload name is
-    # hardcoded here.
-    profile_name = job.get("profile") or profiles_cfg.get("default_profile")
-    if not profile_name or profile_name not in profiles_cfg["profiles"]:
-        print(f"colab-run: job {job_name} names no usable profile (manifest profile or config default_profile required)", file=sys.stderr)
+    # A manifest may name its shape; otherwise the config's
+    # default_shape is the only fallback — no shape is hardcoded
+    # here, and an unresolvable shape fails loudly.
+    shape_id = job.get("shape") or lease.default_shape(REPO)
+    shapes = lease.catalog_shapes(REPO, colab)
+    if not shape_id or shape_id not in shapes:
+        print(f"colab-run: job {job_name} names no usable shape (manifest shape or config default_shape required)", file=sys.stderr)
         return 2
-    profile = profiles_cfg["profiles"][profile_name]
-    session = profile["session"]
+    shape = shapes[shape_id]
     run_id = resume or f"{job_name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    rec = {"run_id": run_id, "job": job_name, "session": session, "state": "starting", "started_at": now(), "resumed": bool(resume)}
+    rec = {"run_id": run_id, "job": job_name, "shape": shape_id, "state": "starting", "started_at": now(), "resumed": bool(resume)}
     if caller:
         rec["caller"] = caller
     save_record(rec)
@@ -236,22 +235,29 @@ def main() -> int:
     # leave it up at the end; the reaper owns its lifecycle. With the lease
     # disabled in config, fall back to the original per-job session.
     use_lease = bool(lease.load_config(REPO).get("enabled"))
+    session = run_id  # the lease-disabled fallback's per-run session
     if use_lease:
-        got = lease.acquire(colab, REPO, profile_name, via="runner", caller=caller)
-        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused"):
+        got = lease.acquire(colab, REPO, shape_id, via="runner", caller=caller)
+        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused", "unknown-shape"):
             rec.update(state="failed", error=json.dumps(got)[:300])
             save_record(rec)
             print(json.dumps({"run_id": run_id, "state": "failed", "lease": got}, indent=2))
             return 1
         rec["lease_action"] = got["action"]
+        # The lease's session is whatever the acquire created or
+        # adopted — a generated name, never a configured one.
+        session = got["record"]["session"]
+        rec["session"] = session
         lease.touch_job(REPO, run_id)
         save_record(rec)
     if not use_lease:
+        rec["session"] = session
+        save_record(rec)
         # Session shape gate for the fallback's own `new` below (the
         # lease path is gated inside acquire): a job run is an agent
         # actor unless the env claim says otherwise. A refusal fails
         # the run before any session is created.
-        refusal = lease.enforce_session_admission(REPO, profile_name, via="runner", profile=profile, seam="runner", caller=caller)
+        refusal = lease.enforce_session_admission(REPO, shape_id, via="runner", shape=shape, seam="runner", caller=caller)
         if refusal is not None:
             rec.update(state="failed", error=json.dumps(refusal)[:300])
             save_record(rec)
@@ -259,7 +265,7 @@ def main() -> int:
             return 1
     try:
         if not use_lease:
-            new_args = ["new", "-s", session] + (["--high-mem"] if profile.get("high_mem") else []) + (["--gpu", profile["gpu"]] if profile.get("gpu") else [])
+            new_args = ["new", "-s", session] + lease._session_shape_args(shape)
             r = colab(*new_args, timeout=600)
             if r.returncode != 0 and "already" not in (r.stdout + r.stderr):
                 rec.update(state="failed", error=(r.stderr or r.stdout).strip()[-300:])

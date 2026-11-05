@@ -1,4 +1,4 @@
-"""Lobby bridge core behaviour (plan: .plans/2026-11-01-lobby-bridge.md):
+"""Standing bridge core behaviour (plan: .plans/2026-11-01-lobby-bridge.md):
 the shared command builder validates under the agent's own rules,
 the duty installs under a grant and cools down, and an armed pass
 ferries the log (mirror, outbox acknowledgement, re-plant) and
@@ -103,7 +103,7 @@ def test_duty_installs_then_cools_down(tmp_path, monkeypatch):
     assert len([c for c in fake.calls if c[0] == "upload"]) == uploads
 
 
-def test_install_stamps_agent_allowed_profiles(tmp_path, monkeypatch):
+def test_install_stamps_agent_allowed_shapes(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     (tmp_path / ".config" / "colab-cli").mkdir(parents=True)
@@ -113,8 +113,9 @@ def test_install_stamps_agent_allowed_profiles(tmp_path, monkeypatch):
     out = lease.bridge_duty(Fake(), repo, NOW)
     assert out["bridge_install"] == "installed"
     cfg = json.loads((repo / "var" / "bridge-config.json").read_text())
-    # Session shape gate: only the High-RAM profile is agent-mintable.
-    assert cfg["agent_allowed_profiles"] == ["workload"]
+    # Session shape gate: only the High-RAM shape is agent-mintable.
+    assert cfg["agent_allowed_shapes"] == ["cpu-highram"]
+    assert cfg["shapes"]["cpu-highram"]["rate_cu_per_hour"] == 0.26
 
 
 def armed_setup(tmp_path):
@@ -150,7 +151,10 @@ def test_duty_armed_ferries_acks_and_folds(tmp_path):
     assert (outbox / "u1.json").exists()
     assert fake.remote["/content/bridge/queue/u1.json"] == b"{}"
     journal = [json.loads(x) for x in (repo / "var" / "lease-spend-journal.jsonl").read_text().splitlines()]
-    assert len(journal) == 1 and journal[0]["session"] == "bridge-workload-x1" and journal[0]["profile"] == "workload"
+    # The armed fixture's log lines predate the retirement (they
+    # name the child by its legacy profile); the fold translates
+    # the shape from the legacy entry and journals the new keys.
+    assert len(journal) == 1 and journal[0]["session"] == "bridge-workload-x1" and journal[0]["shape"] == "cpu-highram"
     # A second pass mirrors nothing new and never double-folds.
     out2 = lease.bridge_duty(fake, repo, NOW)
     assert out2["mirrored"] == 0
@@ -168,7 +172,7 @@ def test_bridge_block_serves_agent_status(tmp_path):
     assert block["armed"] is True and block["generation"] == "gen-test" and block["children"] == []
 
 
-def test_install_stamps_the_lobby_records_caller(tmp_path, monkeypatch):
+def test_install_stamps_the_standing_records_caller(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     (tmp_path / ".config" / "colab-cli").mkdir(parents=True)

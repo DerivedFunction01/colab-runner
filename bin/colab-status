@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sessions, default-session status, and compute-unit usage. Usage: colab-status [profile]
+# Sessions, session status, and compute-unit usage. Usage: colab-status
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
 wrap_enter

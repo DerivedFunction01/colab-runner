@@ -248,7 +248,7 @@ def daemon(config_path: Path) -> int:
         "child_session": child,
         "binding": {child: entry},
         "parent_session": cfg.get("session"),
-        "profile": cfg.get("profile"),
+        "shape": cfg.get("shape"),
         "deadline": cfg.get("deadline"),
         "minted_at": minted_at.isoformat(),
     }, indent=2))

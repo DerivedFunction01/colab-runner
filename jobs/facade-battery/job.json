@@ -1,1 +1,1 @@
-{"args":[],"checkpoint_pull_seconds":60,"name":"facade-battery","outputs":["battery-report.json","battery.log"],"profile":"workload","script":"snippets/facade_battery_job.py","timeout":3600,"units":1}
+{"args":[],"checkpoint_pull_seconds":60,"name":"facade-battery","outputs":["battery-report.json","battery.log"],"shape":"cpu-highram","script":"snippets/facade_battery_job.py","timeout":3600,"units":1}

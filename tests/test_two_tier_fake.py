@@ -1,5 +1,5 @@
 """Two-tier lease behaviour against the fake colab CLI (no login, no
-network): per-profile records, the legacy-record migration, the
+network): per-session records, the legacy-record migration, the
 --hours window, the two-tier grant + standing duty, the standing
 budget sub-cap, and the `state` read the UI renders.
 """
@@ -31,8 +31,8 @@ def lease_env(tmp_path):
         COLAB_RUNNER_VAR=str(tmp_path / "var"),
         # Session shape gate: the suite's test actor claim (see
         # test_lease_fake.lease_env); the standing-duty tests use
-        # standing_env instead, so lobby admission rides the gate's
-        # infra exemption exactly as the hook runs it.
+        # standing_env instead, so standing admission rides the
+        # gate's infra exemption exactly as the hook runs it.
         COLAB_LEASE_ACTOR="test",
         KEEPALIVE_MAX_CYCLES="2",
         KEEPALIVE_INTERVAL_SECONDS="0",
@@ -42,8 +42,8 @@ def lease_env(tmp_path):
 
 def standing_env(tmp_path):
     """lease_env without the test actor claim: the standing duty's
-    admission is the infra exemption (actor standing + the
-    configured standing profile), never a bypass."""
+    admission is the infra exemption (the infra actor + the
+    standing marker on the standing shape), never a bypass."""
     env = lease_env(tmp_path)
     env.pop("COLAB_LEASE_ACTOR", None)
     return env
@@ -57,6 +57,21 @@ def run_lease(env, *args, expect_rc=0):
 
 def var(env) -> Path:
     return Path(env["COLAB_RUNNER_VAR"])
+
+
+def record_files(env):
+    return sorted(p for p in var(env).glob("lease-*.json") if p.name not in ("lease-spend.json", "lease-request.json"))
+
+
+def sole_record(env):
+    files = record_files(env)
+    assert len(files) == 1, files
+    return json.loads(files[0].read_text())
+
+
+def seed_cli_catalog(env):
+    var(env).mkdir(parents=True, exist_ok=True)
+    (var(env) / "cli-catalog.json").write_text(json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "gpu": ["T4"], "tpu": ["v6e1"], "no_high_mem": []}))
 
 
 def window_hours(rec) -> float:
@@ -88,23 +103,27 @@ def test_legacy_record_migration(tmp_path):
     sess.mkdir(parents=True, exist_ok=True)
     (sess / "ACTIVE").write_text("1")
     # The first post-landing reads must still see the legacy lease:
-    # lease #8 was live on this path when the layout changed.
+    # a live lease was on this path when the layout changed. Its
+    # shape is derived from the legacy entry it names (the High-RAM
+    # CPU profile -> cpu-highram), never from the profile's name.
     assert run_lease(env, "status")["action"] == "active"
     assert run_lease(env, "reap")["action"] == "kept"
-    adopted = run_lease(env, "acquire", "workload")
+    adopted = run_lease(env, "acquire", "--shape", "cpu-highram")
     assert adopted["action"] == "adopted"
     assert adopted["record"]["acquired_at"] == legacy["acquired_at"]
-    # A save migrated the record to its per-profile path.
+    assert adopted["record"]["shape"] == "cpu-highram"
+    assert "profile" not in adopted["record"]
+    # A save migrated the record to its per-session path.
     assert (var(env) / "lease-workload.json").exists()
     assert not (var(env) / "lease.json").exists()
 
 
 def test_acquire_hours_deadline_and_projection(tmp_path):
     env = lease_env(tmp_path)
-    out = run_lease(env, "acquire", "standard", "--hours", "2")
+    out = run_lease(env, "acquire", "--shape", "cpu", "--hours", "2")
     assert out["action"] == "created"
     assert abs(window_hours(out["record"]) - 2.0) < 0.05
-    # Priced by the standard profile's own rate: 0.08 x 2h.
+    # Priced by the cpu shape's own rate: 0.08 x 2h.
     assert out["record"]["budget_at_acquire"]["projected"] == 0.16
 
 
@@ -116,7 +135,7 @@ def test_acquire_hours_honored_over_max(tmp_path):
     honored as given and priced in full; past the 12 h session cap
     the lease is a window lease from birth (renew flagged)."""
     env = lease_env(tmp_path)
-    out = run_lease(env, "acquire", "standard", "--hours", "100")
+    out = run_lease(env, "acquire", "--shape", "cpu", "--hours", "100")
     assert out["action"] == "created"
     assert abs(window_hours(out["record"]) - 100.0) < 0.05
     assert out["record"]["budget_at_acquire"]["projected"] == 8.0
@@ -125,67 +144,66 @@ def test_acquire_hours_honored_over_max(tmp_path):
 
 def test_acquire_default_window_unchanged(tmp_path):
     env = lease_env(tmp_path)
-    out = run_lease(env, "acquire", "standard")
+    out = run_lease(env, "acquire", "--shape", "cpu")
     assert out["action"] == "created"
     assert abs(window_hours(out["record"]) - 8.0) < 0.05
     assert out["record"]["budget_at_acquire"]["projected"] == 0.64
 
 
-def test_per_profile_records_coexist(tmp_path):
+def test_concurrent_records_coexist(tmp_path):
     env = lease_env(tmp_path)
-    assert run_lease(env, "acquire", "workload")["action"] == "created"
-    assert run_lease(env, "acquire", "lobby")["action"] == "created"
-    assert (var(env) / "lease-workload.json").exists()
-    assert (var(env) / "lease-lobby.json").exists()
+    burst = run_lease(env, "acquire", "--shape", "cpu-highram")
+    plain = run_lease(env, "acquire", "--shape", "cpu")
+    assert burst["action"] == plain["action"] == "created"
+    assert len(record_files(env)) == 2
     out = run_lease(env, "reap")
-    assert out["action"] == "kept"  # top level: the default profile
-    assert {r["profile"] for r in out["records"]} == {"workload", "lobby"}
+    assert {r["session"] for r in out["records"]} == {burst["record"]["session"], plain["record"]["session"]}
     assert all(r["action"] == "kept" for r in out["records"])
-    # Releasing one tier leaves the other untouched.
-    assert run_lease(env, "release", "lobby")["action"] == "released"
-    assert not (var(env) / "lease-lobby.json").exists()
-    assert (var(env) / "lease-workload.json").exists()
+    # Releasing one lease leaves the other untouched.
+    assert run_lease(env, "release", plain["record"]["session"])["action"] == "released"
+    assert len(record_files(env)) == 1
+    assert sole_record(env)["session"] == burst["record"]["session"]
     assert run_lease(env, "status")["action"] == "active"
 
 
-def test_grant_burst_profile_recorded(tmp_path):
+def test_grant_burst_shape_recorded(tmp_path):
     env = lease_env(tmp_path)
-    out = run_lease(env, "grant", "--hours", "2", "--burst", "standard")
-    assert out["grant"]["burst_profile"] == "standard"
+    out = run_lease(env, "grant", "--hours", "2", "--burst", "cpu")
+    assert out["grant"]["burst_shape"] == "cpu"
     run_lease(env, "ungrant")
 
 
-def test_grant_then_standing_acquires_lobby(tmp_path):
+def test_grant_then_standing_acquires_standing_lease(tmp_path):
     env = standing_env(tmp_path)
     assert run_lease(env, "standing")["action"] == "no-grant"
-    granted = run_lease(env, "grant", "--hours", "4")
+    granted = run_lease(env, "grant", "--hours", "4", "--burst", "cpu-highram")
     g = granted["grant"]
     assert g["kind"] == "two-tier"
-    assert g["lobby_profile"] == "lobby"
-    assert g["burst_profile"] == "workload"
+    assert g["standing_shape"] == "cpu"
+    assert g["burst_shape"] == "cpu-highram"
     out = run_lease(env, "standing")
     assert out["action"] == "standing-acquired"
-    rec = json.loads((var(env) / "lease-lobby.json").read_text())
+    rec = sole_record(env)
     assert rec["standing"] is True
     assert rec["warm"] == "pending"  # standing.warm_on_renew is on
     # Session window is the grant remainder (4h < the 12h session cap).
     assert abs(window_hours(rec) - 4.0) < 0.05
     assert run_lease(env, "standing")["action"] == "standing-kept"
     st = run_lease(env, "state")
-    lobby = [r for r in st["records"] if r["profile"] == "lobby"]
-    assert lobby and lobby[0]["warm"] == "pending"
+    standing = [r for r in st["records"] if r["record"].get("standing")]
+    assert standing and standing[0]["warm"] == "pending"
     assert st["grant"]["kind"] == "two-tier"
 
 
-def test_grant_expiry_standing_releases_lobby(tmp_path):
+def test_grant_expiry_standing_releases_standing_lease(tmp_path):
     env = standing_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     assert run_lease(env, "standing")["action"] == "standing-acquired"
     expire_grant(env)
     out = run_lease(env, "standing")
     assert out["action"] == "standing-expired"
-    assert out["lobby"]["action"] == "released"
-    assert not (var(env) / "lease-lobby.json").exists()
+    assert out["standing"]["action"] == "released"
+    assert record_files(env) == []
     assert not (var(env) / "grant.json").exists()
     assert run_lease(env, "standing")["action"] == "no-grant"
     st = run_lease(env, "state")
@@ -193,7 +211,7 @@ def test_grant_expiry_standing_releases_lobby(tmp_path):
     assert st["records"] == []
 
 
-def test_grant_expiry_reap_releases_lobby(tmp_path):
+def test_grant_expiry_reap_releases_standing_lease(tmp_path):
     env = standing_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     assert run_lease(env, "standing")["action"] == "standing-acquired"
@@ -201,20 +219,20 @@ def test_grant_expiry_reap_releases_lobby(tmp_path):
     out = run_lease(env, "reap")
     # Sole record on disk, so its outcome is also the top-level action.
     assert out["action"] == "released-standing-expired"
-    lobby = [r for r in out["records"] if r["profile"] == "lobby"]
-    assert lobby and lobby[0]["action"] == "released-standing-expired"
-    assert not (var(env) / "lease-lobby.json").exists()
+    assert [r["action"] for r in out["records"]] == ["released-standing-expired"]
+    assert record_files(env) == []
 
 
 def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
     env = standing_env(tmp_path)
     var(env).mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    # Seed attributed lobby spend at (standing cap - 0.1): a
-    # journaled lobby segment covering today so far, rated to total
-    # exactly that. A 4h standing window projects 0.32 more and
-    # breaches the sub-cap. The cap is read from the live config —
-    # it is the operator's panel setting, not a test constant.
+    # Seed attributed standing spend at (standing cap - 0.1): a
+    # journaled legacy standing segment covering today so far,
+    # rated to total exactly that. A 4h standing window projects
+    # 0.32 more and breaches the sub-cap. The cap is read from the
+    # live config — it is the operator's panel setting, not a test
+    # constant.
     standing_cap = json.loads((REPO / "config" / "lease.json").read_text())["standing"]["daily_cu_cap"]
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     hours = max((now - day_start).total_seconds() / 3600.0, 1 / 60)
@@ -224,35 +242,35 @@ def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
     out = run_lease(env, "standing", expect_rc=1)
     assert out["action"] == "standing-refused-budget"
     assert out["budget"]["reason"] == "standing-budget"
-    assert not (var(env) / "lease-lobby.json").exists()
+    assert record_files(env) == []
     # The burst tier never answers to the standing sub-cap. The
     # acquire rides the suite's test actor claim: under caller
     # attribution a claimless agent actor's fresh start is refused
     # (caller-start-refused), which is not what this test is about.
     env["COLAB_LEASE_ACTOR"] = "test"
-    assert run_lease(env, "acquire", "workload")["action"] == "created"
+    assert run_lease(env, "acquire", "--shape", "cpu-highram")["action"] == "created"
 
 
-def test_ungrant_releases_lobby(tmp_path):
+def test_ungrant_releases_standing_lease(tmp_path):
     env = standing_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     assert run_lease(env, "standing")["action"] == "standing-acquired"
     out = run_lease(env, "ungrant")
     assert out["action"] == "ungranted"
-    assert out["lobby"]["action"] == "released"
+    assert out["standing"]["action"] == "released"
     assert not (var(env) / "grant.json").exists()
-    assert not (var(env) / "lease-lobby.json").exists()
+    assert record_files(env) == []
     assert run_lease(env, "standing")["action"] == "no-grant"
 
 
-def test_extend_grant_moves_until_and_prices_lobby_delta(tmp_path):
+def test_extend_grant_moves_until_and_prices_standing_delta(tmp_path):
     env = lease_env(tmp_path)
     run_lease(env, "grant", "--hours", "4")
     out = run_lease(env, "extend-grant", "--hours", "2")
     assert out["action"] == "grant-extended"
     delta = datetime.fromisoformat(out["new_until"]) - datetime.fromisoformat(out["old_until"])
     assert delta == timedelta(hours=2)
-    # Priced on the lobby's delta only: 0.08 x 2 h.
+    # Priced on the standing shape's delta only: 0.08 x 2 h.
     assert out["budget"]["projected"] == 0.16
     g = json.loads((var(env) / "grant.json").read_text())
     assert g["until"] == out["new_until"]
@@ -268,12 +286,12 @@ def test_extend_grant_without_grant_refuses(tmp_path):
 def test_demand_started_burst_carries_envelope_stamps(tmp_path):
     env = lease_env(tmp_path)
     env["COLAB_RUNNER_AUTO_ACQUIRE"] = "1"
-    granted = run_lease(env, "grant", "--hours", "4")
-    run_lease(env, "request", "workload", "--reason", "burst work", "--caller", "test")
+    granted = run_lease(env, "grant", "--hours", "4", "--burst", "cpu-highram")
+    run_lease(env, "request", "--shape", "cpu-highram", "--reason", "burst work", "--caller", "test")
     out = run_lease(env, "auto")
     assert out["action"] == "auto-acquired"
     assert out["caller"] == "test"
-    rec = json.loads((var(env) / "lease-workload.json").read_text())
+    rec = sole_record(env)
     assert rec["envelope_id"] == granted["grant"]["granted_at"]
     assert rec["caller"] == "test"
 
@@ -281,11 +299,12 @@ def test_demand_started_burst_carries_envelope_stamps(tmp_path):
 def test_demand_out_of_scope_carries_neither_stamp(tmp_path):
     env = lease_env(tmp_path)
     env["COLAB_RUNNER_AUTO_ACQUIRE"] = "1"
-    run_lease(env, "grant", "--hours", "4")  # scope: lobby + workload
-    run_lease(env, "request", "standard", "--reason", "outside", "--caller", "test")
+    seed_cli_catalog(env)
+    run_lease(env, "grant", "--hours", "4", "--burst", "cpu-highram")  # scope: cpu + cpu-highram
+    run_lease(env, "request", "--shape", "t4", "--reason", "outside", "--caller", "test")
     out = run_lease(env, "auto")
     assert out["action"] == "auto-acquired"
-    rec = json.loads((var(env) / "lease-standard.json").read_text())
+    rec = sole_record(env)
     assert "envelope_id" not in rec
     assert "via" not in rec
     # Caller attribution is not envelope-scoped: the record carries
@@ -300,21 +319,21 @@ def test_envelope_ledger_and_state_block(tmp_path):
     kinds, and ungrant closes the ledger with grant-ended."""
     env = lease_env(tmp_path)
     env["COLAB_RUNNER_AUTO_ACQUIRE"] = "1"
-    granted = run_lease(env, "grant", "--hours", "4")
-    run_lease(env, "request", "workload", "--reason", "burst work", "--caller", "test")
+    granted = run_lease(env, "grant", "--hours", "4", "--burst", "cpu-highram")
+    run_lease(env, "request", "--shape", "cpu-highram", "--reason", "burst work", "--caller", "test")
     run_lease(env, "auto")
     st = run_lease(env, "state")
     block = st["envelope"]
     assert block["id"] == granted["grant"]["granted_at"]
-    assert block["scope"]["profiles"] == ["lobby", "workload"]
+    assert block["scope"]["shapes"] == ["cpu", "cpu-highram"]
     # The served caps are the grant's own snapshot, whatever the
     # live config's caps are at read time.
     assert block["caps"] == granted["grant"]["scope"]["caps"]
-    assert [r["profile"] for r in block["records"]] == ["workload"]
+    assert [r["shape"] for r in block["records"]] == ["cpu-highram"]
     assert block["records"][0]["caller"] == "test"
     spool = (var(env) / "reaper-events.jsonl").read_text()
     assert "envelope-lease-started" in spool
-    assert run_lease(env, "release", "workload")["action"] == "released"
+    assert run_lease(env, "release", sole_record(env)["session"])["action"] == "released"
     spool = (var(env) / "reaper-events.jsonl").read_text()
     assert "envelope-lease-released" in spool
     ledger = [json.loads(line) for line in (var(env) / "grant-ledger.jsonl").read_text().splitlines() if line.strip()]
@@ -329,21 +348,16 @@ def test_envelope_ledger_and_state_block(tmp_path):
 
 def test_state_specs_and_shape(tmp_path):
     env = lease_env(tmp_path)
+    seed_cli_catalog(env)
     st = run_lease(env, "state")
     specs = {s["id"]: s for s in st["specs"]}
-    assert specs["workload"]["rate_cu_per_hour"] == 0.26
-    assert specs["standard"]["rate_cu_per_hour"] == 0.08
-    assert specs["lobby"]["rate_cu_per_hour"] == 0.08
-    assert specs["lobby"]["session"] == "lobby"
+    assert specs["cpu-highram"]["rate_cu_per_hour"] == 0.26
+    assert specs["cpu"]["rate_cu_per_hour"] == 0.08
     assert specs["t4"]["gpu"] == "T4"
-    assert set(specs["workload"]) == {"id", "label", "session", "gpu", "tpu", "high_mem", "rate_cu_per_hour", "timeout", "parallel", "agent_startable"}
-    # The parallel block is served ready (parallel-instances plan):
-    # CPU eligible with the live toggle state (workload's is on in the
-    # live config), the T4 ineligible.
-    live_cfg = json.loads((REPO / "config" / "lease.json").read_text())
-    assert specs["workload"]["parallel"] == {"eligible": True, "enabled": bool((live_cfg.get("parallel") or {}).get("workload")), "instance": "workload2"}
-    assert specs["t4"]["parallel"]["eligible"] is False
-    assert specs["workload"]["label"] == "High-RAM"
+    assert specs["t4"]["rate_cu_per_hour"] is None
+    assert set(specs["cpu"]) == {"id", "label", "gpu", "tpu", "high_mem", "rate_cu_per_hour", "agent_startable"}
+    assert specs["cpu-highram"]["label"] == "CPU High-RAM"
+    assert specs["cpu"]["agent_startable"] is False  # an agent actor may not start plain CPU
     assert st["records"] == []
     assert st["grant"] is None
     assert st["budget"]["balance"] == 500

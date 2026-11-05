@@ -9,12 +9,11 @@ $STUB_EXTEND_REFUSE=1 makes `extend` answer refused-budget and
 `extend-grant` answer grant-inactive, both with exit 1 (a core refusal).
 $STUB_CAPS_INVALID=1 makes `budget-caps` answer caps-invalid with
 exit 1 (the core rejecting a cap update).
-$STUB_PARALLEL_INELIGIBLE=1 makes `parallel` answer
-parallel-ineligible with exit 1 (the core refusing a toggle).
 
 The `state` shape mirrors sync/lease.py's state() exactly: records
-are status entries wrapping the lease record, the budget carries its
-caps, and every spec carries its catalog label.
+are status entries wrapping the lease record (keyed by session),
+the budget carries its caps, and every spec carries its catalog
+label.
 """
 
 import json
@@ -24,10 +23,15 @@ import sys
 DEADLINE = "2099-01-01T00:00:00+00:00"
 
 
-def record(profile):
+SESSION = "amber-otter-42"
+SHAPE_SPEC = {"gpu": None, "tpu": None, "high_mem": True}
+
+
+def record(session, shape="cpu-highram"):
     return {
-        "profile": profile,
-        "session": profile,
+        "session": session,
+        "shape": shape,
+        "shape_spec": dict(SHAPE_SPEC),
         "acquired_at": "2026-11-01T00:00:00+00:00",
         "deadline": DEADLINE,
         "last_used_at": "2026-11-01T00:00:00+00:00",
@@ -37,12 +41,12 @@ def record(profile):
     }
 
 
-def state_entry(profile):
+def state_entry(session):
     return {
         "action": "active",
-        "record": record(profile),
+        "record": record(session),
         "keepalive_heartbeat_age_s": 12,
-        "profile": profile,
+        "session": session,
         "warm": None,
     }
 
@@ -68,19 +72,17 @@ def main(argv):
         granted = os.environ.get("STUB_GRANT") == "1"
         grant = None
         envelope = None
-        entry = state_entry("workload")
+        entry = state_entry(SESSION)
         if granted:
             caps = {"daily": 10, "monthly": 100, "standing_daily": 2.0}
-            scope = {"caps": caps, "lobby_profile": "lobby", "burst_profile": "workload", "profiles": ["lobby", "workload"]}
+            scope = {"caps": caps, "standing_shape": "cpu", "burst_shape": "cpu-highram", "shapes": ["cpu", "cpu-highram"]}
             grant = {
                 "kind": "two-tier",
                 "granted_at": "2026-11-01T00:00:00+00:00",
                 "until": DEADLINE,
-                "lobby_profile": "lobby",
-                "burst_profile": "workload",
                 "scope": scope,
             }
-            entry["record"] = {**entry["record"], "envelope_id": grant["granted_at"], "via": "xbrl-thread"}
+            entry["record"] = {**entry["record"], "envelope_id": grant["granted_at"], "caller": "xbrl-thread"}
             envelope = {
                 "id": grant["granted_at"],
                 "grant": grant,
@@ -88,7 +90,7 @@ def main(argv):
                 "caps": caps,
                 "records": [entry["record"]],
                 "spend": {"balance": 571.7, "day_spent": 4.04, "month_spent": 9.97, "standing_day_spent": 1.5},
-                "profile_spend": [{"profile": "workload", "day_spent": 2.08, "month_spent": 2.08}],
+                "session_spend": [{"session": SESSION, "shape": "cpu-highram", "day_spent": 2.08, "month_spent": 2.08}],
             }
         out = {
             "records": [entry],
@@ -103,10 +105,9 @@ def main(argv):
             # t4's rate is null on purpose: the core's rate table prices
             # only the CPU tiers, so the UI must render "Cost unconfirmed".
             "specs": [
-                {"id": "workload", "label": "High-RAM", "session": "workload", "gpu": None, "high_mem": True, "rate_cu_per_hour": 0.26, "timeout": 18000, "agent_startable": True, "parallel": {"eligible": True, "enabled": False, "instance": "workload2"}},
-                {"id": "lobby", "label": "Lobby", "session": "lobby", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "agent_startable": False, "parallel": {"eligible": True, "enabled": False, "instance": "lobby2"}},
-                {"id": "standard", "label": "Standard", "session": "standard", "gpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "timeout": 3600, "agent_startable": False, "parallel": {"eligible": True, "enabled": False, "instance": "standard2"}},
-                {"id": "t4", "label": "T4", "session": "t4", "gpu": "T4", "high_mem": False, "rate_cu_per_hour": None, "timeout": 18000, "agent_startable": False, "parallel": {"eligible": False, "enabled": False, "instance": "t42"}},
+                {"id": "cpu-highram", "label": "High-RAM CPU", "gpu": None, "tpu": None, "high_mem": True, "rate_cu_per_hour": 0.26, "agent_startable": True},
+                {"id": "cpu", "label": "Standard CPU", "gpu": None, "tpu": None, "high_mem": False, "rate_cu_per_hour": 0.08, "agent_startable": False},
+                {"id": "t4", "label": "T4 GPU", "gpu": "T4", "tpu": None, "high_mem": False, "rate_cu_per_hour": None, "agent_startable": False},
             ],
             "session_gate": {"enabled": True, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"},
             "bridge": None,
@@ -121,15 +122,16 @@ def main(argv):
             }
             out = slices[part]
     elif cmd == "acquire":
-        out = {"action": "acquired", "record": record(argv[1] if len(argv) > 1 else "workload")}
+        shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "cpu-highram"
+        out = {"action": "acquired", "record": record(SESSION, shape)}
     elif cmd == "extend":
         hours = float(argv[argv.index("--hours") + 1]) if "--hours" in argv else None
         if os.environ.get("STUB_EXTEND_REFUSE") == "1":
             print(json.dumps({"action": "refused-budget", "budget": {"ok": False, "reason": "daily-budget", "projected": 16.0, "cap": 10}}))
             return 1
-        out = {"action": "extended", "profile": argv[1], "hours": hours, "old_deadline": "2026-11-02T00:00:00+00:00", "new_deadline": "2026-11-02T02:00:00+00:00"}
+        out = {"action": "extended", "session": argv[1], "hours": hours, "old_deadline": "2026-11-02T00:00:00+00:00", "new_deadline": "2026-11-02T02:00:00+00:00"}
     elif cmd == "release":
-        out = {"action": "released", "profile": argv[1] if len(argv) > 1 else None}
+        out = {"action": "released", "session": argv[1] if len(argv) > 1 else None}
     elif cmd == "release-session":
         if len(argv) > 1 and argv[1] == "recorded-session":
             print(json.dumps({"action": "session-has-record", "session": argv[1]}))
@@ -159,11 +161,6 @@ def main(argv):
                     value = float(raw)
                     caps[key] = int(value) if value.is_integer() else value
         out = {"action": "caps-updated", "caps": caps, "previous": previous}
-    elif cmd == "parallel":
-        if os.environ.get("STUB_PARALLEL_INELIGIBLE") == "1":
-            print(json.dumps({"action": "parallel-ineligible", "profile": argv[1] if len(argv) > 1 else None}))
-            return 1
-        out = {"action": "parallel-updated", "profile": argv[1], "enabled": "--on" in argv, "instance": argv[1] + "2", "previous": False}
     elif cmd == "ungrant":
         out = {"action": "grant-ended"}
     else:

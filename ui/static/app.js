@@ -8,7 +8,7 @@
 let S = null; // merge of the state portions landed so far
 const sel = {
   mode: "normal",
-  profile: null, // chosen spec id, normal mode
+  shape: null, // chosen spec id, normal mode
   burst: null, // chosen spec id, grant mode
   normalHours: 8,
   grantHours: 8,
@@ -108,25 +108,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* ---------- specs ---------- */
 
-/* Specs come from the core's state.specs — every grantable tier with
- * its served label, shape, and rate (null when the core cannot price
- * it). The fallback derives the same shape from profiles + caps for
- * an older core; a label falls back to the profile id, matching the
- * core's own fallback in specs(). */
+/* Specs come from the core's state.specs — every grantable shape
+ * with its served label and rate (null when the core cannot price
+ * it). There is no client-side fallback catalog: the core serves
+ * the shapes or the section shows its load state. */
 function specsFromState() {
   if (S && Array.isArray(S.specs) && S.specs.length) return S.specs;
-  const profiles = ((S && S.profiles) || {}).profiles || {};
-  const rates = ((S && S.caps) || {}).rate_cu_per_hour || {};
-  return Object.entries(profiles).map(([id, p]) => ({
-    id,
-    label: p.label || id,
-    session: p.session,
-    gpu: p.gpu || null,
-    tpu: p.tpu || null,
-    high_mem: !!p.high_mem,
-    rate_cu_per_hour: p.gpu ? null : p.high_mem ? rates.high_mem : rates.standard,
-    timeout: p.timeout,
-  }));
+  return [];
 }
 
 function specById(id) {
@@ -246,7 +234,7 @@ function leaseChip(entry) {
 
 /* The extend picker: the shared duration chips plus a custom-hours
  * input and an apply button, rendered into a card when its Extend
- * toggle is open. kind is "lease" (key = profile) or "grant". */
+ * toggle is open. kind is "lease" (key = session) or "grant". */
 function extendPickerHTML(kind, key) {
   const hours = extHours[extKey(kind, key)] ?? 8;
   const chips = EXT_DURATIONS.map((h) =>
@@ -272,7 +260,7 @@ function extendRefusalText(res) {
     case "extend-no-lease":
       return "no live lease to extend";
     case "extend-standing-managed":
-      return "the lobby is grant-managed — extend the grant instead";
+      return "the standing lease is grant-managed — extend the grant instead";
     case "grant-inactive":
       return "no active grant to extend";
     default:
@@ -322,30 +310,10 @@ function wireExtendPickers(container) {
       if (kind === "grant") {
         act(btn, async () => reportExtend(await api("/api/grant/extend", { hours }), "grant", ""));
       } else {
-        act(btn, async () => reportExtend(await api("/api/lease/extend", { profile: key, hours }), "lease", key));
+        act(btn, async () => reportExtend(await api("/api/lease/extend", { session: key, hours }), "lease", key));
       }
     });
   });
-}
-
-/* A toggled-on instance with no lease yet gets a dormant card with
- * its own Start; once it runs, its record renders the ordinary
- * lease card (deadline, Terminate, Extend) like any profile. Start
- * and stop ride the existing lease endpoints with the instance
- * profile id the core served — no instance endpoints exist. */
-function dormantInstanceCards(records) {
-  const live = new Set(records.map((e) => e.profile || (e.record || {}).profile));
-  return specsFromState()
-    .filter((s) => s.parallel && s.parallel.enabled && s.parallel.instance && !live.has(s.parallel.instance))
-    .map((s) => {
-      const inst = specById(s.parallel.instance);
-      const title = inst ? specTitle(inst) : s.parallel.instance;
-      return `<div class="card">
-      <div class="row"><b>${esc(title)}</b><span class="chip warn">Not running</span></div>
-      <p class="kvline">Parallel instance of <b>${esc(specLabel(s.id))}</b> · session <span class="mono">${esc(inst ? inst.session || "—" : "—")}</span> · Burn <b>${esc(inst ? specRateText(inst) : "—")}</b></p>
-      <button type="button" class="primary" data-istart="${esc(s.parallel.instance)}">Start</button>
-    </div>`;
-    }).join("");
 }
 
 function renderLeases() {
@@ -353,9 +321,9 @@ function renderLeases() {
   const box = $("lease-cards");
   box.innerHTML = records.map((entry) => {
     const rec = entry.record || {};
-    const profile = entry.profile || rec.profile || "";
-    const spec = specById(profile);
-    const title = spec ? specTitle(spec) : profile || "lease";
+    const session = entry.session || rec.session || "";
+    const spec = specById(rec.shape);
+    const title = spec ? specTitle(spec) : session || "lease";
     const age = entry.keepalive_heartbeat_age_s;
     const pulse = rec.last_pulse_result;
     const burn = spec ? specRateText(spec) : "—";
@@ -364,22 +332,16 @@ function renderLeases() {
       <p class="big num" data-countdown="${esc(rec.deadline || "")}">${esc(countdownText(rec.deadline))}</p>
       <p class="kvline">Deadline <b>${esc(fmtTime(rec.deadline))}</b> · session <span class="mono">${esc(rec.session || "—")}</span>${rec.caller ? ` · Caller <b>${esc(rec.caller)}</b>` : ""}</p>
       <p class="kvline">Heartbeat <b>${age == null ? "unknown" : `${Math.round(age)}s ago`}</b> · Pulse <b>${esc(pulse || "—")}</b> · Burn <b>${esc(burn)}</b></p>
-      <button type="button" class="danger" data-stop="${esc(profile)}">Terminate</button>
-      <button type="button" class="ghost" data-xtoggle="${esc(profile)}">Extend</button>
-      ${extOpen.has(extKey("lease", profile)) ? extendPickerHTML("lease", profile) : ""}
+      <button type="button" class="danger" data-stop="${esc(session)}">Terminate</button>
+      <button type="button" class="ghost" data-xtoggle="${esc(session)}">Extend</button>
+      ${extOpen.has(extKey("lease", session)) ? extendPickerHTML("lease", session) : ""}
     </div>`;
-  }).join("") + dormantInstanceCards(records);
-  box.querySelectorAll("[data-istart]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const profile = btn.getAttribute("data-istart");
-      act(btn, () => api("/api/lease/start", { profile, hours: sel.normalHours }));
-    });
-  });
+  }).join("");
   box.querySelectorAll("[data-stop]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const profile = btn.getAttribute("data-stop");
-      if (!window.confirm(`Terminate the ${specLabel(profile)} lease now?`)) return;
-      act(btn, () => api("/api/lease/stop", { profile }));
+      const session = btn.getAttribute("data-stop");
+      if (!window.confirm(`Terminate the ${session} lease now?`)) return;
+      act(btn, () => api("/api/lease/stop", { session }));
     });
   });
   box.querySelectorAll("[data-xtoggle]").forEach((btn) => {
@@ -437,11 +399,11 @@ function renderGrant() {
   const envLeases = env && Array.isArray(env.records) ? env.records : [];
   const envSpend = (env && env.spend) || {};
   const leaseRows = envLeases.length
-    ? envLeases.map((rec) => `<p class="kvline">· <b>${esc(specLabel(rec.profile))}</b>${rec.via ? ` via <b>${esc(rec.via)}</b>` : ""} · until <b>${esc(fmtTime(rec.deadline))}</b></p>`).join("")
+    ? envLeases.map((rec) => `<p class="kvline">· <b>${esc(specLabel(rec.shape))}</b>${rec.caller ? ` · caller <b>${esc(rec.caller)}</b>` : ""} · until <b>${esc(fmtTime(rec.deadline))}</b></p>`).join("")
     : `<p class="kvline">No envelope leases yet.</p>`;
   box.innerHTML = `<div class="card">
     <div class="row"><b>Two-tier grant</b><span class="chip ok">Active</span></div>
-    <p class="kvline" style="margin-top:8px">Until <b>${esc(fmtTime(grant.until))}</b> · Burst spec <b>${esc(specLabel(grant.burst_profile))}</b></p>
+    <p class="kvline" style="margin-top:8px">Until <b>${esc(fmtTime(grant.until))}</b> · Burst spec <b>${esc(specLabel((grant.scope || {}).burst_shape))}</b></p>
     <p class="kvline">${S.budget && S.budget.standing_day_spent != null ? `Standing spend today <b>${fmtNum(S.budget.standing_day_spent)} of ${envCaps.standing_daily == null ? "—" : fmtNum(envCaps.standing_daily)} CU</b>` : `Standing cap <b>${envCaps.standing_daily == null ? "—" : `${fmtNum(envCaps.standing_daily)} CU/day`}</b>`}</p>
     ${env ? `<p class="kvline">Envelope caps (at grant) — daily <b>${envCaps.daily == null ? "—" : `${fmtNum(envCaps.daily)} CU`}</b> · monthly <b>${envCaps.monthly == null ? "—" : `${fmtNum(envCaps.monthly)} CU`}</b></p>
     <p class="kvline">Envelope spend — today <b>${envSpend.day_spent == null ? "—" : `${fmtNum(envSpend.day_spent)} CU`}</b> · this month <b>${envSpend.month_spent == null ? "—" : `${fmtNum(envSpend.month_spent)} CU`}</b></p>
@@ -465,34 +427,23 @@ function renderGrant() {
   $("grant-until").textContent = fmtTime(grant.until);
 }
 
-/* The Parallel toggle rides the spec row of every eligible spec,
- * bound to the served parallel block (eligibility, state, instance
- * id are the core's; the page derives none of them). Ineligible
- * specs — every GPU/TPU shape, and instances themselves — render
- * no toggle. */
-function parallelToggleHTML(s) {
-  const p = s.parallel;
-  if (!p || !p.eligible) return "";
-  return `<span class="chip ptoggle${p.enabled ? " on" : ""}" data-parallel="${esc(s.id)}" title="Allow a second, parallel session of this spec">Parallel ${p.enabled ? "on" : "off"}</span>`;
-}
-
 function renderSpecList(containerId, key) {
   const specs = specsFromState();
   const box = $(containerId);
   if (!sel[key] || !specs.some((s) => s.id === sel[key])) {
-    sel[key] = ((S && S.profiles) || {}).default_profile || (specs[0] && specs[0].id) || null;
+    sel[key] = (specs[0] && specs[0].id) || null;
   }
   box.innerHTML = specs.map((s) => `
     <button type="button" class="spec${s.id === sel[key] ? " selected" : ""}" data-spec="${esc(s.id)}">
       <span><b>${esc(s.label || s.id)}</b> · ${esc(specDescriptor(s))}</span>
-      <span class="cost num">${esc(specRateText(s))}</span>${parallelToggleHTML(s)}
+      <span class="cost num">${esc(specRateText(s))}</span>
     </button>`).join("");
 }
 
 function renderControls() {
-  renderSpecList("profile-specs", "profile");
+  renderSpecList("shape-specs", "shape");
   renderSpecList("burst-specs", "burst");
-  const chosen = specById(sel.profile);
+  const chosen = specById(sel.shape);
   const rate = chosen ? chosen.rate_cu_per_hour : null;
   $("normal-projected").textContent =
     rate == null ? "Cost unconfirmed" : `${fmtNum(rate * sel.normalHours)} CU`;
@@ -505,7 +456,7 @@ function renderControls() {
  * group from its served fields only; the view below binds the
  * model and owns labels and formatting.
  * The served contract is colab-lease-logs/v1: {seq, ts, kind,
- * detail} — level and profile derive from the event as served. */
+ * detail} — level and shape derive from the event as served. */
 
 /* The logs vocabulary is closed: exactly the contract's eight
  * kinds (owner's ruling, 2026-11-03). The outbox records other
@@ -528,10 +479,12 @@ function logLevel(ev) {
   return LOG_LEVEL_BY_KIND[ev.kind] || "info";
 }
 
-function logProfile(ev) {
+function logShape(ev) {
   const d = ev.detail || {};
   const r = d.result || {};
-  return d.profile || (r.record && r.record.profile) || r.profile || null;
+  // New events carry the shape; events spooled before the
+  // retirement carry the legacy profile id — read both.
+  return d.shape || d.profile || (r.record && (r.record.shape || r.record.profile)) || r.shape || r.profile || null;
 }
 
 function logSession(ev) {
@@ -572,7 +525,7 @@ function groupByDay(events) {
 }
 
 /** The variable part of an event — the kind is its own column and
- * the profile its own column, so this carries only what differs
+ * the shape its own column, so this carries only what differs
  * per occurrence. */
 function logDetailText(ev) {
   const d = ev.detail || {};
@@ -594,7 +547,7 @@ function logDetailText(ev) {
       return [d.projected_cu != null ? `${fmtNum(d.projected_cu)} CU projected` : null,
         d.daily_cap_cu != null ? `daily ${fmtNum(d.daily_used_cu)} / ${fmtNum(d.daily_cap_cu)} CU` : null].filter(Boolean).join(" · ");
     case "grant-started":
-      return `${fmtDur(d.hours)}, burst ${specLabel(d.burst || r.burst_profile)}`;
+      return `${fmtDur(d.hours)}, burst ${specLabel(d.burst || r.burst_shape || r.burst_profile)}`;
     case "envelope-lease-released":
       return d.reason ? esc(d.reason) : "";
     case "ui-restored":
@@ -646,7 +599,7 @@ function logDayBand(key) {
 }
 
 function logEntryHtml(ev) {
-  const profile = logProfile(ev);
+  const shape = logShape(ev);
   const session = logSession(ev);
   const d = ev.detail || {};
   const caller = d.caller || (d.result || {}).caller || ((d.result || {}).record || {}).caller || null;
@@ -658,7 +611,7 @@ function logEntryHtml(ev) {
       <span class="tl-rail">${levelDot(logLevel(ev))}</span>
       <span class="tl-main">
         <span class="tl-top"><span class="kind-code">${esc(ev.kind)}</span></span>
-        <span class="tl-who">${profile ? esc(specLabel(profile)) : '<span class="muted">—</span>'}${session ? `<span class="muted"> · ${esc(session)}</span>` : ""}${caller ? `<span class="muted"> · caller ${esc(caller)}</span>` : ""}</span>
+        <span class="tl-who">${shape ? esc(specLabel(shape)) : '<span class="muted">—</span>'}${session ? `<span class="muted"> · ${esc(session)}</span>` : ""}${caller ? `<span class="muted"> · caller ${esc(caller)}</span>` : ""}</span>
         ${detail ? `<span class="tl-detail">${detail}</span>` : ""}
       </span>
     </button>
@@ -726,25 +679,6 @@ function renderSections(names) {
 
 function wireSpecList(containerId, key) {
   $(containerId).addEventListener("click", (e) => {
-    const toggle = e.target.closest("[data-parallel]");
-    if (toggle) {
-      // The toggle is not a spec selection: it flips the served
-      // toggle state through the config endpoint. A core refusal
-      // answers 200 with its action (the extend pattern), so the
-      // page reads it and says why.
-      const profile = toggle.getAttribute("data-parallel");
-      const spec = specById(profile);
-      const enabled = !(spec && spec.parallel && spec.parallel.enabled);
-      act(toggle.closest("button") || toggle, async () => {
-        const res = await api("/api/config/parallel", { profile, enabled });
-        if (res.action === "parallel-updated") {
-          notice(`Parallel ${enabled ? "enabled" : "disabled"} — ${specLabel(profile)}`);
-        } else {
-          notice(`Parallel toggle refused: ${res.action || "failed"}`);
-        }
-      });
-      return;
-    }
     const row = e.target.closest("[data-spec]");
     if (!row) return;
     sel[key] = row.getAttribute("data-spec");
@@ -783,7 +717,7 @@ function setMode(mode) {
 }
 
 $("start-btn").addEventListener("click", (e) => {
-  act(e.currentTarget, () => api("/api/lease/start", { profile: sel.profile, hours: sel.normalHours }));
+  act(e.currentTarget, () => api("/api/lease/start", { shape: sel.shape, hours: sel.normalHours }));
 });
 $("grant-btn").addEventListener("click", (e) => {
   act(e.currentTarget, () => api("/api/grant", { hours: sel.grantHours, burst: sel.burst }));
@@ -990,7 +924,7 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-wireSpecList("profile-specs", "profile");
+wireSpecList("shape-specs", "shape");
 wireSpecList("burst-specs", "burst");
 wirePresets("normal-presets", "normal-custom", "normalHours");
 wirePresets("grant-presets", "grant-custom", "grantHours");

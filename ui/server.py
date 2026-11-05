@@ -36,7 +36,7 @@ REPO = UI_DIR.parent
 STATIC_DIR = UI_DIR / "static"
 CONFIG_PATH = UI_DIR / "config.json"
 
-FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-profile", "parallel-invalid", "parallel-unknown-profile", "parallel-ineligible", "parallel-instance-live", "caller-start-refused"}
+FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "caller-start-refused"}
 # The panel's budget-cap editor fields, in body-name → core-flag order.
 BUDGET_CAP_FIELDS = {"daily_cu_budget": "--daily", "monthly_cu_budget": "--monthly", "standing_daily_cu_cap": "--standing-daily"}
 CORE_TIMEOUT_S = 1800
@@ -233,22 +233,17 @@ def load_ui_config() -> tuple[str, int]:
     return host, port
 
 
-def repo_config() -> tuple[dict, dict]:
-    """Profiles + budget caps from the repo config, served alongside the
-    core state so the page never hardcodes them."""
-    profiles: dict = {}
+def repo_config() -> dict:
+    """Budget caps from the repo config, served alongside the core
+    state so the page never hardcodes them. (The shape catalog itself
+    comes from the core's state, not from a config file.)"""
     caps: dict = {}
-    try:
-        raw = json.loads((REPO / "config" / "profiles.json").read_text())
-        profiles = {"default_profile": raw.get("default_profile"), "profiles": raw.get("profiles", {})}
-    except (OSError, json.JSONDecodeError):
-        pass
     try:
         lease_cfg = json.loads((REPO / "config" / "lease.json").read_text())
         caps = {k: lease_cfg.get(k) for k in ("daily_cu_budget", "monthly_cu_budget", "max_hours", "rate_cu_per_hour")}
     except (OSError, json.JSONDecodeError):
         pass
-    return profiles, caps
+    return caps
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -295,10 +290,8 @@ class Handler(BaseHTTPRequestHandler):
         rc, result, err = run_core("state")
         if not isinstance(result, dict):
             return self.send_json(502, {"error": "lease core state unavailable", "detail": err, "rc": rc})
-        profiles, caps = repo_config()
         payload = dict(result)
-        payload["profiles"] = profiles
-        payload["caps"] = caps
+        payload["caps"] = repo_config()
         return self.send_json(200, payload)
 
     def api_state_part(self, part: str) -> None:
@@ -311,12 +304,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(502, {"error": f"lease core state {part} unavailable", "detail": err, "rc": rc})
         payload = dict(result)
         if part in ("specs", "budget"):
-            # The repo-file config rides the portions whose sections
-            # render it (control renders profiles, budget renders
-            # caps) — both are instant local reads.
-            profiles, caps = repo_config()
-            payload["profiles"] = profiles
-            payload["caps"] = caps
+            # The repo-file caps ride the portions whose sections
+            # render them — an instant local read.
+            payload["caps"] = repo_config()
         return self.send_json(200, payload)
 
     def api_outbox(self, parsed) -> None:
@@ -365,8 +355,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_ungrant()
         if parsed.path == "/api/config/budget":
             return self.api_config_budget(body)
-        if parsed.path == "/api/config/parallel":
-            return self.api_config_parallel(body)
         if parsed.path == "/api/server/restart":
             return self.api_server_restart()
         return self.send_json(404, {"error": "not found"})
@@ -389,10 +377,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json(200, {"action": "restart-requested"})
 
     def api_lease_start(self, body: dict) -> None:
-        profile = body.get("profile")
-        if not profile or not isinstance(profile, str):
-            return self.send_json(400, {"error": "profile is required"})
-        args = ["acquire", profile]
+        shape = body.get("shape")
+        if not shape or not isinstance(shape, str):
+            return self.send_json(400, {"error": "shape is required"})
+        args = ["acquire", "--shape", shape]
         hours = body.get("hours")
         if hours is not None:
             try:
@@ -408,16 +396,16 @@ class Handler(BaseHTTPRequestHandler):
         args += ["--via", "panel", "--caller", "panel"]
         rc, result, err = run_core(*args)
         if result is None:
-            OUTBOX.append("lease-start-failed", {"profile": profile, "hours": hours, "error": err, "rc": rc})
+            OUTBOX.append("lease-start-failed", {"shape": shape, "hours": hours, "error": err, "rc": rc})
             return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
         kind = "lease-started" if is_success(rc, result) else "lease-start-failed"
-        OUTBOX.append(kind, {"profile": profile, "hours": hours, "result": result})
+        OUTBOX.append(kind, {"shape": shape, "hours": hours, "result": result})
         return self.send_json(200, result)
 
     def api_access_release(self, body: dict) -> None:
         """One-tap release of an unattributed session from the access
         list: the core's release-session verb (a record-backed
-        session is refused there — it releases per profile). The
+        session is refused there — it releases per session). The
         outcome is appended to the outbox under a server-side kind
         the notify hook counts like any lease event; the UI log's
         kind vocabulary is untouched."""
@@ -433,8 +421,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json(409, result)
 
     def api_lease_stop(self, body: dict) -> None:
-        profile = body.get("profile")
-        args = ["release"] + ([profile] if profile else [])
+        session = body.get("session")
+        args = ["release"] + ([session] if session else [])
         rc, result, err = run_core(*args)
         if result is None:
             return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
@@ -442,13 +430,13 @@ class Handler(BaseHTTPRequestHandler):
         # can abort a stop whose deadline an extension just moved
         # (release-aborted), and that is not a stop.
         if is_success(rc, result) and result.get("action") == "released":
-            OUTBOX.append("lease-stopped", {"profile": profile, "result": result})
+            OUTBOX.append("lease-stopped", {"session": session, "result": result})
         return self.send_json(200, result)
 
     def api_lease_extend(self, body: dict) -> None:
-        profile = body.get("profile")
-        if not profile or not isinstance(profile, str):
-            return self.send_json(400, {"error": "profile is required"})
+        session = body.get("session")
+        if not session or not isinstance(session, str):
+            return self.send_json(400, {"error": "session is required"})
         hours = body.get("hours")
         if hours is None:
             return self.send_json(400, {"error": "hours is required"})
@@ -457,14 +445,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except (TypeError, ValueError):
             return self.send_json(400, {"error": "hours must be a positive number"})
-        rc, result, err = run_core("extend", profile, "--hours", fmt_hours(hours))
+        rc, result, err = run_core("extend", session, "--hours", fmt_hours(hours))
         if result is None:
-            OUTBOX.append("lease-extend-failed", {"profile": profile, "hours": hours, "error": err, "rc": rc})
+            OUTBOX.append("lease-extend-failed", {"session": session, "hours": hours, "error": err, "rc": rc})
             return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
         if is_success(rc, result):
-            OUTBOX.append("lease-extended", {"profile": profile, "hours": hours, "old_deadline": result.get("old_deadline"), "new_deadline": result.get("new_deadline")})
+            OUTBOX.append("lease-extended", {"session": session, "hours": hours, "old_deadline": result.get("old_deadline"), "new_deadline": result.get("new_deadline")})
         else:
-            OUTBOX.append("lease-extend-failed", {"profile": profile, "hours": hours, "result": result})
+            OUTBOX.append("lease-extend-failed", {"session": session, "hours": hours, "result": result})
         return self.send_json(200, result)
 
     def api_grant_extend(self, body: dict) -> None:
@@ -499,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
         burst = body.get("burst")
         if burst:
             if not isinstance(burst, str):
-                return self.send_json(400, {"error": "burst must be a profile id"})
+                return self.send_json(400, {"error": "burst must be a shape id"})
             args += ["--burst", burst]
         rc, result, err = run_core(*args)
         if result is None:
@@ -543,27 +531,6 @@ class Handler(BaseHTTPRequestHandler):
             OUTBOX.append("budget-caps-changed", {"caps": result.get("caps"), "previous": result.get("previous")})
             return self.send_json(200, result)
         return self.send_json(400, result)
-
-    def api_config_parallel(self, body: dict) -> None:
-        """Set one base profile's parallel-instance toggle: the core
-        validates eligibility and persists it to config/lease.json.
-        The endpoint forwards exactly one profile and one boolean;
-        the core's refusals (ineligible shape, instance lease live)
-        answer 200 with the refusal action, like the extend
-        endpoints, so the page can read and report the reason."""
-        profile = body.get("profile")
-        if not profile or not isinstance(profile, str):
-            return self.send_json(400, {"error": "profile is required"})
-        enabled = body.get("enabled")
-        if not isinstance(enabled, bool):
-            return self.send_json(400, {"error": "enabled must be a boolean"})
-        rc, result, err = run_core("parallel", profile, "--on" if enabled else "--off")
-        if result is None:
-            return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
-        if is_success(rc, result):
-            OUTBOX.append("parallel-changed", {"profile": profile, "enabled": enabled, "instance": result.get("instance"), "previous": result.get("previous")})
-        return self.send_json(200, result)
-
 
 def main(argv: list[str]) -> int:
     global OUTBOX

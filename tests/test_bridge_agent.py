@@ -23,24 +23,24 @@ def signed(fields):
 
 def test_validate_accepts_signed_commands():
     for fields in (
-        {"v": 1, "id": "a1", "verb": "run", "target": "self", "cmd": "echo hi"},
-        {"v": 1, "id": "a2", "verb": "mint", "profile": "workload"},
-        {"v": 1, "id": "a3", "verb": "stop", "name": "bridge-workload-x"},
-        {"v": 1, "id": "a4", "verb": "ping"},
+        {"v": 2, "id": "a1", "verb": "run", "target": "self", "cmd": "echo hi"},
+        {"v": 2, "id": "a2", "verb": "mint", "shape": "cpu-highram"},
+        {"v": 2, "id": "a3", "verb": "stop", "name": "bridge-cpu-highram-x"},
+        {"v": 2, "id": "a4", "verb": "ping"},
     ):
         cmd, reason = bridge.validate_command(signed(fields))
         assert cmd is not None and reason is None
 
 
 def test_validate_refuses_tampered_and_partial():
-    cmd = signed({"v": 1, "id": "a1", "verb": "run", "target": "self", "cmd": "echo hi"})
+    cmd = signed({"v": 2, "id": "a1", "verb": "run", "target": "self", "cmd": "echo hi"})
     cmd["cmd"] = "echo tampered"
     assert bridge.validate_command(cmd) == (None, "hash-mismatch")
-    assert bridge.validate_command({"v": 1, "id": "a1", "verb": "run"})[1] in ("hash-mismatch",)
-    partial = {"v": 1, "id": "a1", "verb": "run", "target": "self"}
+    assert bridge.validate_command({"v": 2, "id": "a1", "verb": "run"})[1] in ("hash-mismatch",)
+    partial = {"v": 2, "id": "a1", "verb": "run", "target": "self"}
     partial["sha256"] = bridge.command_hash(partial)
     assert bridge.validate_command(partial) == (None, "missing-cmd")
-    assert bridge.validate_command({"v": 2, "id": "x", "verb": "ping", "sha256": "z"})[1] == "protocol-mismatch"
+    assert bridge.validate_command({"v": 1, "id": "x", "verb": "ping", "sha256": "z"})[1] == "protocol-mismatch"
     assert bridge.validate_command(["not", "a", "dict"])[1] == "not-an-object"
 
 
@@ -58,14 +58,14 @@ def test_log_sequences_and_resumes(tmp_path):
 def test_registry_round_trips(tmp_path):
     path = tmp_path / "registry.json"
     reg = bridge.Registry(path)
-    reg.add_child("bridge-workload-1", {"profile": "workload", "minted_at": "2026-11-01T00:00:00+00:00", "last_used_at": "2026-11-01T00:00:00+00:00"})
+    reg.add_child("bridge-cpu-highram-1", {"shape": "cpu-highram", "minted_at": "2026-11-01T00:00:00+00:00", "last_used_at": "2026-11-01T00:00:00+00:00"})
     reg.mark_processed("cmd-1", 7)
     reg.mark_inflight("cmd-2")
     again = bridge.Registry(path)
-    assert again.children["bridge-workload-1"]["profile"] == "workload"
+    assert again.children["bridge-cpu-highram-1"]["shape"] == "cpu-highram"
     assert again.processed == {"cmd-1": 7}
     assert again.inflight == {"cmd-2"}
-    assert again.remove_child("bridge-workload-1")["profile"] == "workload"
+    assert again.remove_child("bridge-cpu-highram-1")["shape"] == "cpu-highram"
     again.clear_inflight("cmd-2")
     assert bridge.Registry(path).inflight == set()
     assert json.loads(path.read_text())["children"] == {}
@@ -76,9 +76,9 @@ def test_registry_round_trips(tmp_path):
 
 # --- Session shape gate: bridge minting (plan: .plans/2026-11-04-agent-session-shape-gate.md) --
 
-PROFILES = {
-    "workload": {"high_mem": True, "gpu": None, "tpu": None, "rate_cu_per_hour": 0.26},
-    "standard": {"high_mem": False, "gpu": None, "tpu": None, "rate_cu_per_hour": 0.08},
+SHAPES = {
+    "cpu-highram": {"high_mem": True, "gpu": None, "tpu": None, "rate_cu_per_hour": 0.26},
+    "cpu": {"high_mem": False, "gpu": None, "tpu": None, "rate_cu_per_hour": 0.08},
     "t4": {"high_mem": False, "gpu": "T4", "tpu": None, "rate_cu_per_hour": None},
 }
 
@@ -107,27 +107,27 @@ def log_lines(tmp_path):
 
 
 def test_mint_refused_for_standard_and_gpu_stamped(tmp_path, monkeypatch):
-    cfg = {"session": "lobby", "generation": "gen-t", "limits": {"max_children": 3}, "profiles": PROFILES, "agent_allowed_profiles": ["workload"]}
+    cfg = {"session": "lobby", "generation": "gen-t", "limits": {"max_children": 3}, "shapes": SHAPES, "agent_allowed_shapes": ["cpu-highram"]}
     agent = make_agent(tmp_path, monkeypatch, cfg)
-    agent.do_mint({"id": "m1", "verb": "mint", "profile": "standard"})
-    agent.do_mint({"id": "m2", "verb": "mint", "profile": "t4"})
+    agent.do_mint({"id": "m1", "verb": "mint", "shape": "cpu"})
+    agent.do_mint({"id": "m2", "verb": "mint", "shape": "t4"})
     assert agent.cli_calls == []  # refused before any CLI call
     assert agent.registry.children == {}
     errors = [line for line in log_lines(tmp_path) if line["kind"] == "error"]
     assert [e["error"] for e in errors] == ["shape-refused", "shape-refused"]
-    assert [e["profile"] for e in errors] == ["standard", "t4"]
-    agent.do_mint({"id": "m3", "verb": "mint", "profile": "workload"})
+    assert [e["shape"] for e in errors] == ["cpu", "t4"]
+    agent.do_mint({"id": "m3", "verb": "mint", "shape": "cpu-highram"})
     assert [c for c in agent.cli_calls if c[0] == "new"]
-    assert list(agent.registry.children) == ["bridge-workload-m3"]
+    assert list(agent.registry.children) == ["bridge-cpu-highram-m3"]
     assert [line["kind"] for line in log_lines(tmp_path) if line["kind"] == "mint"] == ["mint"]
 
 
 def test_mint_allowed_derived_when_stamp_absent(tmp_path, monkeypatch):
     # A bridge armed before the gate has no stamp: the agent derives
     # the same set from the snapshot's shapes.
-    cfg = {"session": "lobby", "generation": "gen-t", "limits": {"max_children": 3}, "profiles": PROFILES}
+    cfg = {"session": "lobby", "generation": "gen-t", "limits": {"max_children": 3}, "shapes": SHAPES}
     agent = make_agent(tmp_path, monkeypatch, cfg)
-    assert agent.mint_allowed == {"workload"}
-    agent.do_mint({"id": "m1", "verb": "mint", "profile": "standard"})
+    assert agent.mint_allowed == {"cpu-highram"}
+    agent.do_mint({"id": "m1", "verb": "mint", "shape": "cpu"})
     assert agent.cli_calls == []
     assert [e["error"] for e in log_lines(tmp_path) if e["kind"] == "error"] == ["shape-refused"]

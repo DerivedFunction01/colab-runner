@@ -54,7 +54,7 @@ def request_file(env):
 
 def test_auto_disabled_is_inert(tmp_path):
     env = auto_env(tmp_path, enabled=False)
-    run_lease(env, "request", "standard", "--reason", "test")
+    run_lease(env, "request", "--shape", "cpu", "--reason", "test")
     assert run_lease(env, "auto")["action"] == "auto-disabled"
     assert run_lease(env, "status")["action"] == "no-lease"
     assert request_file(env).exists()  # not consumed while disabled
@@ -68,19 +68,19 @@ def test_auto_no_demand_is_inert(tmp_path):
 
 def test_auto_acquires_and_consumes(tmp_path):
     env = auto_env(tmp_path, enabled=True)
-    run_lease(env, "request", "standard", "--reason", "unit test demand")
+    run_lease(env, "request", "--shape", "cpu", "--reason", "unit test demand")
     out = run_lease(env, "auto")
     assert out["action"] == "auto-acquired"
-    assert out["session"] == "standard"
     assert out["reason"] == "unit test demand"
+    assert out["session"] == run_lease(env, "status")["record"]["session"]
     assert not request_file(env).exists()
     assert run_lease(env, "status")["action"] == "active"
 
 
 def test_auto_satisfied_live_consumes(tmp_path):
     env = auto_env(tmp_path, enabled=True)
-    run_lease(env, "acquire", "standard")
-    run_lease(env, "request", "standard", "--reason", "already up")
+    run_lease(env, "acquire", "--shape", "cpu")
+    run_lease(env, "request", "--shape", "cpu", "--reason", "already up")
     out = run_lease(env, "auto")
     assert out["action"] == "satisfied-live"
     assert not request_file(env).exists()
@@ -99,9 +99,9 @@ def test_auto_budget_refusal_keeps_demand(tmp_path):
     daily_cap = json.loads((REPO / "config" / "lease.json").read_text())["daily_cu_budget"]
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     hours = max((now - day_start).total_seconds() / 3600.0, 1 / 60)
-    seg = {"profile": "standard", "session": "seed", "start": day_start.isoformat(), "end": now.isoformat(), "rate": (daily_cap + 1) / hours}
+    seg = {"shape": "cpu", "session": "seed", "start": day_start.isoformat(), "end": now.isoformat(), "rate": (daily_cap + 1) / hours}
     (var / "lease-spend-journal.jsonl").write_text(json.dumps(seg) + "\n")
-    run_lease(env, "request", "standard", "--reason", "too expensive today")
+    run_lease(env, "request", "--shape", "cpu", "--reason", "too expensive today")
     out = run_lease(env, "auto")
     assert out["action"] == "skipped-budget"
     assert request_file(env).exists()
@@ -115,7 +115,7 @@ def test_auto_timed_start_via_cli(tmp_path):
     next pass fires it with no agent involved."""
     env = auto_env(tmp_path, enabled=True)
     future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-    run_lease(env, "request", "standard", "--reason", "timed", "--at", future)
+    run_lease(env, "request", "--shape", "cpu", "--reason", "timed", "--at", future)
     out = run_lease(env, "auto")
     assert out["action"] == "not-due"
     assert request_file(env).exists()
@@ -130,7 +130,7 @@ def test_auto_timed_start_via_cli(tmp_path):
 
 def test_unrequest(tmp_path):
     env = auto_env(tmp_path, enabled=True)
-    run_lease(env, "request", "standard")
+    run_lease(env, "request", "--shape", "cpu")
     assert run_lease(env, "unrequest")["action"] == "request-cleared"
     assert run_lease(env, "auto")["action"] == "no-demand"
 
@@ -143,7 +143,7 @@ def test_unrequest(tmp_path):
 def test_request_refused_at_write_for_agent_standard(tmp_path):
     env = auto_env(tmp_path, enabled=True)
     env.pop("COLAB_LEASE_ACTOR", None)
-    out = run_lease(env, "request", "standard", "--reason", "burst", "--caller", "test", expect_rc=1)
+    out = run_lease(env, "request", "--shape", "cpu", "--reason", "burst", "--caller", "test", expect_rc=1)
     assert out["action"] == "shape-refused"
     assert out["shape_class"] == "standard"
     assert not request_file(env).exists()  # a refused demand is never recorded
@@ -154,7 +154,7 @@ def test_auto_shape_refusal_clears_demand(tmp_path):
     env.pop("COLAB_LEASE_ACTOR", None)
     # No via: the write defers, and consumption refuses + clears,
     # so the duty never retries a permanently refused demand.
-    run_lease(env, "request", "standard", "--reason", "unattributed")
+    run_lease(env, "request", "--shape", "cpu", "--reason", "unattributed")
     out = run_lease(env, "auto")
     assert out["action"] == "skipped-shape"
     assert not request_file(env).exists()

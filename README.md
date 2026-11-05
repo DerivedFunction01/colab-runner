@@ -4,7 +4,7 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 
 ## How a job runs
 
-1. `bin/colab-run <job>` (or `bin/colab-check <paths>` for a gate job) restores transient state from the repo mirror and acquires-or-adopts the profile's shared lease session (`bin/colab-lease`; `sync/lease.py`) — one session per profile, treated as a VM, 8 h hard cap, budget-guarded. Code syncs in as a git bundle on top of a base HTTPS clone.
+1. `bin/colab-run <job>` (or `bin/colab-check <paths>` for a gate job) restores transient state from the repo mirror and acquires-or-adopts the shared lease session for the manifest's shape (`bin/colab-lease`; `sync/lease.py`) — a generated session name per lease, treated as a VM, 8 h hard cap, budget-guarded. Code syncs in as a git bundle on top of a base HTTPS clone.
 2. A remote bootstrap snippet prepares the VM (clone, dependencies, resource probe, Python-version assertion).
 3. The job executes detached on the VM (never as a kernel cell — the kill matrix measured that cells die with the local CLI); the wrapper polls and pushes checkpoints off the VM at the job's cadence.
 4. Results return as artifacts plus a hash manifest. The session stays up for the next job; a script-level reaper hook (2-minute poll) enforces the lease deadline. Colab is compute-only: code is authored on this machine, never on the VM.
@@ -12,7 +12,7 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 ## Key pieces
 
 - `config/transient.json` + `ops/mirror_transient.py` — everything that would not survive a VM restart (OAuth token, session state, the CLI install) is mirrored into `state/transient/` (untracked) and restored from there, by the reaper hook's poll and on every wrapper use, under per-item rules in the registry.
-- `config/profiles.example.json` — the tracked template for the local, untracked `config/profiles.json`: the named workload profiles available to this workspace, each with its CU/h rate (null = unconfirmed). Colab's generic shapes are served dynamically; the local file names only this workspace's workloads and roles.
+- `config/lease.json` — the lease machinery's config: budget caps, the session shape-gate policy, the default shape jobs fall back to, and the standing lease's caller/shape. The shape catalog itself is dynamic, parsed from the CLI's own help; measured per-shape rates persist in `var/shape-rates.json` (null = unconfirmed).
 - `ui/` — the operator's lease control panel (127.0.0.1:8793): start any spec for a chosen duration, grant a two-tier lease (standing lobby + burst spec), terminate early; every action is a `bin/colab-lease` call, and starts/stops/grants are announced to the main chat via the outbox + notify hook. No agent operates the lease.
 - `sync/` — snapshot-bundle construction on the origin lineage, bundle apply, the per-class data manifest (transfer vs driver-plus-regenerate vs network regeneration, priced), and result pull-back with hash verification.
 - `probes/` — the P0–P4 probe suites: local network, session shape, transfer channels, execution behaviour + kill matrix, restart survival. Results land in `probes/results/`.
@@ -21,15 +21,11 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 
 ## First-time setup
 
-First create this workspace's local profile config from the tracked example, then edit its profile ids, labels, session names, and default for the workloads this workspace actually runs. Leave a rate null until a lease on this workspace's account measures it.
-
 ```bash
-[ -f config/profiles.json ] || cp config/profiles.example.json config/profiles.json
-# edit config/profiles.json for this workspace
 ops/bootstrap_local.sh          # installs google-colab-cli via uv, restores transients
 ```
 
-Operator-only step: the one-time OAuth login. Use the session named by the local default profile, adding `--high-mem` when that profile sets `high_mem: true`; the command prints a URL to open anywhere and paste the returned code back.
+Operator-only step: the one-time OAuth login. Create a session with the CLI (`colab new -s <any-name>`, adding `--high-mem` for the High-RAM shape); the command prints a URL to open anywhere and paste the returned code back.
 
 After that, the token is cached and mirrored, and wrappers handle the rest. Design and rulings: `.plans/2026-10-29-colab-runner-for-workload-repo.md`.
 

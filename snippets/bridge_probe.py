@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Bridge probe: the in-VM half of a lobby-as-bridge probe
-(2026-11-01). Runs detached inside the standing lobby session and
+"""Bridge probe: the in-VM half of a standing-as-bridge probe
+(2026-11-01). Runs detached inside the standing lease session and
 tests the bridge topology end to end:
 
   this side plants command files in a queue directory (file
   channel) -> the watcher executes them — OS commands in the
-  lobby itself, or relayed into a child session the lobby minted
+  standing lease itself, or relayed into a child session it minted
   (in-VM CLI exec) -> every step appends a JSON line to
   bridge.log, which this side downloads and reads.
 

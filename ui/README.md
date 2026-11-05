@@ -25,31 +25,20 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
 
 - `ui/server.py` — Python standard library only. It holds no lease
   logic: reads and mutations are subprocess calls to `bin/colab-lease`
-  (`state`, `acquire <profile> [--hours H]`, `release [profile]`,
-  `grant --hours H [--burst <profile>]`, `ungrant`), and the core's JSON is passed through
+  (`state`, `acquire --shape <shape> [--hours H]`, `release [session]`,
+  `grant --hours H [--burst <shape>]`, `ungrant`), and the core's JSON is passed through
   to the page. All derivation stays core-side; the page only does
   countdown arithmetic on served timestamps and projected-CU arithmetic
   over the served rate table.
-- `GET /api/state` — core `state` JSON plus `profiles` and `caps` read
-  from `config/profiles.json` (local, untracked) and `config/lease.json`.
-- `POST /api/lease/start {profile, hours}`, `POST /api/lease/stop
-  {profile}`, `POST /api/grant {hours, burst}`, `POST /api/ungrant`.
-  The profile/spec pickers (normal mode, and the burst tier in
+- `GET /api/state` — core `state` JSON plus `caps` read from
+  `config/lease.json`.
+- `POST /api/lease/start {shape, hours}`, `POST /api/lease/stop
+  {session}`, `POST /api/lease/extend {session, hours}`,
+  `POST /api/grant {hours, burst}`, `POST /api/ungrant`.
+  The spec pickers (normal mode, and the burst tier in
   two-tier mode) are rendered from the core's `state.specs` list —
   every spec with its served label and `rate_cu_per_hour`; a null rate
   renders as "Cost unconfirmed", including in the projected cost.
-- `POST /api/config/parallel {profile, enabled}` — sets a base
-  profile's parallel-instance toggle (`bin/colab-lease parallel
-  <profile> --on|--off`). Eligible specs (CPU shapes, per the core's
-  served `parallel` block on each `state.specs` entry) render a
-  Parallel toggle on their picker row; a toggled-on instance renders
-  as its own lease card — a Start card while dormant, the ordinary
-  lease card while it runs. Instance start/stop ride the lease
-  endpoints above with the instance profile id; there are no
-  instance-specific endpoints. A core refusal (ineligible shape,
-  toggle-off while the instance lease is live) answers 200 with the
-  refusal action, like extend. Success appends a `parallel-changed`
-  outbox event.
 - `POST /api/server/restart` — spawns `ui/ui.sh restart` detached
   (path overridable via `COLAB_LEASE_UI_SH`) and answers
   `{action: "restart-requested"}` immediately. It is the degraded

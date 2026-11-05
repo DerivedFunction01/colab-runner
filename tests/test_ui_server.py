@@ -2,9 +2,9 @@
 no real lease state).
 
 Covers the contract the page depends on: /api/state passes the core
-JSON through (plus profiles + caps), mutations invoke bin/colab-lease
-with the right argv and append the right outbox events with increasing
-seq, and /api/outbox?after= filters without acknowledging.
+JSON through (plus caps), mutations invoke bin/colab-lease with the
+right argv and append the right outbox events with increasing seq,
+and /api/outbox?after= filters without acknowledging.
 """
 
 import json
@@ -124,14 +124,12 @@ def test_index_and_theme_served(ui):
 
 def test_state_passes_core_json_through(ui):
     data = ui.get_json("/api/state")
-    assert data["records"][0]["profile"] == "workload"
-    assert data["records"][0]["record"]["session"] == "workload"
+    assert data["records"][0]["session"] == "amber-otter-42"
+    assert data["records"][0]["record"]["session"] == "amber-otter-42"
+    assert data["records"][0]["record"]["shape"] == "cpu-highram"
     assert data["records"][0]["action"] == "active"
     assert data["grant"] is None
     assert data["budget"]["balance"] == 571.7
-    # profiles + caps are served alongside, from the repo config
-    assert data["profiles"]["profiles"]["workload"]["high_mem"] is True
-    assert data["profiles"]["default_profile"] == "workload"
     # The caps are the operator's live panel settings: compare
     # against the config file, never a pinned constant.
     live_cfg = json.loads((REPO / "config" / "lease.json").read_text())
@@ -145,17 +143,17 @@ def test_state_part_endpoints_serve_their_slice(ui):
     own core portion and returns only its slice (plus the repo-file
     config on the portions whose sections render it)."""
     records = ui.get_json("/api/state/records")
-    assert records["records"][0]["profile"] == "workload"
+    assert records["records"][0]["session"] == "amber-otter-42"
     assert "budget" not in records and "specs" not in records
 
     specs = ui.get_json("/api/state/specs")
-    assert {s["id"] for s in specs["specs"]} == {"workload", "lobby", "standard", "t4"}
-    assert specs["profiles"]["default_profile"] == "workload"
+    assert {s["id"] for s in specs["specs"]} == {"cpu-highram", "cpu", "t4"}
+    assert "profiles" not in specs
     assert "caps" in specs
 
     budget = ui.get_json("/api/state/budget")
     assert budget["budget"]["balance"] == 571.7
-    assert "caps" in budget and "profiles" in budget
+    assert "caps" in budget and "profiles" not in budget
 
     grant = ui.get_json("/api/state/grant")
     assert grant["grant"] is None and grant["envelope"] is None
@@ -200,17 +198,16 @@ def test_frontend_loads_state_in_portions(ui):
 def test_state_serves_specs_including_null_rate(ui):
     data = ui.get_json("/api/state")
     specs = {s["id"]: s for s in data["specs"]}
-    assert set(specs) == {"workload", "lobby", "standard", "t4"}
-    assert specs["workload"]["rate_cu_per_hour"] == 0.26
-    assert specs["workload"]["high_mem"] is True
+    assert set(specs) == {"cpu-highram", "cpu", "t4"}
+    assert specs["cpu-highram"]["rate_cu_per_hour"] == 0.26
+    assert specs["cpu-highram"]["high_mem"] is True
     assert specs["t4"]["gpu"] == "T4"
     # the null-rate entry is what drives the UI's "Cost unconfirmed"
     assert specs["t4"]["rate_cu_per_hour"] is None
-    # every spec carries its catalog label (display name; ids unchanged)
-    assert specs["workload"]["label"] == "High-RAM"
-    assert specs["lobby"]["label"] == "Lobby"
-    assert specs["standard"]["label"] == "Standard"
-    assert specs["t4"]["label"] == "T4"
+    # every spec carries its catalog label
+    assert specs["cpu-highram"]["label"] == "High-RAM CPU"
+    assert specs["cpu"]["label"] == "Standard CPU"
+    assert specs["t4"]["label"] == "T4 GPU"
 
 
 def test_frontend_renders_specs_and_cost_unconfirmed():
@@ -220,14 +217,14 @@ def test_frontend_renders_specs_and_cost_unconfirmed():
     assert "label" in js  # spec rows and card titles render the label
     html = (REPO / "ui" / "static" / "index.html").read_text()
     assert 'id="burst-specs"' in html  # two-tier burst spec picker
-    assert 'id="profile-specs"' in html  # normal-lease spec picker
+    assert 'id="shape-specs"' in html  # normal-lease spec picker
     # the full duration picker from the mockup: presets to 3d + custom
     assert 'data-hours="72"' in html
     assert 'id="normal-custom"' in html
     assert 'id="grant-custom"' in html
 
 
-def test_grant_passes_burst_profile(ui):
+def test_grant_passes_burst_shape(ui):
     status, result = ui.post("/api/grant", {"hours": 4, "burst": "t4"})
     assert status == 200 and result["action"] == "granted"
     assert "grant --hours 4 --burst t4" in ui.invocations()
@@ -237,15 +234,15 @@ def test_grant_passes_burst_profile(ui):
 
 
 def test_start_invokes_acquire_and_appends_event(ui):
-    status, result = ui.post("/api/lease/start", {"profile": "workload", "hours": 2})
+    status, result = ui.post("/api/lease/start", {"shape": "cpu-highram", "hours": 2})
     assert status == 200
     assert result["action"] == "acquired"
-    assert "acquire workload --hours 2 --via panel --caller panel" in ui.invocations()
+    assert "acquire --shape cpu-highram --hours 2 --via panel --caller panel" in ui.invocations()
     events = ui.outbox_events()
     assert len(events) == 1
     assert events[0]["kind"] == "lease-started"
     assert events[0]["seq"] == 1
-    assert events[0]["detail"]["profile"] == "workload"
+    assert events[0]["detail"]["shape"] == "cpu-highram"
     assert events[0]["detail"]["hours"] == 2
 
 
@@ -253,14 +250,14 @@ def test_start_carries_panel_actor_claim(ui):
     # Session shape gate: the server claims the panel actor in the
     # child env on every core call, so a panel start can ride the
     # core's bypass (env claim + --via panel together).
-    status, _result = ui.post("/api/lease/start", {"profile": "standard", "hours": 1})
+    status, _result = ui.post("/api/lease/start", {"shape": "cpu", "hours": 1})
     assert status == 200
-    assert "acquire standard --hours 1 --via panel --caller panel" in ui.invocations()
+    assert "acquire --shape cpu --hours 1 --via panel --caller panel" in ui.invocations()
     assert "actor:panel" in ui.invocations()
 
 
 def test_stop_grant_ungrant_flow_and_seqs(ui):
-    status, result = ui.post("/api/lease/stop", {"profile": "workload"})
+    status, result = ui.post("/api/lease/stop", {"session": "amber-otter-42"})
     assert status == 200 and result["action"] == "released"
     status, result = ui.post("/api/grant", {"hours": 4})
     assert status == 200 and result["action"] == "granted"
@@ -268,7 +265,7 @@ def test_stop_grant_ungrant_flow_and_seqs(ui):
     assert status == 200 and result["action"] == "grant-ended"
 
     invocations = ui.invocations()
-    assert "release workload" in invocations
+    assert "release amber-otter-42" in invocations
     assert "grant --hours 4" in invocations
     assert "ungrant" in invocations
 
@@ -278,8 +275,8 @@ def test_stop_grant_ungrant_flow_and_seqs(ui):
 
 
 def test_outbox_after_filters_without_acknowledging(ui):
-    ui.post("/api/lease/start", {"profile": "workload", "hours": 1})
-    ui.post("/api/lease/stop", {"profile": "workload"})
+    ui.post("/api/lease/start", {"shape": "cpu-highram", "hours": 1})
+    ui.post("/api/lease/stop", {"session": "amber-otter-42"})
 
     page = ui.get_json("/api/outbox?after=1")
     assert [e["seq"] for e in page["events"]] == [2]
@@ -294,31 +291,31 @@ def test_outbox_after_filters_without_acknowledging(ui):
 def test_start_core_failure_appends_failed_event(tmp_path):
     server = UiServer(tmp_path, extra_env={"STUB_LEASE_FAIL": "acquire"})
     try:
-        status, _ = server.post("/api/lease/start", {"profile": "workload", "hours": 2})
+        status, _ = server.post("/api/lease/start", {"shape": "cpu-highram", "hours": 2})
         assert status == 502
         events = server.outbox_events()
         assert len(events) == 1
         assert events[0]["kind"] == "lease-start-failed"
-        assert events[0]["detail"]["profile"] == "workload"
+        assert events[0]["detail"]["shape"] == "cpu-highram"
     finally:
         server.close()
 
 
-def test_start_requires_profile(ui):
+def test_start_requires_shape(ui):
     status, body = ui.post("/api/lease/start", {"hours": 2})
     assert status == 400
     assert ui.outbox_events() == []
 
 
 def test_extend_lease_endpoint_invokes_core_and_appends_event(ui):
-    status, result = ui.post("/api/lease/extend", {"profile": "workload", "hours": 2})
+    status, result = ui.post("/api/lease/extend", {"session": "amber-otter-42", "hours": 2})
     assert status == 200
     assert result["action"] == "extended"
-    assert "extend workload --hours 2" in ui.invocations()
+    assert "extend amber-otter-42 --hours 2" in ui.invocations()
     events = ui.outbox_events()
     assert len(events) == 1
     assert events[0]["kind"] == "lease-extended"
-    assert events[0]["detail"]["profile"] == "workload"
+    assert events[0]["detail"]["session"] == "amber-otter-42"
     assert events[0]["detail"]["hours"] == 2
     assert events[0]["detail"]["old_deadline"] == "2026-11-02T00:00:00+00:00"
     assert events[0]["detail"]["new_deadline"] == "2026-11-02T02:00:00+00:00"
@@ -344,7 +341,7 @@ def test_extend_refusals_are_failures_with_events(tmp_path):
     reason surfaces."""
     server = UiServer(tmp_path, extra_env={"STUB_EXTEND_REFUSE": "1"})
     try:
-        status, result = server.post("/api/lease/extend", {"profile": "workload", "hours": 2})
+        status, result = server.post("/api/lease/extend", {"session": "amber-otter-42", "hours": 2})
         assert status == 200
         assert result["action"] == "refused-budget"
         status, result = server.post("/api/grant/extend", {"hours": 2})
@@ -357,8 +354,8 @@ def test_extend_refusals_are_failures_with_events(tmp_path):
 
 def test_extend_validation(ui):
     assert ui.post("/api/lease/extend", {"hours": 2})[0] == 400
-    assert ui.post("/api/lease/extend", {"profile": "workload"})[0] == 400
-    assert ui.post("/api/lease/extend", {"profile": "workload", "hours": -1})[0] == 400
+    assert ui.post("/api/lease/extend", {"session": "amber-otter-42"})[0] == 400
+    assert ui.post("/api/lease/extend", {"session": "amber-otter-42", "hours": -1})[0] == 400
     assert ui.post("/api/grant/extend", {})[0] == 400
     assert ui.post("/api/grant/extend", {"hours": 0})[0] == 400
     assert ui.invocations() == []
@@ -388,7 +385,7 @@ def test_server_restart_spawns_ui_sh_detached(tmp_path):
         assert sh_log.exists() and sh_log.read_text().splitlines() == ["restart"]
         # and this server is still alive and serving afterwards
         data = server.get_json("/api/state")
-        assert data["records"][0]["profile"] == "workload"
+        assert data["records"][0]["session"] == "amber-otter-42"
         # a restart is not a lease event: nothing enters the outbox
         assert server.outbox_events() == []
     finally:
@@ -402,13 +399,13 @@ def test_reaper_spool_drains_into_the_outbox_once(ui):
     has not finished appending is left for the next drain."""
     spool = ui.var / "reaper-events.jsonl"
     spool.parent.mkdir(parents=True, exist_ok=True)
-    spool.write_text(json.dumps({"kind": "lease-renewed", "profile": "workload", "driver": 2, "old_session": "workload", "new_session": "workload-r123"}) + "\n")
+    spool.write_text(json.dumps({"kind": "lease-renewed", "session": "amber-otter-42", "shape": "cpu-highram", "driver": 2, "old_session": "amber-otter-42", "new_session": "amber-otter-42-r123"}) + "\n")
     events = ui.outbox_events()
     assert [e["kind"] for e in events] == ["lease-renewed"]
-    assert events[0]["detail"] == {"profile": "workload", "driver": 2, "old_session": "workload", "new_session": "workload-r123"}
+    assert events[0]["detail"] == {"session": "amber-otter-42", "shape": "cpu-highram", "driver": 2, "old_session": "amber-otter-42", "new_session": "amber-otter-42-r123"}
     assert ui.outbox_events() == events  # drained once, never duplicated
     with spool.open("a") as fh:
-        fh.write('{"kind": "lease-renewed", "profile": "l4"')  # unterminated
+        fh.write('{"kind": "lease-renewed", "session": "l4"')  # unterminated
     assert ui.outbox_events() == events
     with spool.open("a") as fh:
         fh.write(', "driver": 1, "old_session": "l4", "new_session": "l4-r9"}\n')
@@ -427,9 +424,9 @@ def test_envelope_state_passes_through(tmp_path):
         env = data["envelope"]
         assert env["id"] == "2026-11-01T00:00:00+00:00"
         assert env["caps"] == {"daily": 10, "monthly": 100, "standing_daily": 2.0}
-        assert env["scope"]["profiles"] == ["lobby", "workload"]
-        assert env["records"][0]["profile"] == "workload"
-        assert env["records"][0]["via"] == "xbrl-thread"
+        assert env["scope"]["shapes"] == ["cpu", "cpu-highram"]
+        assert env["records"][0]["session"] == "amber-otter-42"
+        assert env["records"][0]["caller"] == "xbrl-thread"
         assert data["grant"]["scope"]["caps"]["daily"] == 10
     finally:
         server.close()
@@ -441,12 +438,12 @@ def test_envelope_spool_kinds_drain_into_the_outbox(ui):
     spool = ui.var / "reaper-events.jsonl"
     spool.parent.mkdir(parents=True, exist_ok=True)
     spool.write_text(
-        json.dumps({"kind": "envelope-lease-started", "profile": "workload", "envelope_id": "2026-11-01T00:00:00+00:00", "via": "xbrl-thread"}) + "\n"
-        + json.dumps({"kind": "envelope-lease-released", "profile": "workload", "envelope_id": "2026-11-01T00:00:00+00:00", "reason": "deadline"}) + "\n"
+        json.dumps({"kind": "envelope-lease-started", "session": "amber-otter-42", "shape": "cpu-highram", "envelope_id": "2026-11-01T00:00:00+00:00", "caller": "xbrl-thread"}) + "\n"
+        + json.dumps({"kind": "envelope-lease-released", "session": "amber-otter-42", "shape": "cpu-highram", "envelope_id": "2026-11-01T00:00:00+00:00", "reason": "deadline"}) + "\n"
     )
     events = ui.outbox_events()
     assert [e["kind"] for e in events] == ["envelope-lease-started", "envelope-lease-released"]
-    assert events[0]["detail"]["via"] == "xbrl-thread"
+    assert events[0]["detail"]["caller"] == "xbrl-thread"
     assert events[1]["detail"]["reason"] == "deadline"
 
 
@@ -493,61 +490,6 @@ def test_frontend_has_budget_cap_editor():
     js = (REPO / "ui" / "static" / "app.js").read_text()
     assert "/api/config/budget" in js
     assert "Edit caps" in js
-
-
-def test_parallel_endpoint_invokes_core_and_appends_event(ui):
-    status, data = ui.post("/api/config/parallel", {"profile": "workload", "enabled": True})
-    assert status == 200
-    assert data["action"] == "parallel-updated"
-    assert data["instance"] == "workload2"
-    assert "parallel workload --on" in ui.invocations()
-    events = ui.outbox_events()
-    assert [e["kind"] for e in events] == ["parallel-changed"]
-    assert events[0]["detail"]["enabled"] is True
-    status, data = ui.post("/api/config/parallel", {"profile": "workload", "enabled": False})
-    assert status == 200
-    assert "parallel workload --off" in ui.invocations()
-
-
-def test_parallel_endpoint_rejects_bad_bodies(ui):
-    for payload in ({}, {"enabled": True}, {"profile": 5, "enabled": True}, {"profile": "workload"}, {"profile": "workload", "enabled": "yes"}, {"profile": "workload", "enabled": 1}):
-        status, _ = ui.post("/api/config/parallel", payload)
-        assert status == 400, payload
-    assert ui.invocations() == []  # nothing reached the core
-    assert ui.outbox_events() == []
-
-
-def test_parallel_core_refusal_answers_200_with_the_action(tmp_path):
-    """Like the extend endpoints: a core refusal is a 200 carrying
-    the refusal action (the page reads it and says why), and no
-    outbox event is appended for a change that did not happen."""
-    server = UiServer(tmp_path, extra_env={"STUB_PARALLEL_INELIGIBLE": "1"})
-    try:
-        status, data = server.post("/api/config/parallel", {"profile": "t4", "enabled": True})
-        assert status == 200
-        assert data["action"] == "parallel-ineligible"
-        assert server.outbox_events() == []
-    finally:
-        server.close()
-
-
-def test_instance_start_stop_route_through_lease_endpoints(ui):
-    """No new lease endpoints for instances: start/stop carry the
-    instance profile id through the existing routes."""
-    status, result = ui.post("/api/lease/start", {"profile": "workload2", "hours": 2})
-    assert status == 200 and result["action"] == "acquired"
-    assert "acquire workload2 --hours 2 --via panel --caller panel" in ui.invocations()
-    status, result = ui.post("/api/lease/stop", {"profile": "workload2"})
-    assert status == 200 and result["action"] == "released"
-    assert "release workload2" in ui.invocations()
-
-
-def test_frontend_has_parallel_toggle_and_instance_card():
-    js = (REPO / "ui" / "static" / "app.js").read_text()
-    assert "/api/config/parallel" in js
-    assert "data-parallel" in js  # the per-spec toggle, bound to the served block
-    assert "data-istart" in js  # the dormant instance card's Start
-    assert "parallelToggleHTML" in js
 
 
 def test_access_release_endpoint_and_outbox(ui):

@@ -40,13 +40,15 @@ def test_tracked_files_are_portable():
     assert not offenders, "\n".join(offenders)
 
 
-def test_profiles_config_is_local_and_seeded_from_tracked_example():
-    """The workspace's named profiles are local data, following the
-    repos-registry split: the actual config/profiles.json is
-    gitignored and untracked, while a fictional, schema-complete
-    config/profiles.example.json is tracked as the seed."""
+def test_profiles_config_is_retired():
+    """Profiles were retired (2026-11-05): no tracked example seeds
+    them any more. A leftover local config/profiles.json may exist
+    as the legacy rate source for pre-retirement records, but it
+    stays gitignored and untracked like every local config."""
     names = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
-    assert "config/profiles.example.json" in names
+    # The working tree is the governed surface: a tracked seed
+    # would be present in it (the index catches up at landing).
+    assert not (REPO / "config" / "profiles.example.json").exists()
     assert "config/profiles.json" not in names
     ignored = subprocess.run(
         ["git", "check-ignore", "-q", "config/profiles.json"],
@@ -56,23 +58,13 @@ def test_profiles_config_is_local_and_seeded_from_tracked_example():
     )
     assert ignored.returncode == 0
 
-    example = json.loads((REPO / "config" / "profiles.example.json").read_text())
-    profiles = example.get("profiles", {})
-    assert profiles
-    assert example.get("default_profile") in profiles
-    assert all(profile.get("rate_cu_per_hour") is None for profile in profiles.values())
-    example_text = json.dumps(example)
-    assert WORKLOAD_LITERAL not in example_text
-    assert "pay" + "gate" not in example_text
-
 
 def test_no_workload_literal_in_executable_code():
-    """The default workload's profile id must not appear as a
-    literal in executable code (2026-11-03 hardcode strip):
-    code resolves the default profile only from
-    config/profiles.json's `default_profile` and fails loudly
-    when the key is absent, and any session creation derives its
-    names from config.
+    """The retired default workload's profile id must not appear
+    as a literal in executable code (2026-11-03 hardcode strip):
+    code resolves the default shape only from config/lease.json's
+    `default_shape` key, and session names are generated, never
+    derived from a workload.
 
     Scope: only files that are BOTH tracked and hand-authored
     executable code — `git ls-files` supplies the tracked set, so
@@ -82,8 +74,8 @@ def test_no_workload_literal_in_executable_code():
     are scanned (.py/.sh/.js and the extensionless bin
     executables): docs, markup, stylesheets, job definitions and
     fixtures are data and out of scope, and
-    the local config/profiles.json — outside these directories
-    anyway — is the sanctioned seam that names the workload. The literal
+    the config files — outside these directories anyway — are the
+    sanctioned seams that name shapes and callers. The literal
     is matched as a standalone token, so the workload repo's own
     name (with a hyphenated suffix) and the SEC system's name
     are not the profile id."""

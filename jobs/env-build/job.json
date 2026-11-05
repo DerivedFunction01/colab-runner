@@ -1,1 +1,1 @@
-{"args":["--script","/content/env_build.sh"],"checkpoint_pull_seconds":45,"name":"env-build","outputs":["env_report.json","heartbeat.log","checkpoint.json"],"profile":"workload","script":"snippets/shell_job.py","timeout":3600,"units":1}
+{"args":["--script","/content/env_build.sh"],"checkpoint_pull_seconds":45,"name":"env-build","outputs":["env_report.json","heartbeat.log","checkpoint.json"],"shape":"cpu-highram","script":"snippets/shell_job.py","timeout":3600,"units":1}

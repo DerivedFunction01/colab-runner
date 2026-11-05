@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Broker probe: the in-VM half of the two-tier envelope plan's
 Step 6 (beachhead broker probe). Runs inside a beachhead session
-(the standing lobby) and measures what a brokered burst start
+(the standing lease) and measures what a brokered burst start
 costs: place the account token at its canonical path, build the
 official CLI's venv (the renewal kit's measured steps, its own
 directory), then mint throwaway standard sessions with the in-VM

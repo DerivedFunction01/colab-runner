@@ -28,8 +28,21 @@ FAKE_ENV_KEEPALIVE = dict(KEEPALIVE_MAX_CYCLES="2", KEEPALIVE_INTERVAL_SECONDS="
 FAKE_ENV_GATE = dict(COLAB_LEASE_ACTOR="test")
 
 
+def runner_env(tmp_path, **extra):
+    # A scratch HOME, exactly as test_lease_fake.lease_env builds:
+    # without it the fake CLI writes its session bindings into the
+    # real ~/.config/colab-cli/sessions.json (the 2026-11-05
+    # pollution that blinded the lease machinery to live sessions).
+    home = tmp_path / "home"
+    token = home / ".config" / "colab-cli" / "token.json"
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text('{"refresh_token": "fake-test-token"}')
+    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
+    return dict(os.environ, HOME=str(home), COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE, **extra)
+
+
 def test_colab_run_smoke_end_to_end(tmp_path):
-    env = dict(os.environ, COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE)
+    env = runner_env(tmp_path)
     r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
@@ -43,7 +56,7 @@ def test_colab_run_smoke_end_to_end(tmp_path):
 
 
 def test_orphan_sweep_marks_dead_session(tmp_path):
-    env = dict(os.environ, COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE)
+    env = runner_env(tmp_path)
     runs = REPO / "results" / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     stale = runs / "ghost-20000101T000000Z.json"

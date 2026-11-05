@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# Create (or reuse) the session for a profile. Usage: colab-up [profile]
+# Create a session at a shape, under a fresh generated name.
+# Usage: colab-up [shape]  (default: the config's default_shape)
+# Adoption/reuse of a live lease is the lease core's job
+# (bin/colab-lease acquire); this wrapper is the bare creation path.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
 wrap_enter
-PROFILE="${1:-$(default_profile)}"
+SHAPE="${1:-$(default_shape)}"
 # Session shape gate: this creation path bypasses the lease core,
 # so it consults the core's admission verdict first; a refusal
 # prints the verdict and fails the up before any CLI call.
-if ! GATE_VERDICT="$(gate_check "$PROFILE")"; then
+if ! GATE_VERDICT="$(gate_check "$SHAPE")"; then
   printf '%s\n' "$GATE_VERDICT"
   exit 1
 fi
-# shellcheck disable=SC2046
-"$COLAB_BIN" --auth oauth2 new $(profile_args "$PROFILE")
+PLAN="$(plan_for "$SHAPE")"
+SESSION="$(printf '%s\n' "$PLAN" | sed -n '1p')"
+NEW_ARGS="$(printf '%s\n' "$PLAN" | sed -n '2p')"
+# shellcheck disable=SC2086
+"$COLAB_BIN" --auth oauth2 new $NEW_ARGS
 # Prime this scope's approval for the new tunnel host (initiation-time
 # approval plan, Step 2): one cheap, bounded download attempt against
 # the session — the attempt itself surfaces the card in this minute,
 # while the operator is present. Its result is irrelevant and never
 # fails the up.
-SESSION="$(profile_field "$PROFILE" session)"
 PRIME_DEST="$(mktemp)"
 timeout 30 "$COLAB_BIN" --auth oauth2 download -s "$SESSION" /content/keepalive.log "$PRIME_DEST" >/dev/null 2>&1 || true
 rm -f "$PRIME_DEST"

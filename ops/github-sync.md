@@ -65,8 +65,8 @@ with `</dev/null`, and pass `-n` to any `ssh` probe inside it.
 - A fresh clone is executable-complete: git carries the modes (24
   files at `100755` at the time of writing).
 - Local-only state is not in the repo by design and must be seeded
-  from the workspace after a clone: `config/profiles.json` (named
-  workload profiles), plus the runtime state under `var/` and
+  from the workspace after a clone: `config/callers.json` (the local
+  caller registry), plus the runtime state under `var/` and
   `state/` when the clone is meant to operate, not just build.
 - History note: on 2026-11-03 the history was rewritten from inside a
   Colab session (Route B's first push) to strip a local config file

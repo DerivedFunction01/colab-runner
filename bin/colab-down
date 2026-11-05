@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Stop the session for a profile. Usage: colab-down [profile]
+# Stop a session by name. Usage: colab-down SESSION
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_wrap.sh"
 wrap_enter
-PROFILE="${1:-$(default_profile)}"
-SESSION="$(profile_field "$PROFILE" session)"
+SESSION="${1:?usage: colab-down SESSION}"
 "$COLAB_BIN" --auth oauth2 stop -s "$SESSION"
