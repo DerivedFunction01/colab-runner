@@ -80,12 +80,12 @@ jobs:
   uploading `config/repos.json` to `/content/repos.json`. It is
   repo-agnostic: dest, venv path, the `init_venv.py` invocation,
   version checks, and scan roots all come from the registry entry.
-  The currently registered repo's invocation is the adapted drive
-  `python3 init_venv.py --choice 0` from the clone root (its script is
-  interactive only with no arguments; Unit 0 seeds the resolved `uv`'s
-  directory on `PATH` for its bare-`PATH` detection, and no torch
-  choice is taken). A script that reports falling back to pip fails
-  the build — on this image that fallback is the pip-less-venv route.
+  The currently registered repo's invocation is the plain drive
+  `python3 init_venv.py` from the clone root (its script is
+  non-interactive; Unit 0 seeds the resolved `uv`'s
+  directory on `PATH` for its bare-`PATH` detection). A script that
+  reports falling back to pip fails the build — on this image that
+  fallback is the pip-less-venv route.
   As a job, env-build runs through `snippets/shell_job.py`
   (`jobs/env-build/job.json`, `--script /content/env_build.sh`);
   upload `env_build.sh` and `repos.json` to `/content` first.
@@ -151,7 +151,7 @@ Findings first: a lease's deadline is a window end, and an extension
 moves the end — never the session. Renewal keeps a window alive
 across the sessions it outlives.
 
-- **Extend**: `bin/colab-lease extend [profile] --hours H` (panel:
+- **Extend**: `bin/colab-lease extend SESSION --hours H` (panel:
   the lease card's Extend control) moves the deadline by H, priced by
   the budget guard on the delta only (rate × H). The record gains
   `renew: true` — it is now a window lease. `extend-grant --hours H`
@@ -212,12 +212,15 @@ scope afterwards is script-level machinery and served state.
   tag `via`. Outside the scope, a lease is an ordinary lease: live
   config caps, neither stamp.
 - **Threads start bursts by demand, never by agent-fired
-  commands**: `bin/colab-lease request [profile] --via TAG
+  commands**: `bin/colab-lease request --via TAG
   --reason TEXT` plants the demand; the hook's auto duty creates
   the lease and copies the tag onto its record. A timed start is
   the same record with `--at ISO-TIME` (a `not_before` stamp): the
   duty leaves it untouched until due, then fires it — no agent and
-  no operator present. Panel starts stamp `via: panel`; the job
+  no operator present. Panel starts stamp `via: panel` and are
+  creations, never adoptions (`acquire --create`): starting mints
+  a parallel lease at the shape; using the current lease is the
+  extend path. The job
   runner stamps `via: runner`; the standing duty stamps
   `via: standing`.
 - **Tracking**: the envelope lifecycle is ledgered in
