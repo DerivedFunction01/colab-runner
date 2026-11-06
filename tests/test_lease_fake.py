@@ -270,6 +270,25 @@ def test_second_caller_rides_the_existing_lease(tmp_path, monkeypatch):
     assert claims[a["record"]["session"]]["caller"] == "beta"
 
 
+def test_create_mints_a_parallel_lease_instead_of_riding(tmp_path, monkeypatch):
+    """An explicit create (the panel's Start, operator ruling
+    2026-11-05) never adopts: with a live lease at the shape it
+    mints a second, parallel session. Plain acquire keeps riding
+    — creating is what --create is for; using the current lease
+    is extend's job."""
+    repo = scratch_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    a = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
+    b = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="panel", create=True)
+    assert a["action"] == "created"
+    assert b["action"] == "created"
+    assert b["record"]["session"] != a["record"]["session"]
+    assert b["record"]["caller"] == "panel"
+    assert len(lease_mod.all_records(repo)) == 2
+    c = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="beta")
+    assert c["action"] == "adopted"
+
+
 def test_acquire_unknown_shape_creates_nothing(tmp_path, monkeypatch):
     repo = scratch_repo(tmp_path, monkeypatch)
     fake = FakeColab()

@@ -47,6 +47,10 @@ _naming_spec = _ilu.spec_from_file_location("colab_naming", Path(__file__).resol
 naming = _ilu.module_from_spec(_naming_spec)
 _naming_spec.loader.exec_module(naming)
 
+_liveness_spec = _ilu.spec_from_file_location("colab_liveness_entry", Path(__file__).resolve().parent / "liveness_entry.py")
+liveness_entry = _ilu.module_from_spec(_liveness_spec)
+_liveness_spec.loader.exec_module(liveness_entry)
+
 
 def var_dir(repo: Path) -> Path:
     return Path(os.environ.get("COLAB_RUNNER_VAR", repo / "var"))
@@ -623,6 +627,13 @@ def save_record(repo: Path, rec: dict) -> None:
         held = _valid_record(load_json(other, None))
         if held is not None and held.get("session") == session:
             other.unlink(missing_ok=True)
+    # Session liveness: a saved live record carries its derived
+    # scheduler entry (sync/liveness_entry.py). The sync never
+    # fails the save — drift is repaired by the reaper janitor.
+    try:
+        liveness_entry.sync_for_record(repo, rec)
+    except Exception:
+        pass
 
 
 def delete_record(repo: Path, session: str) -> None:
@@ -633,6 +644,12 @@ def delete_record(repo: Path, session: str) -> None:
         held = _valid_record(load_json(path, None))
         if held is not None and held.get("session") == session:
             path.unlink(missing_ok=True)
+    # Session liveness: the derived scheduler entry dies with
+    # the record, in the same call.
+    try:
+        liveness_entry.remove_for_session(repo, session)
+    except Exception:
+        pass
 
 
 # --- Generated session names ----------------------------------------------------
@@ -1305,7 +1322,7 @@ def install_renewal_kit(colab, repo: Path, rec: dict, now_dt: datetime | None = 
     return {"kit": "installed"}
 
 
-def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False) -> dict:
+def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False, create: bool = False) -> dict:
     """Adopt a live lease at this shape or create one. The only
     entry point that ever creates a session under the lease model.
     A session is shared capacity, not a caller's possession: any
@@ -1319,6 +1336,9 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     (duty/standing): a demand the hook consumes and the standing
     duty exist to add or hold a lease of their own, so they adopt
     only their own (or an unstamped) record and otherwise create.
+    An explicit create (create=True — the panel's Start) never
+    adopts at all: starting is creating a parallel lease, and
+    using the current one is extend's job.
 
     `hours` sets this lease's window: the deadline is now + hours
     and the budget projection prices that window, exactly as given —
@@ -1358,7 +1378,12 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     grant = active_grant(repo, now_dt)
     in_scope = shape_in_grant(repo, grant, shape_id)
     at_shape = [r for r in all_records(repo) if r.get("shape") == shape_id]
-    if duty or standing:
+    if create:
+        # An explicit create mints a parallel lease: the adoption
+        # pool is empty by construction, so the create path below
+        # runs with its budget guard and shape gate unchanged.
+        pool = []
+    elif duty or standing:
         # Capacity duties adopt only their own (or an unstamped)
         # record; every other call may use any available lease.
         pool = [r for r in at_shape if r.get("caller") in (caller, None)]

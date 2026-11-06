@@ -380,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
         shape = body.get("shape")
         if not shape or not isinstance(shape, str):
             return self.send_json(400, {"error": "shape is required"})
-        args = ["acquire", "--shape", shape]
+        args = ["acquire", "--shape", shape, "--create"]
         hours = body.get("hours")
         if hours is not None:
             try:
@@ -393,6 +393,9 @@ class Handler(BaseHTTPRequestHandler):
         # lease record shows who started it (envelope attribution),
         # and its caller claim — the machinery caller "panel", which
         # is also the creation authority the gate's bypass rides.
+        # Start is a creation, never a ride (--create): clicking
+        # start mints a parallel lease; using the current lease at
+        # the shape is the extend endpoint's job.
         args += ["--via", "panel", "--caller", "panel"]
         rc, result, err = run_core(*args)
         if result is None:

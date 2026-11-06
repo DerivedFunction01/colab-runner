@@ -22,6 +22,11 @@
 # config/lease.example.json — never committed.
 /config/lease.json
 
+# Caller → chat routing for liveness escalation: chat ids are
+# operator state for this machine, seeded from the tracked
+# config/notify-routes.example.json — never committed.
+/config/notify-routes.json
+
 # Job results: manifests are tracked under jobs/; payload bytes are not.
 /results/*
 !/results/.gitkeep

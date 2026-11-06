@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin CLI over sync/lease.py — the shared-session lease.
 
-Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG]|extend SESSION --hours H [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
+Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG] [--create]|extend SESSION --hours H [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
 orphan reconciliation across all lease records); `auto` is the
 hook's auto-acquire duty (inert unless enabled in config/lease.json);
@@ -126,6 +126,8 @@ def main() -> int:
         result = lease.status(cr.colab, REPO, session)
     elif cmd == "acquire":
         hours, rest, err = parse_hours(args[1:])
+        create = "--create" in rest
+        rest = [a for a in rest if a != "--create"]
         via = None
         caller_flag = None
         if err is None:
@@ -143,7 +145,7 @@ def main() -> int:
         if err:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
-        result = lease.acquire(cr.colab, REPO, shape, hours=hours, via=via, caller=caller)
+        result = lease.acquire(cr.colab, REPO, shape, hours=hours, via=via, caller=caller, create=create)
         if result.get("host_changed") and result.get("record"):
             # Initiation-time approval, Step 2: this entry point just
             # birthed (or adopted) a session on a new tunnel host —

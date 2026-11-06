@@ -237,7 +237,7 @@ def test_start_invokes_acquire_and_appends_event(ui):
     status, result = ui.post("/api/lease/start", {"shape": "cpu-highram", "hours": 2})
     assert status == 200
     assert result["action"] == "acquired"
-    assert "acquire --shape cpu-highram --hours 2 --via panel --caller panel" in ui.invocations()
+    assert "acquire --shape cpu-highram --create --hours 2 --via panel --caller panel" in ui.invocations()
     events = ui.outbox_events()
     assert len(events) == 1
     assert events[0]["kind"] == "lease-started"
@@ -252,7 +252,7 @@ def test_start_carries_panel_actor_claim(ui):
     # core's bypass (env claim + --via panel together).
     status, _result = ui.post("/api/lease/start", {"shape": "cpu", "hours": 1})
     assert status == 200
-    assert "acquire --shape cpu --hours 1 --via panel --caller panel" in ui.invocations()
+    assert "acquire --shape cpu --create --hours 1 --via panel --caller panel" in ui.invocations()
     assert "actor:panel" in ui.invocations()
 
 

@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Session liveness checker (session liveness plan,
+.plans/2026-11-06-session-liveness-schedule.md).
+
+    colab-liveness <session>   check one live lease
+    colab-liveness --sync      reconcile registry entries with
+                               the live records (janitor mode)
+
+The checker reads ONLY local files — the lease record, the
+CLI binding, the approval-gate state, the runner's run
+records — and never dials the session, so it cannot mint an
+approval card and cannot be gated by the approval gate whose
+state it watches. It keeps var/liveness-<session>.json: open
+findings with first-seen times and the approval-escalation
+episodes already reported.
+
+Speech contract (the scheduler entry reports on failure):
+exit 0 = healthy, steady state, or the session is gone (the
+checker first deletes its own registry entry and state file,
+so a leaked schedule self-heals within one interval);
+exit 3 = something must be said, with one LIVENESS line per
+item: a finding that newly opened, the approval escalation
+the first time an episode crosses the threshold, or the
+all-clear when the last open finding resolves. A finding
+that merely persists is silent: each distinct stall is
+reported exactly once, by the escalation body that works the
+resulting ping (bodies/colab-liveness.md in the scheduler
+repo, which routes mechanical findings to the owning thread
+and the approval block to the main chat).
+
+Checks (each maps to a stall this machinery has produced):
+record/binding agreement, binding host vs record host,
+deadline present and not past, last pulse verdict and its
+freshness (the lease core stamps last_pulse_at /
+last_pulse_result on the record), and approval blockage age
+from the gate state (contact_ok false since first_seen).
+Runner-side work facts (runs in flight on the session, a
+pending demand) are recorded in the state file for the
+escalation body's context; judging whether the owning
+thread has work queued stays with the approval sweeper's
+idleness duty, which reads the threads' turns.
+"""
+import importlib.util as ilu
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+REPO = Path(__file__).resolve().parent.parent
+
+_spec = ilu.spec_from_file_location("colab_liveness_entry", REPO / "sync" / "liveness_entry.py")
+liveness_entry = ilu.module_from_spec(_spec)
+_spec.loader.exec_module(liveness_entry)
+
+APPROVAL_ESCALATE_S = int(os.environ.get("COLAB_LIVENESS_APPROVAL_ESCALATE_S", "1800"))
+PULSE_STALE_S = int(os.environ.get("COLAB_LIVENESS_PULSE_STALE_S", "1800"))
+SESSION_GRACE_S = int(os.environ.get("COLAB_LIVENESS_SESSION_GRACE_S", "900"))
+TERMINAL_RUN_STATES = {"complete", "failed", "orphaned"}
+
+
+def _load(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _dt(text):
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _age_s(now, then) -> int:
+    return int((now - then).total_seconds()) if then else -1
+
+
+def gate_state_path() -> Path:
+    env = os.environ.get("COLAB_LIVENESS_GATE_STATE")
+    return Path(env) if env else Path.home() / "hooks" / "state" / "colab-lease-approval.json"
+
+
+def bindings_path() -> Path:
+    env = os.environ.get("COLAB_LIVENESS_BINDINGS")
+    return Path(env) if env else Path.home() / ".config" / "colab-cli" / "sessions.json"
+
+
+def binding_host(session: str):
+    binding = _load(bindings_path(), {})
+    if not isinstance(binding, dict):
+        return None, False
+    entry = binding.get(session)
+    if entry is None:
+        return None, False
+    url = entry.get("url") if isinstance(entry, dict) else entry
+    if not isinstance(url, str):
+        return None, True
+    return urlparse(url if "://" in url else f"https://{url}").hostname, True
+
+
+def find_record(session: str):
+    for rec in liveness_entry.load_records(REPO):
+        if rec.get("session") == session:
+            return rec
+    return None
+
+
+def work_facts(session: str) -> dict:
+    runs = []
+    runs_dir = REPO / "results" / "runs"
+    if runs_dir.is_dir():
+        for f in sorted(runs_dir.glob("*.json")):
+            rec = _load(f, {})
+            if isinstance(rec, dict) and rec.get("session") == session and rec.get("state") not in TERMINAL_RUN_STATES:
+                runs.append({"run_id": rec.get("run_id"), "job": rec.get("job"), "state": rec.get("state")})
+    demand = _load(liveness_entry.var_dir(REPO) / "lease-request.json", None)
+    return {"runs_in_flight": runs, "demand_pending": demand if isinstance(demand, dict) else None}
+
+
+def compute_findings(now, rec, state) -> dict:
+    findings = {}
+    session = rec["session"]
+    host, present = binding_host(session)
+    if not present:
+        findings["binding-missing"] = "session absent from the CLI binding"
+    elif host and rec.get("host") and host != rec["host"]:
+        findings["host-divergence"] = f"record host {rec['host']} != binding host {host}"
+    deadline = _dt(rec.get("deadline"))
+    if deadline is None:
+        findings["deadline-missing"] = "record carries no deadline"
+    elif deadline < now:
+        findings["deadline-overdue"] = f"deadline passed {_age_s(now, deadline)}s ago with the record still live (reap overdue)"
+    acquired = _dt(rec.get("acquired_at"))
+    pulse_at = _dt(rec.get("last_pulse_at"))
+    pulse_result = rec.get("last_pulse_result")
+    if pulse_result not in (None, "ok"):
+        findings["pulse-failing"] = f"last pulse result {pulse_result!r} at {rec.get('last_pulse_at')}"
+    elif pulse_at is None:
+        if acquired and _age_s(now, acquired) > SESSION_GRACE_S:
+            findings["pulse-stale"] = "no pulse verdict on the record"
+    elif _age_s(now, pulse_at) > PULSE_STALE_S and acquired and _age_s(now, acquired) > SESSION_GRACE_S:
+        findings["pulse-stale"] = f"no pulse verdict for {_age_s(now, pulse_at)}s (last at {rec.get('last_pulse_at')})"
+    gate = _load(gate_state_path(), {})
+    hosts = gate.get("hosts", {}) if isinstance(gate, dict) else {}
+    gmeta = hosts.get(rec.get("host") or "")
+    if isinstance(gmeta, dict) and not gmeta.get("contact_ok"):
+        first_seen = _dt(gmeta.get("first_seen"))
+        age = _age_s(now, first_seen)
+        if age >= APPROVAL_ESCALATE_S:
+            episode = f"{rec.get('host')}|{gmeta.get('first_seen')}"
+            findings["approval-outstanding"] = (
+                f"approval outstanding for host {rec.get('host')} for {age}s "
+                f"(session {session}, caller {rec.get('caller')}); episode {episode}"
+            )
+            state["_episode"] = episode
+    return findings
+
+
+def main(argv) -> int:
+    if argv == ["--sync"]:
+        records = liveness_entry.load_records(REPO)
+        print(json.dumps(liveness_entry.reconcile(REPO, records)))
+        return 0
+    if len(argv) != 1:
+        print("usage: colab-liveness <session> | --sync", file=sys.stderr)
+        return 2
+    session = argv[0]
+    now = datetime.now(timezone.utc)
+    rec = find_record(session)
+    state_path = liveness_entry.var_dir(REPO) / f"liveness-{session}.json"
+    if rec is None:
+        # Gone: disarm self and state, silently — a leaked
+        # entry self-heals here and never pings twice.
+        liveness_entry.remove_for_session(REPO, session)
+        return 0
+    state = _load(state_path, {})
+    if not isinstance(state, dict):
+        state = {}
+    prev_open = state.get("open") or {}
+    episodes = state.get("approval_episodes") or {}
+    episode = None
+    probe = {}
+    findings = compute_findings(now, rec, probe)
+    episode = probe.get("_episode")
+
+    speak = []
+    for code, detail in findings.items():
+        if code == "approval-outstanding":
+            if episode and not episodes.get(episode, {}).get("escalated"):
+                speak.append((code, detail))
+                episodes[episode] = {"escalated": True, "at": now.isoformat()}
+        elif code not in prev_open:
+            speak.append((code, detail))
+    if not findings and prev_open:
+        speak.append(("cleared", "all findings resolved"))
+    # An episode ends when its finding does; forget it so a
+    # later blockage on the same host escalates afresh.
+    if episode is None:
+        episodes = {k: v for k, v in episodes.items() if not k.startswith(f"{rec.get('host')}|")}
+
+    open_now = {}
+    for code, detail in findings.items():
+        open_now[code] = {"since": (prev_open.get(code) or {}).get("since") or now.isoformat(), "detail": detail}
+    state.update({
+        "session": session,
+        "caller": rec.get("caller"),
+        "host": rec.get("host"),
+        "updated_at": now.isoformat(),
+        "open": open_now,
+        "approval_episodes": episodes,
+        "work": work_facts(session),
+    })
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(state_path)
+
+    for code, detail in speak:
+        print(f"LIVENESS {session} {code} {detail}")
+    return 3 if speak else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
