@@ -24,6 +24,14 @@ and (c) lose nothing when the reaper fires at the deadline.
 
 ## Job lifecycle (the workflow)
 
+A session is another computer (2026-11-06): a job fired at it is
+executed immediately, concurrently with whatever else is running
+there — jobs are never serial behind another job, and co-tenancy
+is recorded on the lease record's `jobs` list. The runner manages
+no workspaces and checks no file isolation: scoping a job's files
+on the session is the coordinator's competence, exercised the
+way it is on any computer.
+
 1. **Preflight (local, every job)**: `bin/colab-lease status` must show
    the lease active with deadline in the future. Read the local workload-repo
    HEAD; if the job needs a tree newer than the warmed snapshot, build a

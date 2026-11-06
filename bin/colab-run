@@ -249,7 +249,11 @@ def main() -> int:
     mirror("restore")
     findings = orphan_sweep()
     for f in findings:
-        print(f"orphan sweep: {f['run_id']} ({f['job']}) — {f['action']}")
+        # Findings ride stderr: stdout is the run's JSON result,
+        # and a sweep line ahead of it breaks every consumer that
+        # parses the result (hit live 2026-11-05, again in the
+        # co-tenancy tests 2026-11-06).
+        print(f"orphan sweep: {f['run_id']} ({f['job']}) — {f['action']}", file=sys.stderr)
 
     # A manifest may name its shape; otherwise the config's
     # default_shape is the only fallback — no shape is hardcoded

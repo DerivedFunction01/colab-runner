@@ -289,6 +289,33 @@ def test_create_mints_a_parallel_lease_instead_of_riding(tmp_path, monkeypatch):
     assert c["action"] == "adopted"
 
 
+def test_reap_idle_guard_respects_registered_jobs(tmp_path, monkeypatch):
+    """Co-tenancy on the lease side: the idle reap releases a
+    session only when its jobs list is empty. A registered run
+    holds the session past the idle threshold — however many
+    other runs share it — and once the last job finishes, the
+    same idle reap releases it."""
+    from datetime import timedelta
+
+    repo = scratch_repo(tmp_path, monkeypatch)
+    cfg_path = tmp_path / "config" / "lease.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["idle_shutdown_minutes"] = 30
+    cfg_path.write_text(json.dumps(cfg, sort_keys=True, separators=(",", ":")))
+    fake = FakeColab()
+    a = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
+    assert a["action"] == "created"
+    lease_mod.touch_job(repo, "run-held-1", now_dt=PNOW)
+    lease_mod.touch_job(repo, "run-held-2", now_dt=PNOW)
+    later = PNOW + timedelta(minutes=31)
+    out = lease_mod.reap(fake, repo, now_dt=later)
+    assert out["action"] == "kept" and sorted(out["jobs"]) == ["run-held-1", "run-held-2"]
+    lease_mod.finish_job(repo, "run-held-1", now_dt=later)
+    lease_mod.finish_job(repo, "run-held-2", now_dt=later)
+    out = lease_mod.reap(fake, repo, now_dt=later + timedelta(minutes=31))
+    assert out["action"] == "released-idle"
+
+
 def test_acquire_unknown_shape_creates_nothing(tmp_path, monkeypatch):
     repo = scratch_repo(tmp_path, monkeypatch)
     fake = FakeColab()

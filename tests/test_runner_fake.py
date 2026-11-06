@@ -67,3 +67,63 @@ def test_orphan_sweep_marks_dead_session(tmp_path):
         assert json.loads(stale.read_text())["state"] == "orphaned"
     finally:
         stale.unlink(missing_ok=True)
+
+
+def _fire_smoke(env):
+    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+def _write_run_record(runs, run_id, session, state="running"):
+    p = runs / f"{run_id}.json"
+    p.write_text(json.dumps({"run_id": run_id, "job": "smoke", "session": session, "state": state, "started_at": "2000-01-01T00:00:00+00:00"}))
+    return p
+
+
+def test_orphan_sweep_keeps_cotenants_of_a_live_session(tmp_path):
+    """Machine model (2026-11-06): jobs on one session are
+    co-tenants, not rivals. The sweep's predicate is the
+    session's liveness, so two in-flight runs sharing a live
+    session are both left exactly as they are — and the second
+    fire lands on the same session and completes alongside
+    them, never serial behind them."""
+    env = runner_env(tmp_path)
+    runs = REPO / "results" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    first = _fire_smoke(env)
+    session = json.loads((runs / f"{first['run_id']}.json").read_text())["session"]
+    tenants = [_write_run_record(runs, f"cotenant-{tag}", session) for tag in ("a", "b")]
+    before = [p.read_text() for p in tenants]
+    try:
+        second = _fire_smoke(env)
+        assert second["state"] == "complete"
+        second_rec = json.loads((runs / f"{second['run_id']}.json").read_text())
+        assert second_rec["session"] == session, "the second fire rides the same live session"
+        assert [p.read_text() for p in tenants] == before, "the sweep and the second fire's poll leave co-tenant records untouched"
+    finally:
+        for p in tenants:
+            p.unlink(missing_ok=True)
+
+
+def test_orphan_sweep_marks_cotenants_of_a_dead_session_together(tmp_path):
+    """Co-tenants share the session's fate: when the session is
+    gone, every in-flight run bound to it is marked orphaned in
+    the same sweep — while a run on a live session is untouched."""
+    env = runner_env(tmp_path)
+    runs = REPO / "results" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    first = _fire_smoke(env)
+    session = json.loads((runs / f"{first['run_id']}.json").read_text())["session"]
+    live_tenant = _write_run_record(runs, "cotenant-live", session)
+    dead_tenants = [_write_run_record(runs, f"cotenant-dead-{tag}", "ghost-session-absent") for tag in ("a", "b")]
+    live_before = live_tenant.read_text()
+    try:
+        _fire_smoke(env)
+        for p in dead_tenants:
+            assert json.loads(p.read_text())["state"] == "orphaned"
+        assert live_tenant.read_text() == live_before
+    finally:
+        live_tenant.unlink(missing_ok=True)
+        for p in dead_tenants:
+            p.unlink(missing_ok=True)
