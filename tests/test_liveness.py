@@ -214,6 +214,7 @@ def test_render_entry_shape():
     assert f"id: colab-liveness-{SESSION}" in text
     assert "every: 15m" in text
     assert "escalate_body: bodies/colab-liveness.md" in text
+    assert "migrated: true" in text, "the scheduler engine schedules only migrated entries"
     assert SESSION in text
 
 

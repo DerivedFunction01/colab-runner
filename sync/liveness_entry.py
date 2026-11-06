@@ -93,7 +93,8 @@ state_paths:
 classification: 'fixed command (bin/colab-liveness <session>); local file reads only, never dials the session; exit 0 healthy, cleared, or gone (self-disarmed), exit 3 with one LIVENESS line per finding it must speak; when it speaks is fully determined by its state file and the exit code, no content judgment'
 lifetime: until_complete
 self_removal: 'the lease core deletes this entry in the same call that deletes the lease record; the checker deletes it itself on the first run that finds no live record, and the reaper hook reconciliation retires any orphan'
-migrated: false
+migrated: true
+migration_note: 'Machine entry, admitted by construction: the render is the classification, and the entry family passed registry validation plus a proof run in the server context before first arming (2026-11-06). The engine schedules only migrated entries; the workbench progress entries this render was first modeled on are harness-consumed and stay unmigrated.'
 """
 
 
