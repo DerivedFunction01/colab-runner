@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Auto-extension guard entry point: extend every live lease
+before it lapses (see sync/extend_guard.py). Prints one JSON
+line per action or finding; exit 0 clean, 3 on findings."""
+
+import importlib.util
+import json
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+spec = importlib.util.spec_from_loader("colab_run", SourceFileLoader("colab_run", str(REPO / "bin" / "colab-run")))
+cr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cr)
+
+spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+lease = importlib.util.module_from_spec(spec_l)
+spec_l.loader.exec_module(lease)
+
+spec_g = importlib.util.spec_from_file_location("extend_guard", REPO / "sync" / "extend_guard.py")
+guard = importlib.util.module_from_spec(spec_g)
+spec_g.loader.exec_module(guard)
+
+
+def main() -> int:
+    code, lines = guard.run_guard(lease, cr.colab, REPO)
+    for line in lines:
+        print(json.dumps(line, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
