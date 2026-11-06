@@ -1351,3 +1351,14 @@ def test_authority_infra_exemption_and_disabled_gate_admit(tmp_path, monkeypatch
     assert [e["kind"] for e in _gate_journal(tmp_path)] == ["shape-infra"]
     _authority_fixture(tmp_path, monkeypatch, enabled=False)
     assert lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, caller="alpha") is None
+
+
+def test_state_serves_extend_guard_policy_and_verdicts(tmp_path):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "lease.json").write_text(json.dumps({"enabled": True, "extend_guard": {"shapes": {"a100-highram": "active-only"}}}))
+    (tmp_path / "var").mkdir()
+    (tmp_path / "var" / "extend-guard-state.json").write_text(json.dumps({"episodes": {}, "verdicts": {"busy-lease-1": {"action": "extended", "at": "2026-11-06T00:00:00+00:00"}}}))
+    out = lease.state_extend_guard(tmp_path)
+    assert out["extend_guard"]["policy"]["shapes"] == {"a100-highram": "active-only"}
+    assert out["extend_guard"]["policy"]["default_mode"] == "active-or-first"
+    assert out["extend_guard"]["verdicts"]["busy-lease-1"]["action"] == "extended"

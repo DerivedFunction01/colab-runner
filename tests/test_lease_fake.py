@@ -396,11 +396,14 @@ def test_state_portions_and_composition(tmp_path, monkeypatch):
     meta = lease_mod.state_meta(fake, repo)
     assert "bridge" in meta
 
+    guard = lease_mod.state_extend_guard(repo)
+    assert "extend_guard" in guard and "policy" in guard["extend_guard"]
+
     composed = lease_mod.state(fake, repo)
     # The fake's help output parses as no catalog, so the specs
     # portion's catalog_error rides the composed payload exactly as
     # it did before the split.
-    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access"}
+    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access", "extend_guard"}
     assert composed["catalog_error"] == specs["catalog_error"]
     assert composed["records"] == records["records"]
     assert composed["budget"] == budget["budget"]

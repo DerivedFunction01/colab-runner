@@ -51,6 +51,10 @@ _liveness_spec = _ilu.spec_from_file_location("colab_liveness_entry", Path(__fil
 liveness_entry = _ilu.module_from_spec(_liveness_spec)
 _liveness_spec.loader.exec_module(liveness_entry)
 
+_extend_guard_spec = _ilu.spec_from_file_location("colab_extend_guard", Path(__file__).resolve().parent / "extend_guard.py")
+extend_guard = _ilu.module_from_spec(_extend_guard_spec)
+_extend_guard_spec.loader.exec_module(extend_guard)
+
 
 def var_dir(repo: Path) -> Path:
     return Path(os.environ.get("COLAB_RUNNER_VAR", repo / "var"))
@@ -3051,6 +3055,16 @@ def state_meta(colab, repo: Path) -> dict:
     return out
 
 
+def state_extend_guard(repo: Path) -> dict:
+    """Portion: the auto-extension guard's resolved policy and
+    its latest verdict per lease, from the guard's own state
+    file. Before the guard's first pass the policy resolves
+    from config and the verdicts are empty."""
+    policy, _findings = extend_guard.load_policy(load_config(repo).get("extend_guard"))
+    verdicts = extend_guard.guard_state(repo).get("verdicts", {})
+    return {"extend_guard": {"policy": policy, "verdicts": verdicts}}
+
+
 def state(colab, repo: Path) -> dict:
     """The UI's composed read: every lease record's status, the
     two-tier grant, the spec catalog, and the budget snapshot,
@@ -3063,6 +3077,7 @@ def state(colab, repo: Path) -> dict:
     out["budget"] = budget
     out.update(state_grant(colab, repo, budget))
     out.update(state_meta(colab, repo))
+    out.update(state_extend_guard(repo))
     return out
 
 

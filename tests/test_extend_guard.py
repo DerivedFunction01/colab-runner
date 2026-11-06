@@ -76,3 +76,86 @@ def test_guard_reports_a_refusal_once_per_episode(tmp_path, monkeypatch):
     assert code == 3 and lines[0]["episode_first"] is False
     state = json.loads((repo / "var" / "extend-guard-state.json").read_text())
     assert state["episodes"]["gone-lease-1"]["action"] == "extend-no-lease"
+
+
+# --- policy loader (plan step 1) ---
+
+
+def _policy(**overrides):
+    policy = dict(guard_mod.POLICY_DEFAULTS)
+    policy["shapes"] = {}
+    policy["callers"] = {}
+    policy.update(overrides)
+    return policy
+
+
+def test_policy_defaults_when_the_block_is_absent(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    policy, findings = guard_mod.load_policy(lease_mod.load_config(repo).get("extend_guard"))
+    assert findings == []
+    assert policy["default_mode"] == "active-or-first" and policy["max_extended_per_shape"] == 1
+    assert policy["threshold_minutes"] == 120 and policy["idle_after_minutes"] == 60
+
+
+def test_policy_unknown_mode_fails_closed(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    cfg_path = repo / "config" / "lease.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["extend_guard"] = {"shapes": {"cpu": "sometimes"}, "callers": {"alpha": "active-only"}}
+    cfg_path.write_text(json.dumps(cfg))
+    policy, findings = guard_mod.load_policy(lease_mod.load_config(repo).get("extend_guard"))
+    assert policy["shapes"]["cpu"] == "never" and policy["callers"]["alpha"] == "active-only"
+    assert len(findings) == 1 and findings[0]["action"] == "policy-unknown-mode"
+
+
+# --- decision procedure (plan step 2) ---
+
+
+def _craft(repo, session, *, last_used_h, deadline_m=30, jobs=None, caller="alpha"):
+    rec = {"session": session, "shape": "cpu", "caller": caller, "deadline": (PNOW + timedelta(minutes=deadline_m)).isoformat(), "acquired_at": (PNOW - timedelta(hours=8)).isoformat(), "last_used_at": (PNOW - timedelta(hours=last_used_h)).isoformat(), "jobs": jobs or []}
+    (repo / "var" / f"lease-{session}.json").write_text(json.dumps(rec))
+    return rec
+
+
+def test_guard_extends_only_the_warmest_idle_twin(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    _craft(repo, "twin-warm-1", last_used_h=3)
+    _craft(repo, "twin-cold-1", last_used_h=5)
+    fake = FakeColab(alive={"twin-warm-1", "twin-cold-1"})
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW)
+    assert code == 0
+    by_session = {line["session"]: line["action"] for line in lines}
+    assert by_session == {"twin-warm-1": "extended", "twin-cold-1": "skipped-count"}
+
+
+def test_guard_never_mode_skips_even_an_active_lease(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    _craft(repo, "busy-lease-1", last_used_h=0, jobs=["run-9"])
+    fake = FakeColab(alive={"busy-lease-1"})
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW, policy=_policy(shapes={"cpu": "never"}))
+    assert code == 0 and lines == [{"session": "busy-lease-1", "action": "skipped-shape", "decision": True}]
+    assert "renew" not in lease_mod.load_record(repo, "busy-lease-1")  # untouched: extend() flags renew when it acts
+
+
+def test_guard_active_lease_extends_while_idle_twin_is_capped_out(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    _craft(repo, "jobbed-lease-1", last_used_h=5, jobs=["run-9"])
+    _craft(repo, "idle-lease-1", last_used_h=3)
+    fake = FakeColab(alive={"jobbed-lease-1", "idle-lease-1"})
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW, policy=_policy(max_extended_per_shape=0))
+    assert code == 0
+    by_session = {line["session"]: line["action"] for line in lines}
+    assert by_session == {"jobbed-lease-1": "extended", "idle-lease-1": "skipped-count"}
+
+
+def test_guard_does_not_re_extend_an_idle_lease_it_already_extended(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    _craft(repo, "idle-lease-1", last_used_h=5)
+    fake = FakeColab(alive={"idle-lease-1"})
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW)
+    assert code == 0 and lines[0]["action"] == "extended"
+    deadline_after_first = lease_mod.load_record(repo, "idle-lease-1")["deadline"]
+    # Eight hours on: due again, still idle at the same stamp.
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW + timedelta(hours=8))
+    assert code == 0 and lines == [{"session": "idle-lease-1", "action": "skipped-idle", "decision": True}]
+    assert lease_mod.load_record(repo, "idle-lease-1")["deadline"] == deadline_after_first

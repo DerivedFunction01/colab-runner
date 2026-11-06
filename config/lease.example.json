@@ -5,6 +5,18 @@
   "daily_cu_budget": 10,
   "default_shape": "cpu-highram",
   "enabled": true,
+  "extend_guard": {
+    "callers": {},
+    "default_mode": "active-or-first",
+    "enabled": true,
+    "idle_after_minutes": 60,
+    "max_extended_per_shape": 1,
+    "shapes": {
+      "a100-highram": "active-only"
+    },
+    "threshold_minutes": 120,
+    "window_hours": 8
+  },
   "idle_shutdown_minutes": null,
   "keepalive": {
     "enabled": true,
