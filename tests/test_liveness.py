@@ -237,6 +237,25 @@ def test_lease_lifecycle_arms_and_disarms(tmp_path):
     assert SESSION in text
 
 
+def test_arming_waits_for_the_escalate_body(tmp_path, monkeypatch):
+    """Default-resolution arming refuses while the entry's
+    shared escalate body is absent from the scheduler repo:
+    an entry pointing at a missing body fails registry
+    validation, so the body lands first or nothing arms."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("COLAB_LIVENESS_JOBS_DIR", raising=False)
+    jobs = tmp_path / "home" / "workspace" / "scheduler" / "jobs"
+    jobs.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    rec = {"session": "body-guard-00"}
+    assert le.sync_for_record(REPO, rec) == "unavailable"
+    body = tmp_path / "home" / "workspace" / "scheduler" / "bodies" / "colab-liveness.md"
+    body.parent.mkdir(parents=True)
+    body.write_text("# body\n")
+    assert le.sync_for_record(REPO, rec) == "written"
+    assert (jobs / "colab-liveness-body-guard-00.yaml").exists()
+
+
 def test_sync_and_reconcile(tmp_path):
     jobs = tmp_path / "jobs"
     jobs.mkdir()

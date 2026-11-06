@@ -99,7 +99,11 @@ migrated: false
 
 def sync_for_record(repo: Path, rec: dict) -> str:
     """Arm (or refresh) the entry for a live record. Returns a
-    status word; never raises."""
+    status word; never raises. Arming is refused while the
+    entry's shared escalate body is absent from the scheduler
+    repo (default resolution only): an entry pointing at a
+    missing body fails registry validation, so the body lands
+    first or nothing arms."""
     session = (rec or {}).get("session")
     if not session:
         return "no-session"
@@ -107,6 +111,10 @@ def sync_for_record(repo: Path, rec: dict) -> str:
         path = entry_path(repo, session)
         if path is None:
             return "unavailable"
+        if not os.environ.get("COLAB_LIVENESS_JOBS_DIR"):
+            body = path.parent.parent / "bodies" / "colab-liveness.md"
+            if not body.exists():
+                return "unavailable"
         text = render_entry(session)
         if path.exists() and path.read_text() == text:
             return "present"
