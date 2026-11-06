@@ -123,6 +123,7 @@ out = {
     "init_cwd": entry["init"].get("cwd", "clone"),
     "version_checks": entry.get("version_checks") or {},
     "scan_roots": entry.get("scan_roots") or [],
+    "package": entry.get("package"),
     "derive_resources": entry.get("derive_resources"),
     "variant": variant or None, "variant_delta": delta,
 }
@@ -198,6 +199,7 @@ PYEOF
 }
 
 kv repo "$REPO_ID"
+kv package "$(jget package)"
 if [ -n "$VARIANT" ]; then kv variant "\"$VARIANT\""; else kv variant "null"; fi
 kv dest "$DEST"
 kv uv_path "$UV"
@@ -452,6 +454,7 @@ except Exception:
     versions = {}
 record = {
     "repo": kv.get("repo", ""),
+    "package": (lambda v: None if v in ("", "null") else v)(kv.get("package", "")),
     "variant": json.loads(kv.get("variant", "null")),
     "dest": kv.get("dest", "").rstrip("/").split("/")[-1],
     "venv_python": kv.get("venv_python", ""),

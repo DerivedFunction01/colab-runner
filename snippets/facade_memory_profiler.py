@@ -45,17 +45,17 @@ def _resolve_profile_repo():
     elif len(records) == 1:
         record = next(iter(records.values()))
     if record:
-        return Path("/content") / record["dest"], Path(record["venv_python"])
+        return Path("/content") / record["dest"], Path(record["venv_python"]), record.get("package")
     if legacy:
         repo = Path(legacy)
-        return repo, repo / ".venv" / "bin" / "python"
+        return repo, repo / ".venv" / "bin" / "python", None
     raise SystemExit(
         "facade_memory_profiler: no built clone resolvable — set PROFILE_REPO_ID "
         "or PROFILE_REPO, or run the env build so /content/env-registry.json exists"
     )
 
 
-REPO, _VENV_PY = _resolve_profile_repo()
+REPO, _VENV_PY, _PACKAGE = _resolve_profile_repo()
 
 if "--bootstrapped" not in sys.argv and _VENV_PY.exists():
     if Path(sys.executable).resolve() != _VENV_PY.resolve():
@@ -156,16 +156,22 @@ def main() -> int:
 
         import pyarrow.parquet as pq
 
-        from workload_sec.apps.client.xbrl import Xbrl
-        from workload_sec.domain.identity import AccessionNumber, Cik
-        from workload_sec.engine.xbrl.schema.models import FilingXbrl, LinkbaseBundle
-        from workload_sec.engine.xbrl.storage.storage import (
-            calculation_arcs_from_arrow_table,
-            presentation_arcs_from_arrow_table,
-        )
-        from workload_sec.engine.xbrl.taxonomy.domain import load_domain_taxonomy
-        from workload_sec.foundation.runtime.memory import reclaim
-        from workload_sec.tools.facade_battery import cohort_folders, load_bundle_facts
+        if not _PACKAGE:
+            raise SystemExit("facade_memory_profiler: the built clone's registry record carries no package name (re-run the env build with a registry entry that declares one)")
+        import importlib
+
+        Xbrl = importlib.import_module(f"{_PACKAGE}.apps.client.xbrl").Xbrl
+        _identity = importlib.import_module(f"{_PACKAGE}.domain.identity")
+        AccessionNumber, Cik = _identity.AccessionNumber, _identity.Cik
+        _models = importlib.import_module(f"{_PACKAGE}.engine.xbrl.schema.models")
+        FilingXbrl, LinkbaseBundle = _models.FilingXbrl, _models.LinkbaseBundle
+        _storage = importlib.import_module(f"{_PACKAGE}.engine.xbrl.storage.storage")
+        calculation_arcs_from_arrow_table = _storage.calculation_arcs_from_arrow_table
+        presentation_arcs_from_arrow_table = _storage.presentation_arcs_from_arrow_table
+        load_domain_taxonomy = importlib.import_module(f"{_PACKAGE}.engine.xbrl.taxonomy.domain").load_domain_taxonomy
+        reclaim = importlib.import_module(f"{_PACKAGE}.foundation.runtime.memory").reclaim
+        _battery = importlib.import_module(f"{_PACKAGE}.tools.facade_battery")
+        cohort_folders, load_bundle_facts = _battery.cohort_folders, _battery.load_bundle_facts
 
         mem_total_kb = 0
         for line in Path("/proc/meminfo").read_text().splitlines():

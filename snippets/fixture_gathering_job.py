@@ -61,6 +61,9 @@ def main() -> int:
     record = resolve_remote_repo(args.repo)
     REPO = Path("/content") / record["dest"]
     venv_py = Path(record["venv_python"])
+    package = record.get("package")
+    if not package:
+        raise SystemExit("fixture_gathering_job: the built clone's registry record carries no package name (re-run the env build with a registry entry that declares one)")
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     heartbeat = out / "heartbeat.log"
@@ -98,7 +101,7 @@ def main() -> int:
             [
                 str(venv_py),
                 "-m",
-                "workload_sec.tools.fixture_candidates",
+                f"{package}.tools.fixture_candidates",
                 "gather",
                 "--config",
                 str(config),

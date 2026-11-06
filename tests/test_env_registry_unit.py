@@ -165,7 +165,7 @@ SETUP_FILES = [
     "config/repos.example.json",
     "jobs/env-build/job.json",
 ]
-FORBIDDEN_LITERALS = ["workload-repo", "workload_sec", "AcmeOwner42", "duckdb", "WORKLOAD_REPO", "workspace/workload"]
+FORBIDDEN_LITERALS = ["acme-sec", "acme_sec", "AcmeOwner42", "acmedb", "ACME_REPO", "workspace/acme"]
 
 
 @pytest.mark.parametrize("rel", SETUP_FILES)
@@ -185,5 +185,5 @@ CONSUMER_FILES = [
 @pytest.mark.parametrize("rel", CONSUMER_FILES)
 def test_consumer_jobs_hardcode_no_clone_path(rel):
     text = (REPO / rel).read_text()
-    assert "/content/workload-repo" not in text
+    assert "/content/acme-sec" not in text
     assert "env-registry.json" in text  # they resolve via the remote registry
