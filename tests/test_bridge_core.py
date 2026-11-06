@@ -121,9 +121,9 @@ def armed_setup(tmp_path):
     fake = Fake()
     minted = (NOW - timedelta(hours=1)).isoformat()
     lines = [
-        {"v": 1, "gen": "gen-test-1", "seq": 1, "ts": minted, "kind": "mint", "id": "m1", "name": "bridge-workload-x1", "shape": "cpu-highram", "rate": 0.26},
+        {"v": 1, "gen": "gen-test-1", "seq": 1, "ts": minted, "kind": "mint", "id": "m1", "name": "bridge-alpha-x1", "shape": "cpu-highram", "rate": 0.26},
         {"v": 1, "gen": "gen-test-1", "seq": 2, "ts": NOW.isoformat(), "kind": "result", "id": "r1", "target": "self", "rc": 0, "out": "hi"},
-        {"v": 1, "gen": "gen-test-1", "seq": 3, "ts": NOW.isoformat(), "kind": "stop", "id": "s1", "name": "bridge-workload-x1", "shape": "cpu-highram", "minted_at": minted, "reason": "requested"},
+        {"v": 1, "gen": "gen-test-1", "seq": 3, "ts": NOW.isoformat(), "kind": "stop", "id": "s1", "name": "bridge-alpha-x1", "shape": "cpu-highram", "minted_at": minted, "reason": "requested"},
     ]
     fake.remote["/content/bridge/log/bridge-000001.jsonl"] = ("\n".join(json.dumps(x) for x in lines) + "\n").encode()
     status = {"v": 1, "gen": "gen-test-1", "ts": datetime.now(timezone.utc).isoformat(), "session": "lobby", "auth_down": False, "children": [], "queue": 0, "processed": 3, "log_segment": "bridge-000001.jsonl"}
@@ -147,7 +147,7 @@ def test_duty_armed_ferries_acks_and_folds(tmp_path):
     journal = [json.loads(x) for x in (repo / "var" / "lease-spend-journal.jsonl").read_text().splitlines()]
     # The fold journals the stopped child's segment under its
     # session and shape at the mint line's rate.
-    assert len(journal) == 1 and journal[0]["session"] == "bridge-workload-x1" and journal[0]["shape"] == "cpu-highram"
+    assert len(journal) == 1 and journal[0]["session"] == "bridge-alpha-x1" and journal[0]["shape"] == "cpu-highram"
     # A second pass mirrors nothing new and never double-folds.
     out2 = lease.bridge_duty(fake, repo, NOW)
     assert out2["mirrored"] == 0

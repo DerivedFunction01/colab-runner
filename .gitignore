@@ -31,6 +31,14 @@
 /results/*
 !/results/.gitkeep
 
+# Thread-owned job manifests are local material: a consumer thread's
+# jobs/<name>/ directory lives on this machine only (its manifest
+# names that thread's callers and scripts). The repo's own job
+# manifests are already tracked and stay tracked — ignore rules
+# never untrack — and a new repo-owned job is added deliberately
+# with git add -f, once.
+/jobs/*/
+
 # Probe payloads and scratch
 /probes/results/*.bin
 /var/

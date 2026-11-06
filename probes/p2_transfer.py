@@ -70,14 +70,14 @@ def main() -> int:
                 ok = dn_r.get("sha256") == sha
             data["transfers"].append({"mb": mb, "sha256": sha, "upload": up, "download": dn, "roundtrip_hash_ok": ok})
         # exec runs Python in the kernel, so the shell script goes through a
-        # generated launcher. The workload-repo repo is private: an anonymous
+        # generated launcher. The workload repo is private: an anonymous
         # in-VM clone is expected to fail auth, which is itself the finding
         # (base clone needs a credential story; the bundle route is primary).
         launcher = REPO / "var" / "p2-clone.py"
         launcher.parent.mkdir(parents=True, exist_ok=True)
         launcher.write_text(
             "import subprocess\n"
-            f"r = subprocess.run(['bash', 'base_clone.sh', {os.environ.get('COLAB_PROBE_CLONE_URL', 'https://example.invalid/workload.git')!r}, 'workload-repo'], capture_output=True, text=True)\n"
+            f"r = subprocess.run(['bash', 'base_clone.sh', {os.environ.get('COLAB_PROBE_CLONE_URL', 'https://example.invalid/workload.git')!r}, 'workload'], capture_output=True, text=True)\n"
             "print('rc', r.returncode)\nprint((r.stdout + r.stderr)[-600:])\n"
         )
         upload(SESSION, REPO / "sync" / "base_clone.sh", timeout=300)

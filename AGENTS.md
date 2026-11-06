@@ -1,6 +1,6 @@
 # AGENTS.md — colab-runner contract
 
-Binding rules for anyone (human or agent) working in this repo. The founding plan (`.plans/2026-10-29-colab-runner-for-workload-repo.md`) carries the full rulings; this file is the operative summary.
+Binding rules for anyone (human or agent) working in this repo. The founding plan (`.plans/2026-10-29-colab-runner-founding.md`) carries the full rulings; this file is the operative summary.
 
 - The CLI is the official `google-colab-cli` (PyPI), command `colab`, installed with `uv tool install`, pinned at ≥ 0.7.1 in `config/transient.json`. Never the unofficial `colab-cli` package.
 - The CLI is deliberately NOT on PATH (2026-11-04): the `~/.local/bin/colab` shim is removed, and every resolver (`bin/colab-run`, `bin/_wrap.sh`, `sync/transfer.py`, `sync/pull_results.py`, `probes/_driver.py`, `ops/bootstrap_local.sh`) resolves the uv tool venv binary (`~/.local/share/uv/tools/google-colab-cli/bin/colab`) ahead of PATH. A bare `colab` in an agent shell must fail with command-not-found; if a `uv tool install` ever recreates the shim, remove the shim again rather than relying on it. Access is through `bin/colab-run`'s funnel only — invoking the venv binary or the `colab_cli` library directly from another thread is the same breach as the bare command.

@@ -60,7 +60,7 @@ def test_orphan_sweep_marks_dead_session(tmp_path):
     runs = REPO / "results" / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     stale = runs / "ghost-20000101T000000Z.json"
-    stale.write_text(json.dumps({"run_id": stale.stem, "job": "smoke", "session": "workload", "state": "running", "started_at": "2000-01-01T00:00:00+00:00"}))
+    stale.write_text(json.dumps({"run_id": stale.stem, "job": "smoke", "session": "ghost-session-absent", "state": "running", "started_at": "2000-01-01T00:00:00+00:00"}))
     try:
         r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
         assert r.returncode == 0, r.stdout + r.stderr
@@ -127,3 +127,57 @@ def test_orphan_sweep_marks_cotenants_of_a_dead_session_together(tmp_path):
         live_tenant.unlink(missing_ok=True)
         for p in dead_tenants:
             p.unlink(missing_ok=True)
+
+
+def test_resume_preserves_the_original_started_at(tmp_path):
+    """--resume continues a run; it does not relaunch it. The
+    record's launch facts (started_at above all — the field
+    concurrency evidence reads) survive a resume byte-identical;
+    the resume adds its own facts. (Live defect 2026-11-06: a
+    resumed hold came back stamped with the resume moment.)"""
+    env = runner_env(tmp_path)
+    runs = REPO / "results" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    run_id = "smoke-resumeproof"
+    rec_path = runs / f"{run_id}.json"
+    rec_path.write_text(json.dumps({"run_id": run_id, "job": "smoke", "state": "orphaned", "started_at": "2000-01-01T00:00:00+00:00", "session": "ghost-session-absent"}))
+    try:
+        r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke", "--resume", run_id], capture_output=True, text=True, env=env, timeout=300)
+        assert r.returncode == 0, r.stdout + r.stderr
+        rec = json.loads(rec_path.read_text())
+        assert rec["state"] == "complete"
+        assert rec["started_at"] == "2000-01-01T00:00:00+00:00", "resume overwrote the launch time"
+        assert rec.get("resumed") is True and rec.get("resumed_at")
+    finally:
+        rec_path.unlink(missing_ok=True)
+
+
+def test_poll_timeout_degrades_instead_of_killing_the_poller(tmp_path):
+    """A checkpoint poll whose CLI call exceeds its timeout is a
+    failed poll, not a dead poller: the loop notes it on the
+    record and continues to the next cadence. (Live defect
+    2026-11-06: an uncaught TimeoutExpired killed the poller and
+    stranded the run at polling while its payload completed.)"""
+    wrapper = tmp_path / "wrapper_colab.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_COLAB_STATE'])\n"
+        "marker = state / 'read-delayed'\n"
+        "args = sys.argv[1:]\n"
+        "if 'exec' in args and any('read-' in a for a in args) and not marker.exists():\n"
+        "    state.mkdir(parents=True, exist_ok=True)\n"
+        "    marker.write_text('1')\n"
+        "    time.sleep(5)\n"
+        "sys.exit(subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode)\n"
+    )
+    wrapper.chmod(0o755)
+    env = runner_env(tmp_path)
+    env.update(COLAB_BIN=str(wrapper), FAKE_COLAB_REAL=str(FAKE), COLAB_RUN_POLL_TIMEOUT_S="2")
+    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    rec = json.loads((REPO / "results" / "runs" / f"{out['run_id']}.json").read_text())
+    assert rec.get("last_poll_error"), "the timed-out poll left no note on the record"

@@ -1,6 +1,6 @@
 # colab-runner
 
-Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU runtime (measured 8 vCPU / ~51–55 GB) via Google's official `google-colab-cli`. First consumer: workload-repo / XBRL — code and gate jobs, pipeline jobs, and probes.
+Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU runtime (measured 8 vCPU / ~51–55 GB) via Google's official `google-colab-cli`. First consumer: an XBRL workload repo — code and gate jobs, pipeline jobs, and probes.
 
 ## How a job runs
 
@@ -27,7 +27,7 @@ ops/bootstrap_local.sh          # installs google-colab-cli via uv, restores tra
 
 Operator-only step: the one-time OAuth login. Create a session with the CLI (`colab new -s <any-name>`, adding `--high-mem` for the High-RAM shape); the command prints a URL to open anywhere and paste the returned code back.
 
-After that, the token is cached and mirrored, and wrappers handle the rest. Design and rulings: `.plans/2026-10-29-colab-runner-for-workload-repo.md`.
+After that, the token is cached and mirrored, and wrappers handle the rest. Design and rulings: `.plans/2026-10-29-colab-runner-founding.md`.
 
 ## Status (2026-10-29)
 

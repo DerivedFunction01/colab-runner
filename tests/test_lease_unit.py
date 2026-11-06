@@ -565,19 +565,19 @@ def test_attributed_spend_splits_segments_at_period_boundaries(tmp_path, monkeyp
     now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
     segs = [
         # Spans midnight into today: 2 h count today (and this month).
-        {"shape": "cpu-highram", "session": "workload", "start": "2026-10-31T22:00:00+00:00", "end": "2026-11-01T02:00:00+00:00", "rate": 1.0},
+        {"shape": "cpu-highram", "session": "alpha", "start": "2026-10-31T22:00:00+00:00", "end": "2026-11-01T02:00:00+00:00", "rate": 1.0},
         # Last month only: counts for neither period.
-        {"shape": "cpu-highram", "session": "workload", "start": "2026-10-15T00:00:00+00:00", "end": "2026-10-15T10:00:00+00:00", "rate": 1.0},
+        {"shape": "cpu-highram", "session": "alpha", "start": "2026-10-15T00:00:00+00:00", "end": "2026-10-15T10:00:00+00:00", "rate": 1.0},
         # Unconfirmed rate: journaled, never priced.
         {"shape": "cpu", "session": "s", "start": "2026-11-01T00:00:00+00:00", "end": "2026-11-01T05:00:00+00:00", "rate": None},
     ]
     (var / "lease-spend-journal.jsonl").write_text("".join(json.dumps(s) + "\n" for s in segs))
     lease.save_record(REPO, {"session": "standard", "shape": "cpu", "shape_spec": {"gpu": None, "tpu": None, "high_mem": False}, "rate_cu_per_hour": 0.08, "acquired_at": "2026-11-01T10:00:00+00:00", "deadline": "2026-11-01T20:00:00+00:00", "last_used_at": "2026-11-01T10:00:00+00:00", "jobs": []})
     out = lease.attributed_spend(REPO, now)
-    # Live standard record: 2 h x 0.08 = 0.16 on top of the workload session's 2.0.
+    # Live standard record: 2 h x 0.08 = 0.16 on top of the alpha session's 2.0.
     assert out["day_spent"] == 2.16
     assert out["month_spent"] == 2.16
-    assert out["sessions"]["workload"] == {"day_spent": 2.0, "month_spent": 2.0}
+    assert out["sessions"]["alpha"] == {"day_spent": 2.0, "month_spent": 2.0}
     assert out["sessions"]["standard"] == {"day_spent": 0.16, "month_spent": 0.16}
 
 
@@ -1162,7 +1162,7 @@ def _foreign_stub(*a, **k):
     if a and a[0] == "usage":
         return cp("balance: 500 CU (stub)")
     if a and a[0] == "sessions":
-        return cp("workload2")
+        return cp("alpha2")
     if a and a[0] == "download":
         return cp("", rc=1)
     return cp("")
@@ -1177,8 +1177,8 @@ def test_acquire_never_adopts_a_foreign_session(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     out = lease.acquire(_foreign_stub, REPO, "cpu-highram", now_dt=NOW)
     assert out["action"] == "created"
-    assert out["record"]["session"] != "workload2"
-    assert lease.load_record(REPO, "workload2") is None
+    assert out["record"]["session"] != "alpha2"
+    assert lease.load_record(REPO, "alpha2") is None
 
 
 def test_reap_reconciles_a_missing_host_silently(tmp_path, monkeypatch):

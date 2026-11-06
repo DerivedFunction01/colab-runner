@@ -70,7 +70,7 @@ implements it; mirror ui/static.
     field (days are sent as ×24 hours); projected cost = rate ×
     hours, or "cost unconfirmed".
   - Two-tier grant: grant duration (same presets) + a burst-spec
-    picker (same specs list, default workload) + Grant button; an
+    picker (same specs list, default primary) + Grant button; an
     active grant shows its until time, the standing spend today
     vs cap (budget.standing_day_spent vs caps.standing_daily),
     and a Revoke (ungrant) button. With an envelope served, the

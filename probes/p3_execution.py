@@ -8,6 +8,7 @@ Requires the operator's login. The local gate leg runs only with --run-local-gat
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,7 +18,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _driver import colab, record, require_login, stop_session, REPO
 
 SESSION = "probe"
-WORKLOAD = Path.home() / "workspace" / "workload-repo"
+# The local-gate leg compares against the workload repo's own gate;
+# its checkout is the operator's to name (this repo carries no
+# workload path).
+TARGET_REPO = Path(os.environ["COLAB_PROBE_REPO"]) if os.environ.get("COLAB_PROBE_REPO") else None
 GATE_PATHS = ["tests/foundation"]  # fixed scoped path set for comparability
 
 
@@ -43,9 +47,12 @@ def main() -> int:
         sec = colab("exec", "-s", SESSION, "--timeout", "120", "--env", "SEC_USER_AGENT=colab-runner-probe research@example.com", "-f", str(REPO / "snippets" / "sec_reachability.py"), timeout=300)
         data["sec_from_colab"] = sec.stdout.strip() or sec.stderr.strip()[-300:]
         if args.run_local_gate:
-            t0 = time.perf_counter()
-            gate = subprocess.run([str(WORKLOAD / ".venv" / "bin" / "python"), "check.py", *GATE_PATHS, "--workers", "2"], cwd=WORKLOAD, capture_output=True, text=True)
-            data["gate_local"] = {"seconds": round(time.perf_counter() - t0, 2), "rc": gate.returncode, "tail": gate.stdout.strip()[-300:]}
+            if TARGET_REPO is None:
+                data["gate_local"] = {"error": "COLAB_PROBE_REPO is not set; the local gate leg has no target repo"}
+            else:
+                t0 = time.perf_counter()
+                gate = subprocess.run([str(TARGET_REPO / ".venv" / "bin" / "python"), "check.py", *GATE_PATHS, "--workers", "2"], cwd=TARGET_REPO, capture_output=True, text=True)
+                data["gate_local"] = {"seconds": round(time.perf_counter() - t0, 2), "rc": gate.returncode, "tail": gate.stdout.strip()[-300:]}
         data["gate_remote_note"] = "Remote gate leg runs via bin/colab-check once the Step 7 bundle exists; verdicts must agree, only wall time may differ."
     finally:
         stop_session(SESSION)

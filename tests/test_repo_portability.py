@@ -97,3 +97,41 @@ def test_no_workload_literal_in_executable_code():
         if token.search(text):
             offenders.append(name)
     assert not offenders, "\n".join(offenders)
+
+
+# Files that must name the workload to do their job, exempt from
+# the tracked-files scan below and named here in the open:
+# - tests/test_env_registry_unit.py names the forbidden literals
+#   to assert their absence from the code that builds environments.
+# - The facade/fixture snippets are workload payload definitions:
+#   they execute the workload's own modules on the VM, so naming
+#   those modules is their function. Everything else tracked —
+#   docs, fixtures, prose — carries no workload literal at all.
+WORKLOAD_SCAN_EXEMPT = {
+    "tests/test_env_registry_unit.py",
+    "snippets/facade_battery_job.py",
+    "snippets/facade_memory_profiler.py",
+    "snippets/fixture_gathering_job.py",
+}
+
+
+def test_no_workload_literal_in_tracked_files():
+    """The workload literal appears nowhere in tracked files
+    outside the named exemptions (2026-11-06 purge): the token
+    scan above governs executable code, and this scan closes the
+    gap it left — docs, tests, and prose drifted because nothing
+    scanned them. Case-insensitive substring: the repo is
+    workload-agnostic, so the workload's name in any form or
+    file is a defect unless the file's function is to name it."""
+    names = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+    offenders = []
+    for name in names:
+        if name in WORKLOAD_SCAN_EXEMPT or Path(name).name == SELF:
+            continue
+        try:
+            text = (REPO / name).read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if WORKLOAD_LITERAL in text.lower():
+            offenders.append(name)
+    assert not offenders, "\n".join(offenders)

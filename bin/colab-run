@@ -265,7 +265,19 @@ def main() -> int:
         return 2
     shape = shapes[shape_id]
     run_id = resume or f"{job_name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    rec = {"run_id": run_id, "job": job_name, "shape": shape_id, "state": "starting", "started_at": now(), "resumed": bool(resume)}
+    rec = None
+    if resume:
+        # A resume continues the run on disk: its launch facts
+        # (started_at above all) are the run's history and are
+        # never re-stamped — the resume adds its own facts.
+        # (2026-11-06: a resumed hold came back stamped with the
+        # resume moment, erasing its launch time.)
+        prior = RUNS / f"{run_id}.json"
+        if prior.exists():
+            rec = json.loads(prior.read_text())
+            rec.update(state="starting", resumed=True, resumed_at=now())
+    if rec is None:
+        rec = {"run_id": run_id, "job": job_name, "shape": shape_id, "state": "starting", "started_at": now(), "resumed": bool(resume)}
     if caller:
         rec["caller"] = caller
     save_record(rec)
@@ -429,10 +441,22 @@ def main() -> int:
         )
         deadline = time.time() + job.get("timeout", 18000)
         cadence = job.get("checkpoint_pull_seconds", 300)
+        # A checkpoint poll that outlives its subprocess timeout
+        # is a failed poll, not a dead poller (2026-11-06: an
+        # uncaught TimeoutExpired killed the poller mid-run and
+        # stranded the record at polling while the payload
+        # completed). The timeout is env-tunable for the same
+        # reason the cadence is a manifest value: tests shrink it.
+        poll_timeout = int(os.environ.get("COLAB_RUN_POLL_TIMEOUT_S", "300"))
         state = {}
         while time.time() < deadline:
             time.sleep(cadence)
-            chk = colab("exec", "-s", session, "--timeout", "120", "-f", str(reader), timeout=300)
+            try:
+                chk = colab("exec", "-s", session, "--timeout", "120", "-f", str(reader), timeout=poll_timeout)
+            except subprocess.TimeoutExpired:
+                rec["last_poll_error"] = f"checkpoint poll timed out at {now()}"
+                save_record(rec)
+                continue
             try:
                 state = json.loads(chk.stdout[chk.stdout.index("{"):])
             except (ValueError, json.JSONDecodeError):

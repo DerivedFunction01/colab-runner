@@ -14,7 +14,7 @@ ua = os.environ.get("SEC_USER_AGENT")
 if not ua:
     print(json.dumps({"verdict": "SEC_USER_AGENT not set in environment"}))
     raise SystemExit(0)
-req = urllib.request.Request("https://www.sec.gov/cgi-bin/browse-workload?action=getcompany", headers={"User-Agent": ua})
+req = urllib.request.Request("https://data.sec.gov/api/xbrl/companyconcept/CIK0000320193/us-gaap/Assets.json", headers={"User-Agent": ua})
 t0 = time.perf_counter()
 try:
     with urllib.request.urlopen(req, timeout=30) as r:

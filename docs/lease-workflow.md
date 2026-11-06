@@ -1,4 +1,4 @@
-# Lease workflow — operating the shared "workload" session (v1, 2026-10-29)
+# Lease workflow — operating the shared "primary" session (v1, 2026-10-29)
 
 Findings first: the lease is a warm VM with a hard deadline, not a job
 service. Everything below exists to (a) never need a new session while
@@ -7,7 +7,7 @@ and (c) lose nothing when the reaper fires at the deadline.
 
 ## Invariants (from the operator's away brief, 2026-10-29)
 
-- One session only: "workload". Wrappers acquire-or-adopt; while the operator is
+- One session only: "primary". Wrappers acquire-or-adopt; while the operator is
   away, NEVER create a session of any profile — a fresh tunnel hostname
   needs an approval he cannot give.
 - If the session dies before the deadline: do not reacquire. Park the
@@ -33,8 +33,7 @@ on the session is the coordinator's competence, exercised the
 way it is on any computer.
 
 1. **Preflight (local, every job)**: `bin/colab-lease status` must show
-   the lease active with deadline in the future. Read the local workload-repo
-   HEAD; if the job needs a tree newer than the warmed snapshot, build a
+   the lease active with deadline in the future. Read the local HEAD of the workload repo; if the job needs a tree newer than the warmed snapshot, build a
    fresh snapshot bundle (sync/make_snapshot_bundle.sh) and apply it
    remotely (sync/apply_bundle_remote.py) BEFORE queueing the job —
    never mid-job. Record the shipped tree hash in the job's run record.
@@ -325,7 +324,7 @@ scope afterwards is script-level machinery and served state.
 
 - Acquired 2026-10-29T17:37Z; deadline 2026-10-30T01:37:14Z; balance at
   acquire 581.67 CU. Warmed tree: snapshot commit 21a85ca2 (parent
-  c07b1210, tree 3c6a2716) at /content/workload-repo.
+  c07b1210, tree 3c6a2716) at /content/workload.
 - First queued work under this workflow: job zero (remote venv build +
   toolchain assertion), then a comparative gate via bin/colab-check on
   a scoped path set. Heavy queue beyond that waits for job zero.
@@ -383,9 +382,9 @@ rather than a fabricated number.
 
 ## Envelope Steps 6–7: the broker verdict and the live proof (2026-11-01)
 
-Step 7 ran live under a 12 h grant (scope lobby + workload, snapshot
+Step 7 ran live under a 12 h grant (scope lobby + primary, snapshot
 caps 15/150/4): the standing duty raised the lobby unattended,
-a demand planted with `--via step7-proof` started the workload burst
+a demand planted with `--via step7-proof` started the primary burst
 through the auto duty — envelope-stamped, priced on attributed
 spend, ledgered — and the burst was released after verification,
 its burn journaled (98 s at 0.26 CU/h). The grant and lobby stay
@@ -471,9 +470,9 @@ a rebuild). At most one extra instance per profile.
 
 The instance is a derived profile, not a new lease kind: its
 profile id and session name are the base's plus `2` (the High-RAM
-instance is profile `workload2`, session `workload2`), with the base's
+instance is profile `primary2`, session `primary2`), with the base's
 shape and measured rate and its own record
-(`var/lease-workload2.json`). Every profile-keyed path — acquire,
+(`var/lease-primary2.json`). Every profile-keyed path — acquire,
 reap, keepalive, kernel pulse, renewal, spend — covers it
 unchanged; spend segments journal under the instance's own
 profile and session at the shared rate.
@@ -497,10 +496,10 @@ sibling's remaining window (rate × time to its deadline,
 reported as `sibling_projected`) to its own projection for the
 balance floor and the daily/monthly caps.
 
-Live proof (2026-11-03): the CLI-created `workload2` High-RAM
+Live proof (2026-11-03): the CLI-created `primary2` High-RAM
 session was adopted in place (`adopted-foreign`, pulse ok,
 keepalive launched, sibling projection 1.59 CU priced against
-the primary's remaining window) with the primary workload lease's
+the primary's remaining window) with the primary lease's
 session and deadline untouched, and the reaper kept both across
 subsequent cycles. The stop path was proven on a standard-tier
 instance instead: `standard2` created, pulsed, released, and

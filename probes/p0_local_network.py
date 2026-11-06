@@ -2,7 +2,7 @@
 """P0: local network baseline (stdlib only).
 
 Measures TTFB to GitHub / PyPI / Colab / SEC, and the real cost of fetching
-the workload-repo code payload the way a Colab bootstrap would (codeload tarball
+the workload repo's code payload the way a Colab bootstrap would (codeload tarball
 of origin main). Writes a JSON result under probes/results/.
 """
 
@@ -44,9 +44,9 @@ def download(url: str) -> dict:
 
 
 def reference_payload() -> dict:
-    """A public file in the same size class as the workload-repo code payload.
+    """A public file in the same size class as the workload repo's code payload.
 
-    The workload-repo GitHub repo is not publicly readable (codeload returns
+    The workload GitHub repo is not publicly readable (codeload returns
     404 unauthenticated), so throughput is calibrated on the largest pyarrow
     wheel from PyPI instead; Step 7 prices the real bundle from disk.
     """
@@ -68,7 +68,7 @@ def main() -> int:
             ttfb("https://github.com"),
             ttfb("https://pypi.org/simple/google-colab-cli/"),
             ttfb("https://colab.research.google.com"),
-            ttfb("https://www.sec.gov/cgi-bin/browse-workload?action=getcompany"),
+            ttfb("https://data.sec.gov/api/xbrl/companyconcept/CIK0000320193/us-gaap/Assets.json"),
         ],
         "payload": reference_payload(),
     }

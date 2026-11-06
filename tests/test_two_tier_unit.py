@@ -212,9 +212,9 @@ def test_acquire_out_of_scope_carries_neither_stamp(tmp_path, monkeypatch):
 
 def test_acquire_adopted_in_scope_gains_envelope_stamp(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
-    seed_record("workload", "cpu-highram")
+    seed_record("alpha", "cpu-highram")
     lease.write_grant(REPO, 8, burst_shape="cpu-highram", now_dt=T0)
-    out = lease.acquire(make_stub({"workload"}), REPO, "cpu-highram", now_dt=T0, via="panel")
+    out = lease.acquire(make_stub({"alpha"}), REPO, "cpu-highram", now_dt=T0, via="panel")
     assert out["action"] == "adopted"
     assert out["record"]["envelope_id"] == T0.isoformat()
     # An adopted record keeps its creator's attribution: no via stamp.
@@ -269,8 +269,8 @@ def test_acquire_in_scope_refused_by_smaller_snapshot(tmp_path, monkeypatch):
 def test_extend_burst_independent_of_grant(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     lease.write_grant(REPO, 8, now_dt=T0)
-    seed_record("workload", "cpu-highram")
-    out = lease.extend(make_stub({"workload"}), REPO, "workload", 2, now_dt=T0)
+    seed_record("alpha", "cpu-highram")
+    out = lease.extend(make_stub({"alpha"}), REPO, "alpha", 2, now_dt=T0)
     assert out["action"] == "extended"
     assert out["budget"]["projected"] == 0.52  # the burst's own rate x delta
     # The grant neither extends nor blocks: its end is unmoved.

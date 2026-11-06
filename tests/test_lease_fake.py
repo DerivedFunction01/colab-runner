@@ -617,7 +617,7 @@ def test_gate_demand_refusal_clears_and_journals(tmp_path, monkeypatch):
 def test_gate_renewal_refuses_standard_window(tmp_path, monkeypatch):
     repo = gate_repo(tmp_path, monkeypatch)
     fake = FakeColab()  # nothing alive: both sessions read absent
-    for shape, session in (("cpu", "standard"), ("cpu-highram", "workload")):
+    for shape, session in (("cpu", "standard"), ("cpu-highram", "alpha")):
         lease_mod.save_record(repo, {"shape": shape, "session": session, "acquired_at": (PNOW - timedelta(hours=12)).isoformat(), "deadline": (PNOW + timedelta(hours=12)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": [], "renew": True})
     out = lease_mod.reap(fake, repo, now_dt=PNOW)
     # The Standard window is not recreated; its record is kept and
@@ -626,10 +626,10 @@ def test_gate_renewal_refuses_standard_window(tmp_path, monkeypatch):
     by_session = {r["session"]: r["action"] for r in out["records"]}
     assert by_session["standard"] == "renewal-failed"
     renewed = [r for r in out["records"] if r["action"] == "renewed"]
-    assert len(renewed) == 1 and renewed[0]["new_session"].startswith("workload-r")
+    assert len(renewed) == 1 and renewed[0]["new_session"].startswith("alpha-r")
     assert lease_mod.load_record(repo, "standard")["session"] == "standard"
-    assert lease_mod.load_record(repo, "workload") is None
-    assert lease_mod.load_record(repo)["session"].startswith("workload-r")
+    assert lease_mod.load_record(repo, "alpha") is None
+    assert lease_mod.load_record(repo)["session"].startswith("alpha-r")
     journal = gate_journal(repo)
     assert [e["kind"] for e in journal] == ["shape-refused"]
     assert journal[0]["seam"] == "renewal" and journal[0]["shape"] == "cpu"
