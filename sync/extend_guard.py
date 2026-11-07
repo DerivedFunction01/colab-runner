@@ -199,7 +199,10 @@ def run_guard(lease_mod, colab, repo: Path, now_dt: datetime | None = None, poli
         first = prior is None or prior.get("action") != action
         episodes[session] = {"action": action, "since": (prior or {}).get("since") or now_dt.isoformat()}
         verdicts[session] = {"action": action, "at": now_dt.isoformat()}
-        lines.append({"session": session, "action": action, "finding": True, "episode_first": first, "caller": rec.get("caller")})
+        line = {"session": session, "action": action, "finding": True, "episode_first": first, "caller": rec.get("caller")}
+        if out.get("read_error"):
+            line["read_error"] = out["read_error"]
+        lines.append(line)
 
     def skip(rec, action: str) -> None:
         verdicts[rec["session"]] = {"action": action, "at": now_dt.isoformat()}

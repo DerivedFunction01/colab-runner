@@ -706,26 +706,51 @@ def parse_balance(usage_text: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def session_state(colab, session: str) -> str:
+_SESSION_READ_ATTEMPTS = 3
+_SESSION_READ_BACKOFF_S = (2, 5)
+
+
+def session_state(colab, session: str, diag: dict | None = None) -> str:
     """Tri-state: "alive" (listed), "absent" (list obtained, name not in
     it), "unknown" (the CLI call failed or returned nothing). Unknown must
     never be treated as dead: on 2026-10-29 the lease record vanished
     while its session lived, and a hiccup-reads-as-death path is the
-    standing suspect class. Callers reconcile only on "absent"."""
-    try:
-        out = colab("sessions", timeout=120).stdout
-    except Exception:  # noqa: BLE001
-        return "unknown"
-    if not out or not out.strip():
-        return "unknown"
-    if "Enter the authorization code" in out:
-        # The CLI's interactive login prompt is not a session list: on
-        # 2026-11-01 it read as "absent" here and a live lease's record
-        # was deleted under it. The bin/colab-run guard now stops the
-        # prompt from ever reaching callers; this is the same rule at
-        # the seam, for any path that bypasses the wrapper.
-        return "unknown"
-    return "alive" if session in out else "absent"
+    standing suspect class. Callers reconcile only on "absent".
+
+    The read is retried (bounded, with backoff): a single transient
+    failure — a subprocess timeout under the account's parallel load
+    is the observed class — otherwise poisons a whole guard or
+    reaper cycle with an unknown it did not earn (2026-11-07: a
+    healthy, pulsing session classified extend-unknown and twice
+    kept-unknown overnight). Only exhausted retries classify
+    unknown, and `diag`, when passed, records why: the attempt
+    count and the last failure's shape, so an unknown is never
+    silent again. The auth prompt is definitive, never retried."""
+    last_error = "no-attempt"
+    for attempt in range(_SESSION_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(_SESSION_READ_BACKOFF_S[min(attempt - 1, len(_SESSION_READ_BACKOFF_S) - 1)])
+        try:
+            out = colab("sessions", timeout=120).stdout
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"[:120] if str(exc) else type(exc).__name__
+            continue
+        if out and "Enter the authorization code" in out:
+            # The CLI's interactive login prompt is not a session list: on
+            # 2026-11-01 it read as "absent" here and a live lease's record
+            # was deleted under it. The bin/colab-run guard now stops the
+            # prompt from ever reaching callers; this is the same rule at
+            # the seam, for any path that bypasses the wrapper.
+            if diag is not None:
+                diag.update({"attempts": attempt + 1, "read_error": "auth-prompt"})
+            return "unknown"
+        if not out or not out.strip():
+            last_error = "empty-output"
+            continue
+        return "alive" if session in out else "absent"
+    if diag is not None:
+        diag.update({"attempts": _SESSION_READ_ATTEMPTS, "read_error": last_error})
+    return "unknown"
 
 
 def session_alive(colab, session: str) -> bool:
@@ -1563,9 +1588,10 @@ def extend(colab, repo: Path, session: str, hours: float, now_dt: datetime | Non
         return {"action": "extend-no-lease"}
     if rec.get("standing") and grant_active(load_grant(repo), now_dt):
         return {"action": "extend-standing-managed"}
-    state = session_state(colab, session)
+    diag: dict = {}
+    state = session_state(colab, session, diag)
     if state == "unknown":
-        return {"action": "extend-unknown", "session": session}
+        return {"action": "extend-unknown", "session": session, "read_error": diag.get("read_error"), "attempts": diag.get("attempts")}
     if state == "absent" and not rec.get("renew"):
         return {"action": "extend-no-lease", "session": session}
     shape = catalog_shapes(repo).get(rec.get("shape"))
@@ -1981,9 +2007,10 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
     plus grant-expiry enforcement for standing leases — a standing
     lease whose grant has lapsed (or vanished) is released even before
     its own deadline."""
-    state = session_state(colab, rec["session"])
+    diag: dict = {}
+    state = session_state(colab, rec["session"], diag)
     if state == "unknown":
-        return {"action": "kept-unknown", "session": rec["session"]}
+        return {"action": "kept-unknown", "session": rec["session"], "read_error": diag.get("read_error"), "attempts": diag.get("attempts")}
     if state == "absent":
         if rec.get("renew") and not rec.get("standing") and now_dt < parse_dt(rec["deadline"]):
             # Window lease whose session died mid-window: renew it

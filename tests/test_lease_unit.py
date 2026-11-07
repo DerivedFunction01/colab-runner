@@ -1362,3 +1362,64 @@ def test_state_serves_extend_guard_policy_and_verdicts(tmp_path):
     assert out["extend_guard"]["policy"]["shapes"] == {"a100-highram": "active-only"}
     assert out["extend_guard"]["policy"]["default_mode"] == "active-or-first"
     assert out["extend_guard"]["verdicts"]["busy-lease-1"]["action"] == "extended"
+
+
+# --- session_state read resilience (2026-11-07 classification defect) ---
+
+
+def test_session_state_retries_a_transient_failure(monkeypatch):
+    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired("colab", 120)
+        return cp("lilac-reef-93 some-host")
+
+    diag = {}
+    assert lease.session_state(flaky, "lilac-reef-93", diag) == "alive"
+    assert calls["n"] == 2
+
+
+def test_session_state_unknown_only_after_exhausted_retries(monkeypatch):
+    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+
+    def dead(*a, **k):
+        raise subprocess.TimeoutExpired("colab", 120)
+
+    diag = {}
+    assert lease.session_state(dead, "lilac-reef-93", diag) == "unknown"
+    assert diag["attempts"] == 3 and "TimeoutExpired" in diag["read_error"]
+
+
+def test_session_state_empty_output_retries_then_unknown(monkeypatch):
+    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    diag = {}
+    assert lease.session_state(lambda *a, **k: cp(""), "lilac-reef-93", diag) == "unknown"
+    assert diag == {"attempts": 3, "read_error": "empty-output"}
+
+
+def test_session_state_auth_prompt_is_not_retried(monkeypatch):
+    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    calls = {"n": 0}
+
+    def prompt(*a, **k):
+        calls["n"] += 1
+        return cp("Enter the authorization code:")
+
+    diag = {}
+    assert lease.session_state(prompt, "lilac-reef-93", diag) == "unknown"
+    assert calls["n"] == 1 and diag["read_error"] == "auth-prompt"
+
+
+def test_extend_unknown_carries_the_read_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    seed_record(tmp_path, monkeypatch)
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired("colab", 120)
+
+    out = lease.extend(boom, REPO, "standard", 2, now_dt=NOW)
+    assert out["action"] == "extend-unknown"
+    assert out["attempts"] == 3 and "TimeoutExpired" in out["read_error"]
