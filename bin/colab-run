@@ -439,6 +439,34 @@ def main() -> int:
             "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split()}\n"
             "print(json.dumps(out))\n"
         )
+        def pull_outputs() -> list:
+            """Download the declared outputs to results/<run_id>/.
+
+            Runs at every checkpoint cadence while the job runs —
+            the manifest's checkpoint_pull_seconds is a pull
+            cadence, not only a poll cadence (2026-11-07: the
+            venue relay starved because outputs landed only at
+            completion, so a 12 h job's log never reached the
+            local reader waiting on it) — and once more after the
+            loop as the authoritative final pull. A failed or
+            timed-out download is noted on the record and never
+            breaks the poll loop; a missing remote file (the job
+            has not written it yet) simply pulls nothing."""
+            pulled_now = []
+            for name in job.get("outputs", []):
+                dest = REPO / "results" / run_id / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
+                except subprocess.TimeoutExpired:
+                    rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
+                    continue
+                if dest.exists():
+                    pulled_now.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()})
+            if pulled_now:
+                rec["last_checkpoint_pull_at"] = now()
+            return pulled_now
+
         deadline = time.time() + job.get("timeout", 18000)
         cadence = job.get("checkpoint_pull_seconds", 300)
         # A checkpoint poll that outlives its subprocess timeout
@@ -464,6 +492,9 @@ def main() -> int:
             done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
             rec["last_checkpoint_units"] = done_units
             save_record(rec)
+            if job.get("outputs"):
+                pull_outputs()
+                save_record(rec)
             log = state.get("heartbeat_tail") or []
             if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]):
                 break
@@ -484,13 +515,7 @@ def main() -> int:
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
         # Pull expected outputs and verify by the job's own unit hashes.
-        pulled = []
-        for name in job.get("outputs", []):
-            dest = REPO / "results" / run_id / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
-            if dest.exists():
-                pulled.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()})
+        pulled = pull_outputs()
         exit_code = (state.get("checkpoint") or {}).get("exit_code")
         if exit_code not in (None, 0):
             # The payload ran and stamped its own failure in the

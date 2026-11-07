@@ -152,6 +152,41 @@ def test_resume_preserves_the_original_started_at(tmp_path):
         rec_path.unlink(missing_ok=True)
 
 
+def test_checkpoint_pull_lands_outputs_during_the_run(tmp_path):
+    """checkpoint_pull_seconds is a pull cadence, not only a poll
+    cadence: declared outputs download at every checkpoint while
+    the job runs, so a long job's growing outputs (the venue
+    keeper's log is the live case) reach local readers mid-run
+    instead of only at completion. (Live defect 2026-11-07: the
+    relay waiting on the keeper's log starved for the job's whole
+    12 h timeout because pulls happened only after the loop.)"""
+    wrapper = tmp_path / "wrapper_colab.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_COLAB_STATE'])\n"
+        "args = sys.argv[1:]\n"
+        "if 'download' in args:\n"
+        "    state.mkdir(parents=True, exist_ok=True)\n"
+        "    with (state / 'downloads.log').open('a') as fh:\n"
+        "        fh.write(args[-2] + '\\n')\n"
+        "sys.exit(subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode)\n"
+    )
+    wrapper.chmod(0o755)
+    env = runner_env(tmp_path)
+    env.update(COLAB_BIN=str(wrapper), FAKE_COLAB_REAL=str(FAKE))
+    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    downloads = (tmp_path / "fake" / "downloads.log").read_text().splitlines()
+    unit0 = [d for d in downloads if d.endswith("unit-0.bin")]
+    assert len(unit0) >= 2, f"unit-0.bin downloaded {len(unit0)} time(s): the final pull only, no checkpoint pull during the run"
+    rec = json.loads((REPO / "results" / "runs" / f"{out['run_id']}.json").read_text())
+    assert rec.get("last_checkpoint_pull_at"), "the run record carries no checkpoint pull stamp"
+
+
 def test_poll_timeout_degrades_instead_of_killing_the_poller(tmp_path):
     """A checkpoint poll whose CLI call exceeds its timeout is a
     failed poll, not a dead poller: the loop notes it on the
