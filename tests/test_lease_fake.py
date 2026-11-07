@@ -359,7 +359,11 @@ def test_budget_guard_prices_concurrent_windows(tmp_path, monkeypatch):
     out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="beta", duty=True)
     assert out["action"] == "refused-budget"
     assert out["budget"]["reason"] == "daily-budget"
-    assert out["budget"]["committed_projected"] == 0.64
+    # The other window runs 18:00Z -> 02:00Z: the daily check
+    # clips its committed share to the 6 h inside today (0.48);
+    # the unclipped sum (0.64) rides as committed_full.
+    assert out["budget"]["committed_projected"] == 0.48
+    assert out["budget"]["committed_full"] == 0.64
     # Control: with the other record gone the same request fits.
     lease_mod.delete_record(repo, "one")
     fake2 = FakeColab()
@@ -369,7 +373,32 @@ def test_budget_guard_prices_concurrent_windows(tmp_path, monkeypatch):
     # prices the live window the same way.
     out = lease_mod.acquire(FakeColab(alive={out["record"]["session"]}), repo, "cpu", now_dt=PNOW, caller="gamma", duty=True)
     assert out["action"] == "refused-budget"
-    assert out["budget"]["committed_projected"] == 0.64
+    assert out["budget"]["committed_projected"] == 0.48
+    assert out["budget"]["committed_full"] == 0.64
+
+
+def test_budget_daily_check_clips_other_windows_to_today(tmp_path, monkeypatch):
+    """The 2026-11-07 refusal, as a fixture: a multi-day keeper
+    window (56 h at 0.08) and a same-shape window (9 h at 0.26)
+    commit 6.82 unclipped, which with an 8 h window priced at
+    2.08 busts a daily cap of 8. Clipped to today (18:00Z ->
+    24:00Z = 6 h each) they commit 2.04 and the window fits;
+    a tighter cap of 5 still refuses, reporting the clipped
+    figure as committed_projected and the full one as
+    committed_full."""
+    repo = scratch_repo(tmp_path, monkeypatch, daily_cap=8.0)
+    fake = FakeColab()
+    lease_mod.save_record(repo, {"shape": "cpu", "session": "keeper", "caller": "panel", "rate_cu_per_hour": 0.08, "acquired_at": (PNOW - timedelta(hours=10)).isoformat(), "deadline": (PNOW + timedelta(hours=56)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
+    lease_mod.save_record(repo, {"shape": "cpu-highram", "session": "sibling", "caller": "alpha", "rate_cu_per_hour": 0.26, "acquired_at": (PNOW - timedelta(hours=2)).isoformat(), "deadline": (PNOW + timedelta(hours=9)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
+    cfg = lease_mod.load_config(repo)
+    shape = {"id": "cpu-highram", "rate_cu_per_hour": 0.26}
+    out = lease_mod.budget_check(fake, repo, cfg, shape, hours=8.0, now_dt=PNOW, exclude_session="candidate")
+    assert out["ok"] is True
+    cfg["daily_cu_budget"] = 5.0
+    out = lease_mod.budget_check(fake, repo, cfg, shape, hours=8.0, now_dt=PNOW, exclude_session="candidate")
+    assert out["ok"] is False and out["reason"] == "daily-budget"
+    assert out["committed_projected"] == 2.04
+    assert out["committed_full"] == 6.82
 
 
 def test_state_portions_and_composition(tmp_path, monkeypatch):

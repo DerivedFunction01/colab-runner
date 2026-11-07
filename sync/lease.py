@@ -924,7 +924,14 @@ def budget_check(colab, repo: Path, cfg: dict, shape: dict, hours: float | None 
     "committed_projected" — concurrent windows are priced as the
     sum they commit, so two windows must not each pass a guard
     their sum would fail. The other leases' elapsed burn is already
-    inside day/month spent via their live records. Returns
+    inside day/month spent via their live records. For the daily
+    check the committed sum is clipped to the current UTC day —
+    the same clipping day_spent gets (owner ruling 2026-11-07):
+    a multi-day window charges only today's portion against
+    today's cap, and each later day re-prices as it arrives. The
+    balance floor and the monthly check keep the full windows:
+    a window may not promise more than the account holds, and
+    the month is the monthly window's own horizon. Returns
     {"ok": bool, ...}."""
     try:
         usage_res = colab("usage", timeout=120)
@@ -959,7 +966,8 @@ def budget_check(colab, repo: Path, cfg: dict, shape: dict, hours: float | None 
     month_spent = spend["month_spent"]
     if projected is None:
         return {"ok": True, "balance": balance, "projected": None, "rate_unconfirmed": True, "day_spent": round(day_spent, 2), "month_spent": round(month_spent, 2)}
-    committed = projected + _committed_projection(repo, now_dt or datetime.now(timezone.utc), exclude_session)
+    now = now_dt or datetime.now(timezone.utc)
+    committed = projected + _committed_projection(repo, now, exclude_session)
     committed_extra = round(committed - projected, 2)
     if committed > balance:
         # The floor: caps throttle the repo's own burn, but no
@@ -971,10 +979,20 @@ def budget_check(colab, repo: Path, cfg: dict, shape: dict, hours: float | None 
     daily_cap = cap("daily", cfg.get("daily_cu_budget"))
     monthly_cap = cap("monthly", cfg.get("monthly_cu_budget"))
     if daily_cap is not None and day_spent + committed > daily_cap:
-        out = {"ok": False, "reason": "daily-budget", "day_spent": round(day_spent, 2), "projected": round(projected, 2), "cap": daily_cap, "balance": balance}
-        if committed_extra:
-            out["committed_projected"] = committed_extra
-        return out
+        # Retry the comparison with other windows clipped to the
+        # current UTC day before refusing on the daily cap: the
+        # unclipped sum stays in the verdict as committed_full so
+        # the overage's composition is never hidden.
+        day_end = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        committed_day = projected + _committed_projection(repo, now, exclude_session, clip_end=day_end)
+        if day_spent + committed_day > daily_cap:
+            out = {"ok": False, "reason": "daily-budget", "day_spent": round(day_spent, 2), "projected": round(projected, 2), "cap": daily_cap, "balance": balance}
+            clipped_extra = round(committed_day - projected, 2)
+            if clipped_extra:
+                out["committed_projected"] = clipped_extra
+            if committed_extra != clipped_extra:
+                out["committed_full"] = committed_extra
+            return out
     if monthly_cap is not None and month_spent + committed > monthly_cap:
         out = {"ok": False, "reason": "monthly-budget", "month_spent": round(month_spent, 2), "projected": round(projected, 2), "cap": monthly_cap, "balance": balance}
         if committed_extra:
@@ -992,20 +1010,26 @@ def budget_check(colab, repo: Path, cfg: dict, shape: dict, hours: float | None 
     return out
 
 
-def _committed_projection(repo: Path, now_dt: datetime, exclude_session: str | None = None) -> float:
+def _committed_projection(repo: Path, now_dt: datetime, exclude_session: str | None = None, clip_end: datetime | None = None) -> float:
     """Every other live lease's remaining committed window cost:
     rate x the time left to its record's deadline, summed. Zero for
     an expired window or an unconfirmed rate (nothing fabricated).
     The lease being priced excludes itself (exclude_session) — its
-    own window is the projection it rides beside."""
+    own window is the projection it rides beside. `clip_end` caps
+    each window at that instant (the daily check passes the end
+    of the current UTC day, so a multi-day window charges only
+    the portion that falls inside today)."""
     total = 0.0
     for rec in all_records(repo):
         if exclude_session is not None and rec.get("session") == exclude_session:
             continue
         try:
-            remaining_h = (parse_dt(rec["deadline"]) - now_dt).total_seconds() / 3600.0
+            end = parse_dt(rec["deadline"])
         except (KeyError, ValueError):
             continue
+        if clip_end is not None and end > clip_end:
+            end = clip_end
+        remaining_h = (end - now_dt).total_seconds() / 3600.0
         if remaining_h <= 0:
             continue
         rate = rec.get("rate_cu_per_hour")
