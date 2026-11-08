@@ -9,6 +9,8 @@ $STUB_EXTEND_REFUSE=1 makes `extend` answer refused-budget and
 `extend-grant` answer grant-inactive, both with exit 1 (a core refusal).
 $STUB_CAPS_INVALID=1 makes `budget-caps` answer caps-invalid with
 exit 1 (the core rejecting a cap update).
+$STUB_ADOPT_REFUSE=1 makes `adopt` answer adopt-deadline-past
+with exit 1 (a core refusal).
 
 The `state` shape mirrors sync/lease.py's state() exactly: records
 are status entries wrapping the lease record (keyed by session),
@@ -153,6 +155,12 @@ def main(argv):
             print(json.dumps({"action": "refused-budget", "budget": {"ok": False, "reason": "daily-budget", "projected": 16.0, "cap": 10}}))
             return 1
         out = {"action": "extended", "session": argv[1], "hours": hours, "old_deadline": "2026-11-02T00:00:00+00:00", "new_deadline": "2026-11-02T02:00:00+00:00"}
+    elif cmd == "adopt":
+        if os.environ.get("STUB_ADOPT_REFUSE") == "1":
+            print(json.dumps({"action": "adopt-deadline-past", "session": argv[1]}))
+            return 1
+        shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "cpu-highram"
+        out = {"action": "adopted", "record": record(argv[1], shape), "deadline_source": "manual"}
     elif cmd == "release":
         out = {"action": "released", "session": argv[1] if len(argv) > 1 else None}
     elif cmd == "release-session":

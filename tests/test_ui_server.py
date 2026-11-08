@@ -554,3 +554,49 @@ def test_state_orphans_failure_is_isolated(tmp_path):
         assert budget["budget"]["balance"] == 571.7
     finally:
         server.close()
+
+
+def test_adopt_endpoint_invokes_core_and_appends_event(ui):
+    status, data = ui.post("/api/lease/adopt", {"session": "stray-fox-7"})
+    assert status == 200 and data["action"] == "adopted"
+    assert "adopt stray-fox-7 --caller panel" in ui.invocations()
+    events = [e for e in ui.outbox_events() if e["kind"] == "lease-adopted"]
+    assert len(events) == 1 and events[0]["detail"]["session"] == "stray-fox-7"
+
+
+def test_adopt_endpoint_forwards_deadline_and_shape(ui):
+    status, _ = ui.post("/api/lease/adopt", {"session": "stray-fox-7", "deadline": "2026-11-09T00:00:00+00:00", "shape": "cpu-highram"})
+    assert status == 200
+    assert "adopt stray-fox-7 --deadline 2026-11-09T00:00:00+00:00 --shape cpu-highram --caller panel" in ui.invocations()
+
+
+def test_adopt_endpoint_refusal_is_409_with_event(tmp_path):
+    server = UiServer(tmp_path, extra_env={"STUB_ADOPT_REFUSE": "1"})
+    try:
+        status, data = server.post("/api/lease/adopt", {"session": "stray-fox-7"})
+        assert status == 409 and data["action"] == "adopt-deadline-past"
+        events = [e for e in server.outbox_events() if e["kind"] == "lease-adopt-failed"]
+        assert len(events) == 1 and events[0]["detail"]["session"] == "stray-fox-7"
+    finally:
+        server.close()
+
+
+def test_adopt_endpoint_core_failure_is_502(tmp_path):
+    server = UiServer(tmp_path, extra_env={"STUB_LEASE_FAIL": "adopt"})
+    try:
+        status, _ = server.post("/api/lease/adopt", {"session": "stray-fox-7"})
+        assert status == 502
+    finally:
+        server.close()
+
+
+def test_adopt_endpoint_validation(ui):
+    status, _ = ui.post("/api/lease/adopt", {})
+    assert status == 400
+    status, _ = ui.post("/api/lease/adopt", {"session": "stray-fox-7", "deadline": "not-a-date"})
+    assert status == 400
+    status, _ = ui.post("/api/lease/adopt", {"session": "stray-fox-7", "hours": -1})
+    assert status == 400
+    status, _ = ui.post("/api/lease/adopt", {"session": "stray-fox-7", "deadline": "2026-11-09T00:00:00+00:00", "hours": 3})
+    assert status == 400
+    assert not any(line.startswith("adopt ") for line in ui.invocations())

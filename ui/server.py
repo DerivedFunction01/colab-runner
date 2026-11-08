@@ -345,6 +345,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_lease_stop(body)
         if parsed.path == "/api/lease/extend":
             return self.api_lease_extend(body)
+        if parsed.path == "/api/lease/adopt":
+            return self.api_lease_adopt(body)
         if parsed.path == "/api/access/release":
             return self.api_access_release(body)
         if parsed.path == "/api/grant":
@@ -457,6 +459,56 @@ class Handler(BaseHTTPRequestHandler):
         else:
             OUTBOX.append("lease-extend-failed", {"session": session, "hours": hours, "result": result})
         return self.send_json(200, result)
+
+    def api_lease_adopt(self, body: dict) -> None:
+        """Adopt one orphaned session from the census: the core
+        adopt verb with the panel caller. The body names the
+        session and optionally plants a deadline (an ISO
+        timestamp, or a positive hours count — with neither, the
+        derived evidence plants itself) and a shape for a
+        class-ambiguous orphan. A core refusal is a 409 with the
+        verdict (the access-release mapping); an unreachable
+        core is a 502. The outcome is appended to the outbox
+        under server-side kinds, as the other one-tap actions
+        do; the UI log vocabulary is untouched."""
+        session = body.get("session")
+        if not session or not isinstance(session, str):
+            return self.send_json(400, {"error": "session is required"})
+        deadline = body.get("deadline")
+        hours = body.get("hours")
+        if deadline is not None and hours is not None:
+            return self.send_json(400, {"error": "deadline and hours are alternatives — give one"})
+        args = ["adopt", session]
+        if deadline is not None:
+            if not isinstance(deadline, str):
+                return self.send_json(400, {"error": "deadline must be an ISO timestamp"})
+            try:
+                datetime.fromisoformat(deadline)
+            except ValueError:
+                return self.send_json(400, {"error": "deadline must be an ISO timestamp"})
+            args += ["--deadline", deadline]
+        elif hours is not None:
+            try:
+                if float(hours) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self.send_json(400, {"error": "hours must be a positive number"})
+            args += ["--hours", fmt_hours(hours)]
+        shape = body.get("shape")
+        if shape is not None:
+            if not isinstance(shape, str) or not shape:
+                return self.send_json(400, {"error": "shape must be a shape id"})
+            args += ["--shape", shape]
+        args += ["--caller", "panel"]
+        rc, result, err = run_core(*args)
+        if result is None:
+            OUTBOX.append("lease-adopt-failed", {"session": session, "error": err, "rc": rc})
+            return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
+        if result.get("action") == "adopted":
+            OUTBOX.append("lease-adopted", {"session": session, "result": result})
+            return self.send_json(200, result)
+        OUTBOX.append("lease-adopt-failed", {"session": session, "result": result})
+        return self.send_json(409, result)
 
     def api_grant_extend(self, body: dict) -> None:
         hours = body.get("hours")
