@@ -284,7 +284,13 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     stable outputs are no longer re-moved whole at every cadence.
     An output above the single-file ceiling moves via
     transfer.chunked_download (32 MB parts, whole-file SHA-256
-    verified) instead of one plain download."""
+    verified) instead of one plain download.
+
+    Entries accumulate on the record (rec["pulled"], one per
+    path, latest pull winning) and the accumulated list is what
+    this returns: with the skip above, a per-call list would
+    leave the terminal record reporting only the outputs the
+    final call happened to move — usually none."""
     pulled_now = []
     stats = (reader_state or {}).get("outputs") or {}
     stored = rec.setdefault("output_stats", {})
@@ -313,7 +319,15 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
                 stored[name] = stat
     if pulled_now:
         rec["last_checkpoint_pull_at"] = now()
-    return pulled_now
+        # Accumulate into the record's pulled list, one entry
+        # per path, latest pull winning: the terminal record
+        # and the printed result report every output the run
+        # landed, whichever cadence moved it.
+        by_path = {entry["path"]: entry for entry in rec.get("pulled", [])}
+        for entry in pulled_now:
+            by_path[entry["path"]] = entry
+        rec["pulled"] = list(by_path.values())
+    return rec.get("pulled", [])
 
 
 def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before) -> tuple[int, dict]:
