@@ -5,14 +5,20 @@ asserts the pulled outputs are hash-equal to the deterministic control.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE = REPO / "tests" / "fixtures" / "fake_colab.py"
+
+_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
+repo_fixture = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(repo_fixture)
 
 
 def control_sha(seed: str, unit: int) -> str:
@@ -38,31 +44,44 @@ def runner_env(tmp_path, **extra):
     token.parent.mkdir(parents=True, exist_ok=True)
     token.write_text('{"refresh_token": "fake-test-token"}')
     (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
-    return dict(os.environ, HOME=str(home), COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE, **extra)
+    # The runner under test runs against a fixture repo (authored
+    # config in the test tree): bin/colab-run derives its repo root
+    # from its own location, so its lease reads and its run records
+    # land in the fixture, never the checkout.
+    root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
+    return dict(os.environ, HOME=str(home), TEST_REPO_ROOT=str(root), COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE, **extra)
+
+
+def run_bin(env):
+    return Path(env["TEST_REPO_ROOT"]) / "bin" / "colab-run"
+
+
+def runs_dir(env):
+    return Path(env["TEST_REPO_ROOT"]) / "results" / "runs"
 
 
 def test_colab_run_smoke_end_to_end(tmp_path):
     env = runner_env(tmp_path)
-    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["state"] == "complete"
     pulled = {p["path"]: p["sha256"] for p in out["pulled"]}
     for unit in range(3):
         assert pulled[f"unit-{unit}.bin"] == control_sha("smoke", unit)
-    rec = json.loads((REPO / "results" / "runs" / f"{out['run_id']}.json").read_text())
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec["state"] == "complete"
     assert rec["usage_before"] and rec["usage_after"]
 
 
 def test_orphan_sweep_marks_dead_session(tmp_path):
     env = runner_env(tmp_path)
-    runs = REPO / "results" / "runs"
+    runs = runs_dir(env)
     runs.mkdir(parents=True, exist_ok=True)
     stale = runs / "ghost-20000101T000000Z.json"
     stale.write_text(json.dumps({"run_id": stale.stem, "job": "smoke", "session": "ghost-session-absent", "state": "running", "started_at": "2000-01-01T00:00:00+00:00"}))
     try:
-        r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+        r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
         assert r.returncode == 0, r.stdout + r.stderr
         assert json.loads(stale.read_text())["state"] == "orphaned"
     finally:
@@ -70,7 +89,7 @@ def test_orphan_sweep_marks_dead_session(tmp_path):
 
 
 def _fire_smoke(env):
-    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     return json.loads(r.stdout)
 
@@ -89,7 +108,7 @@ def test_orphan_sweep_keeps_cotenants_of_a_live_session(tmp_path):
     fire lands on the same session and completes alongside
     them, never serial behind them."""
     env = runner_env(tmp_path)
-    runs = REPO / "results" / "runs"
+    runs = runs_dir(env)
     runs.mkdir(parents=True, exist_ok=True)
     first = _fire_smoke(env)
     session = json.loads((runs / f"{first['run_id']}.json").read_text())["session"]
@@ -111,7 +130,7 @@ def test_orphan_sweep_marks_cotenants_of_a_dead_session_together(tmp_path):
     gone, every in-flight run bound to it is marked orphaned in
     the same sweep — while a run on a live session is untouched."""
     env = runner_env(tmp_path)
-    runs = REPO / "results" / "runs"
+    runs = runs_dir(env)
     runs.mkdir(parents=True, exist_ok=True)
     first = _fire_smoke(env)
     session = json.loads((runs / f"{first['run_id']}.json").read_text())["session"]
@@ -136,13 +155,13 @@ def test_resume_preserves_the_original_started_at(tmp_path):
     the resume adds its own facts. (Live defect 2026-11-06: a
     resumed hold came back stamped with the resume moment.)"""
     env = runner_env(tmp_path)
-    runs = REPO / "results" / "runs"
+    runs = runs_dir(env)
     runs.mkdir(parents=True, exist_ok=True)
     run_id = "smoke-resumeproof"
     rec_path = runs / f"{run_id}.json"
     rec_path.write_text(json.dumps({"run_id": run_id, "job": "smoke", "state": "orphaned", "started_at": "2000-01-01T00:00:00+00:00", "session": "ghost-session-absent"}))
     try:
-        r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke", "--resume", run_id], capture_output=True, text=True, env=env, timeout=300)
+        r = subprocess.run([sys.executable, str(run_bin(env)), "smoke", "--resume", run_id], capture_output=True, text=True, env=env, timeout=300)
         assert r.returncode == 0, r.stdout + r.stderr
         rec = json.loads(rec_path.read_text())
         assert rec["state"] == "complete"
@@ -176,14 +195,14 @@ def test_checkpoint_pull_lands_outputs_during_the_run(tmp_path):
     wrapper.chmod(0o755)
     env = runner_env(tmp_path)
     env.update(COLAB_BIN=str(wrapper), FAKE_COLAB_REAL=str(FAKE))
-    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["state"] == "complete"
     downloads = (tmp_path / "fake" / "downloads.log").read_text().splitlines()
     unit0 = [d for d in downloads if d.endswith("unit-0.bin")]
     assert len(unit0) >= 2, f"unit-0.bin downloaded {len(unit0)} time(s): the final pull only, no checkpoint pull during the run"
-    rec = json.loads((REPO / "results" / "runs" / f"{out['run_id']}.json").read_text())
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec.get("last_checkpoint_pull_at"), "the run record carries no checkpoint pull stamp"
 
 
@@ -210,9 +229,9 @@ def test_poll_timeout_degrades_instead_of_killing_the_poller(tmp_path):
     wrapper.chmod(0o755)
     env = runner_env(tmp_path)
     env.update(COLAB_BIN=str(wrapper), FAKE_COLAB_REAL=str(FAKE), COLAB_RUN_POLL_TIMEOUT_S="2")
-    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["state"] == "complete"
-    rec = json.loads((REPO / "results" / "runs" / f"{out['run_id']}.json").read_text())
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec.get("last_poll_error"), "the timed-out poll left no note on the record"

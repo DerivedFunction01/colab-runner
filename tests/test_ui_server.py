@@ -7,14 +7,17 @@ right argv and append the right outbox events with increasing seq,
 and /api/outbox?after= filters without acknowledging.
 """
 
+import importlib.util
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,10 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 STUB_SRC = REPO / "tests" / "fixtures" / "stub_lease_bin.py"
 SERVER = REPO / "ui" / "server.py"
+
+_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
+repo_fixture = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(repo_fixture)
 
 
 def free_port() -> int:
@@ -37,6 +44,17 @@ class UiServer:
         stub = tmp_path / "stub_lease_bin.py"
         stub.write_text(STUB_SRC.read_text())
         stub.chmod(0o755)
+        # The server derives its repo root from its own location:
+        # run a copy rooted at a fixture repo (authored config in
+        # the test tree) so repo_config() serves the fixture caps,
+        # never the checkout's operator config.
+        root = tmp_path / "repo"
+        ui_dir = root / "ui"
+        ui_dir.mkdir(parents=True)
+        shutil.copy(SERVER, ui_dir / "server.py")
+        shutil.copy(REPO / "ui" / "config.json", ui_dir / "config.json")
+        (ui_dir / "static").symlink_to(REPO / "ui" / "static")
+        repo_fixture.write_config(root)
         self.port = free_port()
         env = dict(
             os.environ,
@@ -47,7 +65,7 @@ class UiServer:
         )
         env.update(extra_env or {})
         self.proc = subprocess.Popen(
-            [sys.executable, str(SERVER)],
+            [sys.executable, str(ui_dir / "server.py")],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -130,11 +148,11 @@ def test_state_passes_core_json_through(ui):
     assert data["records"][0]["action"] == "active"
     assert data["grant"] is None
     assert data["budget"]["balance"] == 571.7
-    # The caps are the operator's live panel settings: compare
-    # against the config file, never a pinned constant.
-    live_cfg = json.loads((REPO / "config" / "lease.json").read_text())
-    assert data["caps"]["daily_cu_budget"] == live_cfg["daily_cu_budget"]
-    assert data["caps"]["monthly_cu_budget"] == live_cfg["monthly_cu_budget"]
+    # The caps are the fixture repo's authored panel settings
+    # (tests/fixtures/repo_fixture.py), compared against the
+    # fixture constants, never the operator's live config.
+    assert data["caps"]["daily_cu_budget"] == repo_fixture.FIXTURE_DAILY_CAP
+    assert data["caps"]["monthly_cu_budget"] == repo_fixture.FIXTURE_MONTHLY_CAP
     assert "state" in ui.invocations()
 
 

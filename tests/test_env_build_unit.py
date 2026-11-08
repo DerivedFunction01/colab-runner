@@ -19,14 +19,25 @@ FAKE_UV = """#!/usr/bin/env bash
 if [ "$1" = "--version" ]; then echo "uv 9.9.9"; exit 0; fi
 if [ "$1" = "venv" ]; then
   shift
+  py=""
   args=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --python) shift 2 ;;
+      --python) py="$2"; shift 2 ;;
       *) args+=("$1"); shift ;;
     esac
   done
-  exec python3 -m venv "${args[@]}"
+  # Lay the venv down by hand, in the shape uv writes: bin/python
+  # symlinks to the requested interpreter and a pyvenv.cfg beside
+  # them. Delegating to `python3 -m venv` dies inside its own
+  # ensurepip step on the Colab session image.
+  dest="${args[-1]}"
+  py="${py:-$(command -v python3)}"
+  mkdir -p "$dest/bin"
+  ln -sf "$py" "$dest/bin/python"
+  ln -sf "$py" "$dest/bin/python3"
+  printf 'home = %s\ninclude-system-site-packages = false\nuv = 9.9.9\n' "$(dirname "$py")" > "$dest/pyvenv.cfg"
+  exit 0
 fi
 if [ "$1" = "pip" ]; then exit 0; fi
 echo "fake uv: unhandled $*" >&2; exit 2

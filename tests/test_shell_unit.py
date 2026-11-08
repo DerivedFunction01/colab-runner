@@ -83,18 +83,28 @@ class FakeRun:
         return subprocess.CompletedProcess(cmd, self.rc)
 
 
-def run_main(monkeypatch, fake, argv):
+def run_main(monkeypatch, fake, argv, tmp_path):
     monkeypatch.setattr(sh.subprocess, "run", fake)
     # The main() scenarios below target a live session; the connect
     # guard's own refusal paths are pinned by the tests after them.
     monkeypatch.setattr(sh, "live_state", lambda session: "alive")
+    # main() refuses before connecting when the local identity or
+    # the CLI venv python is absent; point both seams at scratch
+    # files so the scenarios never depend on the real HOME's key
+    # or this machine's uv tool install.
+    identity = tmp_path / "id_ed25519"
+    identity.write_text("fake-test-identity")
+    venv_python = tmp_path / "venv-python"
+    venv_python.write_text("")
+    monkeypatch.setattr(sh, "DEFAULT_IDENTITY", identity)
+    monkeypatch.setattr(sh, "CLI_VENV_PYTHON", venv_python)
     return sh.main(argv)
 
 
 def test_main_propagates_remote_exit_code(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
     fake = FakeRun(rc=7)
-    assert run_main(monkeypatch, fake, ["-s", "alpha", "exit 7"]) == 7
+    assert run_main(monkeypatch, fake, ["-s", "alpha", "exit 7"], tmp_path) == 7
     cmd, kw = fake.calls[-1]
     assert cmd[0] == "ssh"
     assert kw["input"].strip() == "exit 7"
@@ -104,14 +114,14 @@ def test_main_propagates_remote_exit_code(tmp_path, monkeypatch):
 def test_main_timeout_is_124(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
     fake = FakeRun(exc=subprocess.TimeoutExpired(cmd=["ssh"], timeout=1))
-    assert run_main(monkeypatch, fake, ["-s", "alpha", "--timeout", "1", "sleep 9"]) == 124
+    assert run_main(monkeypatch, fake, ["-s", "alpha", "--timeout", "1", "sleep 9"], tmp_path) == 124
 
 
 def test_main_no_session_is_2(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
     monkeypatch.delenv("COLAB_SH_SESSION", raising=False)
     fake = FakeRun()
-    assert run_main(monkeypatch, fake, ["echo hi"]) == 2
+    assert run_main(monkeypatch, fake, ["echo hi"], tmp_path) == 2
     assert fake.calls == [] or fake.calls[-1][0][0] != "ssh"
 
 
@@ -165,7 +175,7 @@ def test_main_journals_the_attach_claim(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
     monkeypatch.delenv("COLAB_CALLER", raising=False)
     fake = FakeRun(rc=0)
-    assert run_main(monkeypatch, fake, ["-s", "alpha", "--caller", "lease", "echo hi"]) == 0
+    assert run_main(monkeypatch, fake, ["-s", "alpha", "--caller", "lease", "echo hi"], tmp_path) == 0
     import json as _json
     lines = [_json.loads(x) for x in (tmp_path / "caller-claims.jsonl").read_text().splitlines() if x.strip()]
     assert lines[-1]["session"] == "alpha" and lines[-1]["caller"] == "lease" and lines[-1]["seam"] == "colab-sh"
@@ -175,5 +185,5 @@ def test_main_refuses_an_unregistered_caller_before_connecting(tmp_path, monkeyp
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
     monkeypatch.delenv("COLAB_CALLER", raising=False)
     fake = FakeRun()
-    assert run_main(monkeypatch, fake, ["-s", "alpha", "--caller", "bogus-name-zzz", "echo hi"]) == 2
+    assert run_main(monkeypatch, fake, ["-s", "alpha", "--caller", "bogus-name-zzz", "echo hi"], tmp_path) == 2
     assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)

@@ -9,15 +9,21 @@ fixture via the environment (the isolate-tests-from-live-
 state rule: nothing here may touch the real registry, the
 real binding, or the real gate state).
 """
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CHECKER = REPO / "bin" / "colab-liveness"
+
+_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
+repo_fixture = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(repo_fixture)
 
 sys.path.insert(0, str(REPO / "sync"))
 import liveness_entry as le  # noqa: E402
@@ -187,9 +193,14 @@ def lease_cli_env(tmp_path):
     (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
     jobs = tmp_path / "jobs"
     jobs.mkdir()
+    # The lease CLI under test runs against a fixture repo
+    # (authored config in the test tree), never the checkout's
+    # operator one.
+    root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
     env = dict(
         os.environ,
         HOME=str(home),
+        TEST_REPO_ROOT=str(root),
         COLAB_BIN=str(REPO / "tests" / "fixtures" / "fake_colab.py"),
         FAKE_COLAB_STATE=str(tmp_path / "fake"),
         COLAB_RUNNER_VAR=str(tmp_path / "var"),
@@ -203,7 +214,7 @@ def lease_cli_env(tmp_path):
 
 
 def run_lease_cli(env, *args):
-    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-lease"), *args],
+    r = subprocess.run([sys.executable, str(Path(env["TEST_REPO_ROOT"]) / "bin" / "colab-lease"), *args],
                        capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     return json.loads(r.stdout)

@@ -4,15 +4,21 @@ grant + standing duty, the standing budget sub-cap, and the `state`
 read the UI renders.
 """
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE = REPO / "tests" / "fixtures" / "fake_colab.py"
+
+_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
+repo_fixture = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(repo_fixture)
 
 
 def lease_env(tmp_path):
@@ -23,9 +29,13 @@ def lease_env(tmp_path):
     token.parent.mkdir(parents=True, exist_ok=True)
     token.write_text('{"refresh_token": "fake-test-token"}')
     (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
+    # The CLI under test runs against a fixture repo (authored
+    # config in the test tree), never the checkout's operator one.
+    root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
     return dict(
         os.environ,
         HOME=str(home),
+        TEST_REPO_ROOT=str(root),
         COLAB_BIN=str(FAKE),
         FAKE_COLAB_STATE=str(tmp_path / "fake"),
         COLAB_RUNNER_VAR=str(tmp_path / "var"),
@@ -50,7 +60,7 @@ def standing_env(tmp_path):
 
 
 def run_lease(env, *args, expect_rc=0):
-    r = subprocess.run([sys.executable, str(REPO / "bin" / "colab-lease"), *args], capture_output=True, text=True, env=env, timeout=300)
+    r = subprocess.run([sys.executable, str(Path(env["TEST_REPO_ROOT"]) / "bin" / "colab-lease"), *args], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == expect_rc, r.stdout + r.stderr
     return json.loads(r.stdout)
 
@@ -198,10 +208,9 @@ def test_standing_budget_refusal_keeps_burst_acquirable(tmp_path):
     # Seed attributed standing spend at (standing cap - 0.1): a
     # journaled standing segment (caller-stamped) covering today
     # so far, rated to total exactly that. A 4h standing window projects
-    # 0.32 more and breaches the sub-cap. The cap is read from the
-    # live config — it is the operator's panel setting, not a test
-    # constant.
-    standing_cap = json.loads((REPO / "config" / "lease.json").read_text())["standing"]["daily_cu_cap"]
+    # 0.32 more and breaches the sub-cap. The cap is the fixture
+    # repo's authored value (tests/fixtures/repo_fixture.py).
+    standing_cap = repo_fixture.FIXTURE_STANDING_CAP
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     hours = max((now - day_start).total_seconds() / 3600.0, 1 / 60)
     seg = {"caller": "standing", "session": "seed", "start": day_start.isoformat(), "end": now.isoformat(), "rate": (standing_cap - 0.1) / hours}
@@ -331,4 +340,4 @@ def test_state_specs_and_shape(tmp_path):
     assert st["budget"]["balance"] == 500
     # The served standing cap is the live config's (the operator's
     # panel setting), read here rather than pinned to a constant.
-    assert st["budget"]["caps"]["standing_daily"] == json.loads((REPO / "config" / "lease.json").read_text())["standing"]["daily_cu_cap"]
+    assert st["budget"]["caps"]["standing_daily"] == repo_fixture.FIXTURE_STANDING_CAP

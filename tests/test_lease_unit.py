@@ -9,6 +9,7 @@ import importlib.util
 import json
 import subprocess
 from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -18,16 +19,30 @@ spec = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py
 lease = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lease)
 
+_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
+repo_fixture = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(repo_fixture)
+
 NOW = datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture()
+def repo(tmp_path, monkeypatch):
+    """A scratch repo carrying the authored fixture config (see
+    tests/fixtures/repo_fixture.py): the suite must pass in a
+    bare clone, where the checkout has no operator config."""
+    root = repo_fixture.scratch_repo(tmp_path)
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+    return root
 
 
 @pytest.fixture(autouse=True)
 def gate_permissive(monkeypatch):
     """Session shape gate: these units pin lease mechanics against
-    the repo's live config (only var is redirected), so they
-    declare the permissive fixture state explicitly — the same
-    explicit disable a fixture-owned config would carry. The
-    gate's own tests live in test_lease_fake."""
+    the fixture repo's authored config, so they declare the
+    permissive fixture state explicitly — the same explicit
+    disable a fixture-owned config would carry. The gate's own
+    tests live in test_lease_fake."""
     monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
 
 
@@ -35,8 +50,7 @@ def cp(stdout="", rc=0):
     return subprocess.CompletedProcess([], rc, stdout, "")
 
 
-def seed_record(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def seed_record(repo):
     rec = {
         "session": "standard",
         "shape": "cpu",
@@ -47,30 +61,30 @@ def seed_record(tmp_path, monkeypatch):
         "last_used_at": "2026-10-29T17:30:00+00:00",
         "jobs": [],
     }
-    lease.save_record(REPO, rec)
+    lease.save_record(repo, rec)
     return rec
 
 
-def test_reap_keeps_record_when_sessions_unreadable(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_reap_keeps_record_when_sessions_unreadable(repo, tmp_path, monkeypatch):
+    seed_record(repo)
 
     def boom(*a, **k):
         raise subprocess.TimeoutExpired("colab", 120)
 
-    out = lease.reap(boom, REPO, now_dt=NOW)
+    out = lease.reap(boom, repo, now_dt=NOW)
     assert out["action"] == "kept-unknown"
-    assert lease.load_record(REPO) is not None
+    assert lease.load_record(repo) is not None
 
 
-def test_reap_clears_only_on_confirmed_absent(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
-    out = lease.reap(lambda *a, **k: cp("[]"), REPO, now_dt=NOW)
+def test_reap_clears_only_on_confirmed_absent(repo, tmp_path, monkeypatch):
+    seed_record(repo)
+    out = lease.reap(lambda *a, **k: cp("[]"), repo, now_dt=NOW)
     assert out["action"] == "cleared-dead"
-    assert lease.load_record(REPO) is None
+    assert lease.load_record(repo) is None
 
 
-def test_reap_pulses_kernel_when_due_and_skips_when_fresh(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_reap_pulses_kernel_when_due_and_skips_when_fresh(repo, tmp_path, monkeypatch):
+    seed_record(repo)
     calls = []
 
     def stub(*a, **k):
@@ -81,20 +95,20 @@ def test_reap_pulses_kernel_when_due_and_skips_when_fresh(tmp_path, monkeypatch)
             return cp("", rc=1)  # no heartbeat file: keepalive relaunch path, harmless here
         return cp("")
 
-    out = lease.reap(stub, REPO, now_dt=NOW)
+    out = lease.reap(stub, repo, now_dt=NOW)
     assert out["action"] == "kept"
     assert out["pulse"] == "ok"
     execs = [c for c in calls if c and c[0] == "exec" and any("lease-pulse" in str(x) for x in c)]
     assert len(execs) == 1
-    assert lease.load_record(REPO)["last_pulse_at"] == NOW.isoformat()
+    assert lease.load_record(repo)["last_pulse_at"] == NOW.isoformat()
     calls.clear()
-    out2 = lease.reap(stub, REPO, now_dt=NOW)
+    out2 = lease.reap(stub, repo, now_dt=NOW)
     assert out2["pulse"] == "not-due"
     assert not [c for c in calls if c and c[0] == "exec" and any("lease-pulse" in str(x) for x in c)]
 
 
-def test_release_keeps_record_when_stop_fails(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_release_keeps_record_when_stop_fails(repo, tmp_path, monkeypatch):
+    seed_record(repo)
 
     def flaky(*a, **k):
         # stop times out; sessions keeps listing the session as alive.
@@ -102,17 +116,16 @@ def test_release_keeps_record_when_stop_fails(tmp_path, monkeypatch):
             raise subprocess.TimeoutExpired("colab", 120)
         return cp('["standard"]')
 
-    out = lease.release(flaky, REPO)
+    out = lease.release(flaky, repo)
     assert out["action"] == "release-failed"
-    assert lease.load_record(REPO) is not None
+    assert lease.load_record(repo) is not None
 
 
-def test_heartbeat_age_stall_degrades_to_unknown_with_short_bound(tmp_path, monkeypatch):
+def test_heartbeat_age_stall_degrades_to_unknown_with_short_bound(repo, tmp_path, monkeypatch):
     """A stalled heartbeat download (the file channel can hang on the
     egress proxy's IPv4 endpoint, diagnosed 2026-11-01) must degrade
     to age-unknown quickly — never wedge a status/state read behind
     the old 120 s bound."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     seen = {}
 
     def stall(*a, **k):
@@ -120,14 +133,13 @@ def test_heartbeat_age_stall_degrades_to_unknown_with_short_bound(tmp_path, monk
         seen["timeout"] = k.get("timeout")
         raise subprocess.TimeoutExpired("colab", k.get("timeout"))
 
-    assert lease.heartbeat_age(stall, REPO, "standard") is None
+    assert lease.heartbeat_age(stall, repo, "standard") is None
     assert seen["args"][0] == "download"
     assert seen["timeout"] == lease.HEARTBEAT_READ_TIMEOUT_S
     assert lease.HEARTBEAT_READ_TIMEOUT_S <= 15
 
 
-def test_heartbeat_age_reads_a_fresh_heartbeat(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def test_heartbeat_age_reads_a_fresh_heartbeat(repo, tmp_path, monkeypatch):
 
     def fetch(*a, **k):
         dest = Path(a[-1])
@@ -136,14 +148,14 @@ def test_heartbeat_age_reads_a_fresh_heartbeat(tmp_path, monkeypatch):
         dest.write_text(json.dumps({"ts": ts}) + "\n")
         return cp("")
 
-    age = lease.heartbeat_age(fetch, REPO, "standard")
+    age = lease.heartbeat_age(fetch, repo, "standard")
     assert age is not None and 40 <= age <= 45
 
 
-def test_status_survives_a_stalled_heartbeat_download(tmp_path, monkeypatch):
+def test_status_survives_a_stalled_heartbeat_download(repo, tmp_path, monkeypatch):
     """The UI's read path: session live + heartbeat download stalled
     still returns the status, with the age reported as unknown."""
-    seed_record(tmp_path, monkeypatch)
+    seed_record(repo)
 
     def stub(*a, **k):
         if a and a[0] == "sessions":
@@ -152,48 +164,46 @@ def test_status_survives_a_stalled_heartbeat_download(tmp_path, monkeypatch):
             raise subprocess.TimeoutExpired("colab", k.get("timeout"))
         return cp("")
 
-    out = lease.status(stub, REPO)
+    out = lease.status(stub, repo)
     assert out["action"] == "active"
     assert out["keepalive_heartbeat_age_s"] is None
 
 
-def test_ensure_keepalive_stalled_upload_is_a_result_not_an_exception(tmp_path, monkeypatch):
+def test_ensure_keepalive_stalled_upload_is_a_result_not_an_exception(repo, tmp_path, monkeypatch):
     """The keepalive upload rides the stall-prone file channel: a stall
     must come back as launch-failed (lease stands, caller carries on),
     bounded well under the old 300 s — never as a raised timeout."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     seen = {}
 
     def stall_upload(*a, **k):
         seen["timeout"] = k.get("timeout")
         raise subprocess.TimeoutExpired("colab", k.get("timeout"))
 
-    out = lease.ensure_keepalive(stall_upload, REPO, "standard")
+    out = lease.ensure_keepalive(stall_upload, repo, "standard")
     assert out["keepalive"] == "launch-failed"
     assert out["stage"] == "upload"
     assert seen["timeout"] == lease.KEEPALIVE_UPLOAD_TIMEOUT_S
     assert lease.KEEPALIVE_UPLOAD_TIMEOUT_S <= 30
 
 
-def test_ensure_keepalive_stalled_launch_is_a_result_not_an_exception(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def test_ensure_keepalive_stalled_launch_is_a_result_not_an_exception(repo, tmp_path, monkeypatch):
 
     def stall_launch(*a, **k):
         if a and a[0] == "exec":
             raise subprocess.TimeoutExpired("colab", k.get("timeout"))
         return cp("")
 
-    out = lease.ensure_keepalive(stall_launch, REPO, "standard")
+    out = lease.ensure_keepalive(stall_launch, repo, "standard")
     assert out["keepalive"] == "launch-failed"
     assert out["stage"] == "launch"
 
 
-def test_reap_pulses_even_when_keepalive_relaunch_stalls(tmp_path, monkeypatch):
+def test_reap_pulses_even_when_keepalive_relaunch_stalls(repo, tmp_path, monkeypatch):
     """Regression for 2026-11-01: reap died inside the keepalive
     relaunch's stalled upload before ever reaching the kernel pulse,
     leaving the lease with no activity channel at all. The pulse is
     an exec — it must not be starved by a file-channel failure."""
-    seed_record(tmp_path, monkeypatch)
+    seed_record(repo)
 
     def stub(*a, **k):
         if a and a[0] == "sessions":
@@ -206,7 +216,7 @@ def test_reap_pulses_even_when_keepalive_relaunch_stalls(tmp_path, monkeypatch):
             return cp("lease pulse")
         return cp("")
 
-    out = lease.reap(stub, REPO, now_dt=NOW)
+    out = lease.reap(stub, repo, now_dt=NOW)
     assert out["action"] == "kept"
     assert out["keepalive"] == "launch-failed"
     assert out["pulse"] == "ok"
@@ -226,13 +236,13 @@ def test_specs_serves_catalog_labels_with_id_fallback(tmp_path):
     assert specs["cpu-highram"]["rate_cu_per_hour"] is None
 
 
-def test_specs_real_catalog_labels():
-    labels = {s["id"]: s["label"] for s in lease.specs(REPO)}
+def test_specs_real_catalog_labels(repo):
+    labels = {s["id"]: s["label"] for s in lease.specs(repo)}
     assert labels["cpu"] == "CPU"
     assert labels["cpu-highram"] == "CPU High-RAM"
 
 
-def test_live_sessions_empty_listing_has_no_phantom():
+def test_live_sessions_empty_listing_has_no_phantom(repo):
     """The CLI answers an empty account with '[colab] No active
     sessions.' — its own log prefix is not a session name, and the
     listing must read as empty, never as a session named 'colab'
@@ -244,7 +254,7 @@ def test_live_sessions_empty_listing_has_no_phantom():
             return cp("[colab] No active sessions found on server.\n[colab] No active sessions.")
         return cp("")
 
-    assert lease.live_sessions(stub, REPO) == []
+    assert lease.live_sessions(stub, repo) == []
 
 
 def make_extend_stub(alive_sessions):
@@ -259,89 +269,88 @@ def make_extend_stub(alive_sessions):
     return stub
 
 
-def test_extend_happy_path_moves_deadline_and_prices_delta(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_extend_happy_path_moves_deadline_and_prices_delta(repo, tmp_path, monkeypatch):
+    seed_record(repo)
     monkeypatch.setenv("HOME", str(tmp_path))  # no token here: the kit install reports token-missing, non-fatally
-    out = lease.extend(make_extend_stub(["standard"]), REPO, "standard", 2, now_dt=NOW)
+    out = lease.extend(make_extend_stub(["standard"]), repo, "standard", 2, now_dt=NOW)
     assert out["action"] == "extended"
     assert out["old_deadline"] == "2026-10-30T01:00:00+00:00"
     assert out["new_deadline"] == "2026-10-30T03:00:00+00:00"
     # Delta pricing: the standard rate (0.08) x the added hours only.
     assert out["budget"]["projected"] == 0.16
-    rec = lease.load_record(REPO, "standard")
+    rec = lease.load_record(repo, "standard")
     assert rec["deadline"] == "2026-10-30T03:00:00+00:00"
     assert rec["renew"] is True
     assert rec["jobs"] == []  # the jobs list is untouched
 
 
-def test_extend_refused_budget_changes_nothing(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_extend_refused_budget_changes_nothing(repo, tmp_path, monkeypatch):
+    seed_record(repo)
     # Sized off the live daily cap so the refusal holds whatever cap
     # the operator has set: the extension's projection alone (hours x
     # the standard rate 0.08) clears the cap. (The fixed 200 h form
     # silently stopped refusing when the live cap rose past 16 CU.)
-    cap = lease.load_config(REPO)["daily_cu_budget"]
+    cap = lease.load_config(repo)["daily_cu_budget"]
     hours = int(cap / 0.08) + 50
-    out = lease.extend(make_extend_stub(["standard"]), REPO, "standard", hours, now_dt=NOW)
+    out = lease.extend(make_extend_stub(["standard"]), repo, "standard", hours, now_dt=NOW)
     assert out["action"] == "refused-budget"
     assert out["budget"]["reason"] == "daily-budget"
     assert out["budget"]["projected"] == round(hours * 0.08, 2)
-    rec = lease.load_record(REPO, "standard")
+    rec = lease.load_record(repo, "standard")
     assert rec["deadline"] == "2026-10-30T01:00:00+00:00"
     assert "renew" not in rec
 
 
-def test_extend_unknown_session_state_refuses(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_extend_unknown_session_state_refuses(repo, tmp_path, monkeypatch):
+    seed_record(repo)
 
     def boom(*a, **k):
         raise subprocess.TimeoutExpired("colab", 120)
 
-    out = lease.extend(boom, REPO, "standard", 2, now_dt=NOW)
+    out = lease.extend(boom, repo, "standard", 2, now_dt=NOW)
     assert out["action"] == "extend-unknown"
-    assert lease.load_record(REPO, "standard")["deadline"] == "2026-10-30T01:00:00+00:00"
+    assert lease.load_record(repo, "standard")["deadline"] == "2026-10-30T01:00:00+00:00"
 
 
-def test_extend_absent_window_lease_applies_to_the_window(tmp_path, monkeypatch):
-    rec = seed_record(tmp_path, monkeypatch)
+def test_extend_absent_window_lease_applies_to_the_window(repo, tmp_path, monkeypatch):
+    rec = seed_record(repo)
     rec["renew"] = True
-    lease.save_record(REPO, rec)
-    out = lease.extend(make_extend_stub([]), REPO, "standard", 2, now_dt=NOW)
+    lease.save_record(repo, rec)
+    out = lease.extend(make_extend_stub([]), repo, "standard", 2, now_dt=NOW)
     assert out["action"] == "extended"
-    assert lease.load_record(REPO, "standard")["deadline"] == "2026-10-30T03:00:00+00:00"
+    assert lease.load_record(repo, "standard")["deadline"] == "2026-10-30T03:00:00+00:00"
 
 
-def test_extend_absent_without_renew_refuses(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
-    out = lease.extend(make_extend_stub([]), REPO, "standard", 2, now_dt=NOW)
+def test_extend_absent_without_renew_refuses(repo, tmp_path, monkeypatch):
+    seed_record(repo)
+    out = lease.extend(make_extend_stub([]), repo, "standard", 2, now_dt=NOW)
     assert out["action"] == "extend-no-lease"
-    assert lease.load_record(REPO, "standard")["deadline"] == "2026-10-30T01:00:00+00:00"
+    assert lease.load_record(repo, "standard")["deadline"] == "2026-10-30T01:00:00+00:00"
 
 
-def test_extend_without_record_refuses(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
-    out = lease.extend(make_extend_stub(["standard"]), REPO, "standard", 2, now_dt=NOW)
+def test_extend_without_record_refuses(repo, tmp_path, monkeypatch):
+    out = lease.extend(make_extend_stub(["standard"]), repo, "standard", 2, now_dt=NOW)
     assert out["action"] == "extend-no-lease"
 
 
-def test_extend_repeated_extensions_accumulate(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)
+def test_extend_repeated_extensions_accumulate(repo, tmp_path, monkeypatch):
+    seed_record(repo)
     monkeypatch.setenv("HOME", str(tmp_path))
     stub = make_extend_stub(["standard"])
-    assert lease.extend(stub, REPO, "standard", 2, now_dt=NOW)["action"] == "extended"
-    out = lease.extend(stub, REPO, "standard", 3, now_dt=NOW)
+    assert lease.extend(stub, repo, "standard", 2, now_dt=NOW)["action"] == "extended"
+    out = lease.extend(stub, repo, "standard", 3, now_dt=NOW)
     assert out["old_deadline"] == "2026-10-30T03:00:00+00:00"
     assert out["new_deadline"] == "2026-10-30T06:00:00+00:00"
     # Each extension prices its own delta.
     assert out["budget"]["projected"] == 0.24
 
 
-def test_release_guard_aborts_when_deadline_moved_on_disk(tmp_path, monkeypatch):
+def test_release_guard_aborts_when_deadline_moved_on_disk(repo, tmp_path, monkeypatch):
     """An extension landing between the caller's read and the stop
     wins: release() re-reads the record immediately before stopping,
     sees the deadline moved into the future, and aborts — no stop is
     issued and the record stands."""
-    seed_record(tmp_path, monkeypatch)
+    seed_record(repo)
     real_load = lease.load_record
     reads = {"n": 0}
 
@@ -359,15 +368,14 @@ def test_release_guard_aborts_when_deadline_moved_on_disk(tmp_path, monkeypatch)
         calls.append(a)
         return cp('["standard"]')
 
-    out = lease.release(stub, REPO)
+    out = lease.release(stub, repo)
     assert out["action"] == "release-aborted"
     assert out["guard"] == "deadline-moved"
     assert not [c for c in calls if c and c[0] == "stop"]
-    assert lease.load_record(REPO) is not None
+    assert lease.load_record(repo) is not None
 
 
-def seed_window_record(tmp_path, monkeypatch, **over):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def seed_window_record(repo, **over):
     rec = {
         "session": "standard",
         "shape": "cpu",
@@ -381,7 +389,7 @@ def seed_window_record(tmp_path, monkeypatch, **over):
         "renew": True,
     }
     rec.update(over)
-    lease.save_record(REPO, rec)
+    lease.save_record(repo, rec)
     return rec
 
 
@@ -413,15 +421,15 @@ def make_renewal_stub(alive, calls, fail_new=None, handover=None):
     return stub
 
 
-def test_renewal_threshold_driver2_swaps_session_keeps_window(tmp_path, monkeypatch):
-    seed_window_record(tmp_path, monkeypatch)
+def test_renewal_threshold_driver2_swaps_session_keeps_window(repo, tmp_path, monkeypatch):
+    seed_window_record(repo)
     monkeypatch.setenv("HOME", str(tmp_path))  # kit install: token-missing, non-fatal
     alive, calls = {"standard"}, []
-    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls), repo, now_dt=NOW)
     assert out["action"] == "renewed"
     assert out["driver"] == 2
     assert out["old_session"] == "standard"
-    rec = lease.load_record(REPO, out["new_session"])
+    rec = lease.load_record(repo, out["new_session"])
     assert rec["session"] == out["new_session"]
     assert rec["session"].startswith("standard-r")
     # The window is preserved exactly; only the session + its start move.
@@ -432,27 +440,27 @@ def test_renewal_threshold_driver2_swaps_session_keeps_window(tmp_path, monkeypa
     assert rec["session"] in alive
 
 
-def test_renewal_absent_session_driver2(tmp_path, monkeypatch):
-    seed_window_record(tmp_path, monkeypatch)
+def test_renewal_absent_session_driver2(repo, tmp_path, monkeypatch):
+    seed_window_record(repo)
     monkeypatch.setenv("HOME", str(tmp_path))
     alive, calls = set(), []
-    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls), repo, now_dt=NOW)
     # A dead session on a window lease renews instead of clearing.
     assert out["action"] == "renewed"
     assert out["driver"] == 2
-    rec = lease.load_record(REPO, out["new_session"])
+    rec = lease.load_record(repo, out["new_session"])
     assert rec is not None
     assert rec["deadline"] == "2026-10-30T06:00:00+00:00"
     assert rec["session"] in alive
 
 
-def test_renewal_driver1_adopts_handover_and_merges_binding(tmp_path, monkeypatch):
+def test_renewal_driver1_adopts_handover_and_merges_binding(repo, tmp_path, monkeypatch):
     home = tmp_path / "home"
     sessions_file = home / ".config" / "colab-cli" / "sessions.json"
     sessions_file.parent.mkdir(parents=True)
     sessions_file.write_text(json.dumps({"standard": {"endpoint": "https://parent.invalid"}}))
     monkeypatch.setenv("HOME", str(home))
-    seed_window_record(tmp_path, monkeypatch, kit="installed")
+    seed_window_record(repo, kit="installed")
     child_entry = {"endpoint": "https://child.invalid", "runtime": "child-runtime"}
     handover = {
         "child_session": "standard-r999",
@@ -463,12 +471,12 @@ def test_renewal_driver1_adopts_handover_and_merges_binding(tmp_path, monkeypatc
         "minted_at": "2026-10-29T17:59:00+00:00",
     }
     alive, calls = {"standard", "standard-r999"}, []
-    out = lease.reap(make_renewal_stub(alive, calls, handover=handover), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls, handover=handover), repo, now_dt=NOW)
     assert out["action"] == "renewed"
     assert out["driver"] == 1
     assert out["old_session"] == "standard"
     assert out["new_session"] == "standard-r999"
-    rec = lease.load_record(REPO, "standard-r999")
+    rec = lease.load_record(repo, "standard-r999")
     assert rec["session"] == "standard-r999"
     assert rec["acquired_at"] == "2026-10-29T17:59:00+00:00"  # the child's own start
     assert rec["deadline"] == "2026-10-30T06:00:00+00:00"
@@ -481,52 +489,52 @@ def test_renewal_driver1_adopts_handover_and_merges_binding(tmp_path, monkeypatc
     assert any(c and c[0] == "stop" and "standard" in c for c in calls)
 
 
-def test_renewal_skips_unflagged_records(tmp_path, monkeypatch):
-    rec = seed_window_record(tmp_path, monkeypatch)
+def test_renewal_skips_unflagged_records(repo, tmp_path, monkeypatch):
+    rec = seed_window_record(repo)
     del rec["renew"]
-    lease.save_record(REPO, rec)
+    lease.save_record(repo, rec)
     alive, calls = {"standard"}, []
-    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls), repo, now_dt=NOW)
     assert out["action"] == "kept"
     assert not [c for c in calls if c and c[0] == "new"]
 
 
-def test_renewal_skips_standing_records(tmp_path, monkeypatch):
-    seed_window_record(tmp_path, monkeypatch, session="lobby", standing=True)
-    lease.write_grant(REPO, 24, now_dt=NOW)
+def test_renewal_skips_standing_records(repo, tmp_path, monkeypatch):
+    seed_window_record(repo, session="lobby", standing=True)
+    lease.write_grant(repo, 24, now_dt=NOW)
     alive, calls = {"lobby"}, []
-    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls), repo, now_dt=NOW)
     lobby = [r for r in out["records"] if r["session"] == "lobby"][0]
     assert lobby["action"] == "kept"  # standing duty semantics, not renewal
     assert not [c for c in calls if c and c[0] == "new"]
 
 
-def test_failed_renewal_retries_next_cycle_deadline_untouched(tmp_path, monkeypatch):
-    seed_window_record(tmp_path, monkeypatch)
+def test_failed_renewal_retries_next_cycle_deadline_untouched(repo, tmp_path, monkeypatch):
+    seed_window_record(repo)
     monkeypatch.setenv("HOME", str(tmp_path))
     alive, calls = {"standard"}, []
     failing = {"on": True}
     stub = make_renewal_stub(alive, calls, fail_new=lambda: failing["on"])
-    out = lease.reap(stub, REPO, now_dt=NOW)
+    out = lease.reap(stub, repo, now_dt=NOW)
     assert out["action"] == "kept"
     assert out["renewal"] == "failed"
-    rec = lease.load_record(REPO, "standard")
+    rec = lease.load_record(repo, "standard")
     assert rec["session"] == "standard"
     assert rec["deadline"] == "2026-10-30T06:00:00+00:00"
     failing["on"] = False
-    out2 = lease.reap(stub, REPO, now_dt=NOW)
+    out2 = lease.reap(stub, repo, now_dt=NOW)
     assert out2["action"] == "renewed"
-    assert lease.load_record(REPO)["session"].startswith("standard-r")
+    assert lease.load_record(repo)["session"].startswith("standard-r")
 
 
-def test_budget_snapshot_serves_standing_day_spend(tmp_path, monkeypatch):
+def test_budget_snapshot_serves_standing_day_spend(repo, tmp_path, monkeypatch):
     """The grant card renders standing spend vs cap (mock Panel C), so
     state must serve the standing caller's day spend — the guard's
     own attributed figure (journaled segments + live records), never
     a balance delta: the same spend must be served whatever the
     balance did in between (external usage, expirations)."""
     var = tmp_path / "var"
-    var.mkdir(parents=True)
+    var.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(var))
     now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -535,32 +543,32 @@ def test_budget_snapshot_serves_standing_day_spend(tmp_path, monkeypatch):
     seg = {"caller": "standing", "session": "lobby", "start": day_start.isoformat(), "end": now.isoformat(), "rate": 2.42 / hours}
     (var / "lease-spend-journal.jsonl").write_text(json.dumps(seg) + "\n")
 
-    out = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), REPO)
+    out = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), repo)
     assert out["balance"] == 768.38
     assert out["standing_day_spent"] == 2.42
     assert out["day_spent"] == 2.42
-    # The served cap is the live config's (the operator's panel
-    # setting), read here rather than pinned to a constant.
-    assert out["caps"]["standing_daily"] == lease.load_config(REPO)["standing"]["daily_cu_cap"]
+    # The served cap is the fixture config's standing sub-cap,
+    # read back from the scratch repo rather than pinned.
+    assert out["caps"]["standing_daily"] == lease.load_config(repo)["standing"]["daily_cu_cap"]
 
     # A balance collapse (the 2026-11-01 expiration step) moves
     # nothing: spend is attributed, not balance-derived.
-    out2 = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 699.00 compute units"), REPO)
+    out2 = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 699.00 compute units"), repo)
     assert out2["standing_day_spent"] == 2.42
     assert out2["day_spent"] == 2.42
 
     # No segments and no records -> 0.0, not a fabricated number.
     (var / "lease-spend-journal.jsonl").write_text("")
-    out3 = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), REPO)
+    out3 = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), repo)
     assert out3["standing_day_spent"] == 0.0
 
 
-def test_attributed_spend_splits_segments_at_period_boundaries(tmp_path, monkeypatch):
+def test_attributed_spend_splits_segments_at_period_boundaries(repo, tmp_path, monkeypatch):
     """The derivation itself: journaled segments split at the day and
     month boundaries, live records contribute their running segment,
     and unconfirmed-rate work contributes nothing."""
     var = tmp_path / "var"
-    var.mkdir(parents=True)
+    var.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(var))
     now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
     segs = [
@@ -572,8 +580,8 @@ def test_attributed_spend_splits_segments_at_period_boundaries(tmp_path, monkeyp
         {"shape": "cpu", "session": "s", "start": "2026-11-01T00:00:00+00:00", "end": "2026-11-01T05:00:00+00:00", "rate": None},
     ]
     (var / "lease-spend-journal.jsonl").write_text("".join(json.dumps(s) + "\n" for s in segs))
-    lease.save_record(REPO, {"session": "standard", "shape": "cpu", "shape_spec": {"gpu": None, "tpu": None, "high_mem": False}, "rate_cu_per_hour": 0.08, "acquired_at": "2026-11-01T10:00:00+00:00", "deadline": "2026-11-01T20:00:00+00:00", "last_used_at": "2026-11-01T10:00:00+00:00", "jobs": []})
-    out = lease.attributed_spend(REPO, now)
+    lease.save_record(repo, {"session": "standard", "shape": "cpu", "shape_spec": {"gpu": None, "tpu": None, "high_mem": False}, "rate_cu_per_hour": 0.08, "acquired_at": "2026-11-01T10:00:00+00:00", "deadline": "2026-11-01T20:00:00+00:00", "last_used_at": "2026-11-01T10:00:00+00:00", "jobs": []})
+    out = lease.attributed_spend(repo, now)
     # Live standard record: 2 h x 0.08 = 0.16 on top of the alpha session's 2.0.
     assert out["day_spent"] == 2.16
     assert out["month_spent"] == 2.16
@@ -581,38 +589,38 @@ def test_attributed_spend_splits_segments_at_period_boundaries(tmp_path, monkeyp
     assert out["sessions"]["standard"] == {"day_spent": 0.16, "month_spent": 0.16}
 
 
-def test_budget_check_balance_floor_refuses_beyond_the_bank(tmp_path, monkeypatch):
+def test_budget_check_balance_floor_refuses_beyond_the_bank(repo, tmp_path, monkeypatch):
     """Caps throttle attributed burn; the balance is the floor: a
     window projecting more than the account holds refuses even with
     zero spend against every cap."""
     var = tmp_path / "var"
-    var.mkdir(parents=True)
+    var.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(var))
-    out = lease.budget_check(lambda *a, **k: cp("Current balance: 0.05 compute units"), REPO, lease.load_config(REPO), {"rate_cu_per_hour": 0.08}, hours=8, now_dt=NOW)
+    out = lease.budget_check(lambda *a, **k: cp("Current balance: 0.05 compute units"), repo, lease.load_config(repo), {"rate_cu_per_hour": 0.08}, hours=8, now_dt=NOW)
     assert out["ok"] is False
     assert out["reason"] == "balance-insufficient"
     assert out["projected"] == 0.64
     assert out["day_spent"] == 0.0
 
 
-def test_release_journals_the_completed_segment(tmp_path, monkeypatch):
+def test_release_journals_the_completed_segment(repo, tmp_path, monkeypatch):
     """Release closes the session's segment into the journal, so its
     burn stays counted after the record is gone."""
-    seed_record(tmp_path, monkeypatch)
+    seed_record(repo)
 
     def stub(*a, **k):
         if a and a[0] == "sessions":
             return cp("[]")
         return cp("")
 
-    out = lease.release(stub, REPO, now_dt=NOW)
+    out = lease.release(stub, repo, now_dt=NOW)
     assert out["action"] == "released"
     lines = (tmp_path / "var" / "lease-spend-journal.jsonl").read_text().strip().splitlines()
     assert len(lines) == 1
     seg = json.loads(lines[0])
     assert seg["shape"] == "cpu" and seg["rate"] == 0.08
     # Seeded record ran 17:00 -> NOW (18:00): 1 h x 0.08.
-    assert lease.attributed_spend(REPO, NOW)["day_spent"] == 0.08
+    assert lease.attributed_spend(repo, NOW)["day_spent"] == 0.08
 
 
 # --- The dynamic spec catalog (2026-11-01) ------------------------------------
@@ -717,8 +725,7 @@ def test_state_surfaces_a_catalog_failure(tmp_path, monkeypatch):
     assert {s["id"] for s in out["specs"]} == {"cpu", "cpu-highram"}
 
 
-def test_acquire_dynamic_profiles_pass_their_cli_flags(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def test_acquire_dynamic_profiles_pass_their_cli_flags(repo, tmp_path, monkeypatch):
     news = []
 
     def stub(*a, **k):
@@ -735,10 +742,10 @@ def test_acquire_dynamic_profiles_pass_their_cli_flags(tmp_path, monkeypatch):
             return cp("", rc=1)
         return cp("")
 
-    out = lease.acquire(stub, REPO, "l4", now_dt=NOW)
+    out = lease.acquire(stub, repo, "l4", now_dt=NOW)
     assert out["action"] == "created"
     assert ("--gpu", "L4") in zip(news[0], news[0][1:])
-    out2 = lease.acquire(stub, REPO, "tpu-v6e1", now_dt=NOW)
+    out2 = lease.acquire(stub, repo, "tpu-v6e1", now_dt=NOW)
     assert out2["action"] == "created"
     assert ("--tpu", "v6e1") in zip(news[1], news[1][1:])
 
@@ -755,16 +762,15 @@ def _acquire_stub(*a, **k):
     return cp("")
 
 
-def test_acquire_honors_an_explicit_window_over_max_hours(tmp_path, monkeypatch):
+def test_acquire_honors_an_explicit_window_over_max_hours(repo, tmp_path, monkeypatch):
     """Regression (2026-11-01): acquire silently clamped every
     explicit hours value to the config max_hours, so an ordered 24 h
     endurance window came up as 8 h, unflagged for renewal, and the
     budget priced the clamped window. An explicit window is honored
     as given; past the session cap the lease is a window lease from
     birth (renew flagged, delta priced on the full window)."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("HOME", str(tmp_path))  # no token here: the kit install reports token-missing, non-fatally
-    out = lease.acquire(_acquire_stub, REPO, "cpu", now_dt=NOW, hours=24)
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW, hours=24)
     assert out["action"] == "created"
     rec = out["record"]
     assert rec["deadline"] == "2026-10-30T18:00:00+00:00"
@@ -772,36 +778,34 @@ def test_acquire_honors_an_explicit_window_over_max_hours(tmp_path, monkeypatch)
     assert rec["budget_at_acquire"]["projected"] == 1.92
 
 
-def test_acquire_default_window_is_config_max_hours(tmp_path, monkeypatch):
+def test_acquire_default_window_is_config_max_hours(repo, tmp_path, monkeypatch):
     """Without hours, the window is the config max_hours (8) — the
     pre-existing default behavior is unchanged by the clamp fix."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("HOME", str(tmp_path))
-    out = lease.acquire(_acquire_stub, REPO, "cpu", now_dt=NOW)
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW)
     assert out["action"] == "created"
     assert out["record"]["deadline"] == "2026-10-30T02:00:00+00:00"
     assert "renew" not in out["record"]
 
 
-def test_acquire_max_hours_cap_still_clamps_its_caller(tmp_path, monkeypatch):
+def test_acquire_max_hours_cap_still_clamps_its_caller(repo, tmp_path, monkeypatch):
     """The standing duty passes max_hours_cap explicitly for its own
     windows; that parameter — and only that parameter — still
     clamps."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("HOME", str(tmp_path))
-    out = lease.acquire(_acquire_stub, REPO, "cpu", now_dt=NOW, hours=24, max_hours_cap=12)
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW, hours=24, max_hours_cap=12)
     assert out["action"] == "created"
     assert out["record"]["deadline"] == "2026-10-30T06:00:00+00:00"
 
 
-def test_renewal_spools_a_lease_renewed_event_for_the_outbox(tmp_path, monkeypatch):
+def test_renewal_spools_a_lease_renewed_event_for_the_outbox(repo, tmp_path, monkeypatch):
     """Renewals happen in reap(), outside the companion server — the
     outbox's only writer — so the core spools the event and the
     server drains it (see drain_reaper_events in ui/server.py)."""
-    seed_window_record(tmp_path, monkeypatch)
+    seed_window_record(repo)
     monkeypatch.setenv("HOME", str(tmp_path))
     alive, calls = {"standard"}, []
-    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls), repo, now_dt=NOW)
     assert out["action"] == "renewed"
     spool = Path(tmp_path / "var" / "reaper-events.jsonl")
     lines = [json.loads(l) for l in spool.read_text().splitlines() if l.strip()]
@@ -823,37 +827,36 @@ def test_session_state_auth_prompt_is_unknown_not_absent(tmp_path, monkeypatch):
     assert lease.session_state(prompt, "standard") == "unknown"
 
 
-def test_acquire_never_destroys_record_on_unreadable_sessions(tmp_path, monkeypatch):
+def test_acquire_never_destroys_record_on_unreadable_sessions(repo, tmp_path, monkeypatch):
     """The 2026-11-01 record loss, pinned: a live lease whose session
     list comes back as the auth prompt (or any unreadable output) must
     survive acquire untouched — no stop, no delete, no recreate."""
-    rec = seed_record(tmp_path, monkeypatch)
+    rec = seed_record(repo)
     prompt = lambda *a, **k: cp("Enter the authorization code:")  # noqa: E731
-    out = lease.acquire(prompt, REPO, "cpu", now_dt=NOW)
+    out = lease.acquire(prompt, repo, "cpu", now_dt=NOW)
     assert out["action"] == "acquire-unknown"
-    kept = lease.load_record(REPO, "standard")
+    kept = lease.load_record(repo, "standard")
     assert kept is not None
     assert kept["deadline"] == rec["deadline"]
     assert kept["acquired_at"] == rec["acquired_at"]
 
 
-def test_budget_check_maps_auth_required(tmp_path, monkeypatch):
+def test_budget_check_maps_auth_required(repo, tmp_path, monkeypatch):
     """The wrapper guard's stop-and-surface signal is its own refusal
     reason, distinct from a stall or a parse failure."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
 
     def dead_auth(*a, **k):
         return subprocess.CompletedProcess([], 3, "", "colab auth required: stored token missing or invalid")
 
-    out = lease.budget_check(dead_auth, REPO, lease.load_config(REPO), {"rate_cu_per_hour": 0.08}, hours=1)
+    out = lease.budget_check(dead_auth, repo, lease.load_config(repo), {"rate_cu_per_hour": 0.08}, hours=1)
     assert out == {"ok": False, "reason": "auth-required"}
 
 
-def test_state_surfaces_auth_required_marker(tmp_path, monkeypatch):
+def test_state_surfaces_auth_required_marker(repo, tmp_path, monkeypatch):
     var = tmp_path / "var"
-    var.mkdir()
+    var.mkdir(exist_ok=True)
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(var))
-    assert lease.auth_required(REPO) is None
+    assert lease.auth_required(repo) is None
     (var / "auth-required.json").write_text(json.dumps({"noted_at": "2026-11-01T13:05:58+00:00", "reason": "test"}))
 
     def stub(*a, **k):
@@ -861,16 +864,15 @@ def test_state_surfaces_auth_required_marker(tmp_path, monkeypatch):
             return cp("Current balance: 100 compute units")
         return cp("[]")
 
-    out = lease.state(stub, REPO)
+    out = lease.state(stub, repo)
     assert out["auth_required"]["reason"] == "test"
 
 
-def test_budget_check_usage_timeout_is_a_refusal_not_a_crash(tmp_path, monkeypatch):
+def test_budget_check_usage_timeout_is_a_refusal_not_a_crash(repo, tmp_path, monkeypatch):
     """The usage read rides the stall-prone proxy (a 120 s timeout
     fired live on 2026-11-01 and crashed acquire with a traceback):
     it must come back as a clean refused-budget — the guard cannot
     price without a balance — never as a raised exception."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
 
     def stall(*a, **k):
         if a and a[0] == "usage":
@@ -879,10 +881,10 @@ def test_budget_check_usage_timeout_is_a_refusal_not_a_crash(tmp_path, monkeypat
             return cp("[]")
         return cp("")
 
-    out = lease.budget_check(stall, REPO, lease.load_config(REPO), {"high_mem": False, "rate_cu_per_hour": 0.08}, hours=1)
+    out = lease.budget_check(stall, repo, lease.load_config(repo), {"high_mem": False, "rate_cu_per_hour": 0.08}, hours=1)
     assert out["ok"] is False
     assert out["reason"] == "usage-unavailable"
-    acq = lease.acquire(stall, REPO, "cpu", now_dt=NOW, hours=1)
+    acq = lease.acquire(stall, repo, "cpu", now_dt=NOW, hours=1)
     assert acq["action"] == "refused-budget"
 
 
@@ -955,27 +957,26 @@ def _auto_stub(alive):
     return stub
 
 
-def test_auto_timed_start_waits_then_fires(tmp_path, monkeypatch):
+def test_auto_timed_start_waits_then_fires(repo, tmp_path, monkeypatch):
     """A demand with a future not_before survives an auto pass
     untouched (not consumed, not failed, no lease), then acquires on
     the first pass after its time — a timed start as data, with the
     request's tag (written here in its legacy via spelling) read as
     the caller claim and stamped on the created record."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("COLAB_RUNNER_AUTO_ACQUIRE", "1")
     alive = set()
     stub = _auto_stub(alive)
-    lease.write_request(REPO, reason="timed", shape="cpu", now_dt=NOW, via="timer", not_before=NOW + timedelta(hours=1))
-    out = lease.auto_acquire(stub, REPO, now_dt=NOW)
+    lease.write_request(repo, reason="timed", shape="cpu", now_dt=NOW, via="timer", not_before=NOW + timedelta(hours=1))
+    out = lease.auto_acquire(stub, repo, now_dt=NOW)
     assert out["action"] == "not-due"
-    assert lease.load_request(REPO) is not None
-    assert lease.load_record(REPO) is None
+    assert lease.load_request(repo) is not None
+    assert lease.load_record(repo) is None
     assert alive == set()
-    out = lease.auto_acquire(stub, REPO, now_dt=NOW + timedelta(hours=2))
+    out = lease.auto_acquire(stub, repo, now_dt=NOW + timedelta(hours=2))
     assert out["action"] == "auto-acquired"
     assert out["caller"] == "timer"
-    assert lease.load_request(REPO) is None
-    rec = lease.load_record(REPO)
+    assert lease.load_request(repo) is None
+    rec = lease.load_record(repo)
     assert rec is not None and rec["caller"] == "timer"
 
 
@@ -990,41 +991,39 @@ def test_auto_timed_start_waits_then_fires(tmp_path, monkeypatch):
 # named by rule — is gone; this is its successor behaviour.)
 
 
-def test_two_callers_hold_concurrent_leases_at_one_shape(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def test_two_callers_hold_concurrent_leases_at_one_shape(repo, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     alive = set()
     stub = _auto_stub(alive)
-    a = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="alpha")
+    a = lease.acquire(stub, repo, "cpu", now_dt=NOW, caller="alpha")
     assert a["action"] == "created"
     # Beta's ordinary acquire rides alpha's live lease.
-    b = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="beta")
+    b = lease.acquire(stub, repo, "cpu", now_dt=NOW, caller="beta")
     assert b["action"] == "adopted"
     assert b["record"]["session"] == a["record"]["session"]
     assert b["riding"] is True and b["owner_caller"] == "alpha"
-    assert len(lease.all_records(REPO)) == 1
+    assert len(lease.all_records(repo)) == 1
     # A capacity request (duty) creates beta's own second lease.
-    b2 = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="beta", duty=True)
+    b2 = lease.acquire(stub, repo, "cpu", now_dt=NOW, caller="beta", duty=True)
     assert b2["action"] == "created"
     assert b2["record"]["session"] != a["record"]["session"]
-    assert len(lease.all_records(REPO)) == 2
-    again = lease.acquire(stub, REPO, "cpu", now_dt=NOW, caller="alpha")
+    assert len(lease.all_records(repo)) == 2
+    again = lease.acquire(stub, repo, "cpu", now_dt=NOW, caller="alpha")
     assert again["action"] == "adopted"
     assert again["record"]["session"] == a["record"]["session"]
-    assert len(lease.all_records(REPO)) == 2
+    assert len(lease.all_records(repo)) == 2
 
 
-def test_generated_names_never_reuse_a_claimed_name(tmp_path, monkeypatch):
+def test_generated_names_never_reuse_a_claimed_name(repo, tmp_path, monkeypatch):
     """A name in the caller-claims journal is never handed out
     again: a stale claim can then never misattribute a later lease
     (the caller-attribution proof's defect, closed by
     construction). Live sessions, records, and the spend journal
     feed the same taken set."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
-    lease.append_caller_claim(REPO, "amber-otter-42", "alpha", "test")
-    assert "amber-otter-42" in lease._taken_session_names(REPO)
+    lease.append_caller_claim(repo, "amber-otter-42", "alpha", "test")
+    assert "amber-otter-42" in lease._taken_session_names(repo)
     for _ in range(50):
-        assert lease.generate_session_name(REPO) != "amber-otter-42"
+        assert lease.generate_session_name(repo) != "amber-otter-42"
 
 
 def test_default_shape_absent_without_the_config_key(tmp_path):
@@ -1063,8 +1062,7 @@ def _approval_events(tmp_path):
     return [e for e in (json.loads(l) for l in spool.read_text().splitlines() if l.strip()) if e.get("kind") == "approval-needed"]
 
 
-def test_acquire_records_host_and_spools_approval_needed(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def test_acquire_records_host_and_spools_approval_needed(repo, tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
 
@@ -1079,35 +1077,34 @@ def test_acquire_records_host_and_spools_approval_needed(tmp_path, monkeypatch):
             return cp("created")
         return _acquire_stub(*a, **k)
 
-    out = lease.acquire(stub, REPO, "cpu", now_dt=NOW)
+    out = lease.acquire(stub, repo, "cpu", now_dt=NOW)
     assert out["action"] == "created"
     assert out["host_changed"] is True and out["host"] == HOST_A
-    rec = lease.load_record(REPO)
+    rec = lease.load_record(repo)
     assert rec["host"] == HOST_A
     events = _approval_events(tmp_path)
     assert len(events) == 1
     assert events[0] == {"kind": "approval-needed", "shape": "cpu", "session": rec["session"], "host": HOST_A, "previous_host": None, "origin": "acquire"}
 
 
-def test_acquire_without_binding_records_no_host_and_no_event(tmp_path, monkeypatch):
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
+def test_acquire_without_binding_records_no_host_and_no_event(repo, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))  # no sessions file at all
-    out = lease.acquire(_acquire_stub, REPO, "cpu", now_dt=NOW)
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW)
     assert out["action"] == "created"
     assert "host_changed" not in out
-    assert "host" not in lease.load_record(REPO)
+    assert "host" not in lease.load_record(repo)
     assert _approval_events(tmp_path) == []
 
 
-def test_renewal_swap_records_new_host_and_spools(tmp_path, monkeypatch):
+def test_renewal_swap_records_new_host_and_spools(repo, tmp_path, monkeypatch):
     child = f"standard-r{int(NOW.timestamp())}"
     home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}, child: {"url": f"https://{HOST_B}"}})
     monkeypatch.setenv("HOME", str(home))
-    seed_window_record(tmp_path, monkeypatch, host=HOST_A)
+    seed_window_record(repo, host=HOST_A)
     alive, calls = {"standard"}, []
-    out = lease.reap(make_renewal_stub(alive, calls), REPO, now_dt=NOW)
+    out = lease.reap(make_renewal_stub(alive, calls), repo, now_dt=NOW)
     assert out["action"] == "renewed" and out["driver"] == 2
-    rec = lease.load_record(REPO, child)
+    rec = lease.load_record(repo, child)
     assert rec["session"] == child and rec["host"] == HOST_B
     events = _approval_events(tmp_path)
     assert len(events) == 1
@@ -1115,8 +1112,8 @@ def test_renewal_swap_records_new_host_and_spools(tmp_path, monkeypatch):
     assert events[0]["previous_host"] == HOST_A and events[0]["session"] == child
 
 
-def test_adopted_baselines_host_without_an_event(tmp_path, monkeypatch):
-    seed_record(tmp_path, monkeypatch)  # a pre-feature record: no host key
+def test_adopted_baselines_host_without_an_event(repo, tmp_path, monkeypatch):
+    seed_record(repo)  # a pre-feature record: no host key
     home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}})
     monkeypatch.setenv("HOME", str(home))
 
@@ -1127,16 +1124,16 @@ def test_adopted_baselines_host_without_an_event(tmp_path, monkeypatch):
             return cp("", rc=1)
         return cp("")
 
-    out = lease.acquire(stub, REPO, "cpu", now_dt=NOW)
+    out = lease.acquire(stub, repo, "cpu", now_dt=NOW)
     assert out["action"] == "adopted"
-    assert lease.load_record(REPO, "standard")["host"] == HOST_A
+    assert lease.load_record(repo, "standard")["host"] == HOST_A
     assert _approval_events(tmp_path) == []
 
 
-def test_adopted_host_change_spools_once_and_unchanged_is_silent(tmp_path, monkeypatch):
-    rec = seed_record(tmp_path, monkeypatch)
+def test_adopted_host_change_spools_once_and_unchanged_is_silent(repo, tmp_path, monkeypatch):
+    rec = seed_record(repo)
     rec["host"] = HOST_A
-    lease.save_record(REPO, rec)
+    lease.save_record(repo, rec)
     home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_B}"}})
     monkeypatch.setenv("HOME", str(home))
 
@@ -1147,13 +1144,13 @@ def test_adopted_host_change_spools_once_and_unchanged_is_silent(tmp_path, monke
             return cp("", rc=1)
         return cp("")
 
-    out = lease.acquire(stub, REPO, "cpu", now_dt=NOW)
+    out = lease.acquire(stub, repo, "cpu", now_dt=NOW)
     assert out["action"] == "adopted"
-    assert lease.load_record(REPO, "standard")["host"] == HOST_B
+    assert lease.load_record(repo, "standard")["host"] == HOST_B
     events = _approval_events(tmp_path)
     assert len(events) == 1
     assert events[0]["origin"] == "adopted" and events[0]["previous_host"] == HOST_A
-    out2 = lease.acquire(stub, REPO, "cpu", now_dt=NOW)
+    out2 = lease.acquire(stub, repo, "cpu", now_dt=NOW)
     assert out2["action"] == "adopted"
     assert len(_approval_events(tmp_path)) == 1  # unchanged host: no second event
 
@@ -1168,27 +1165,26 @@ def _foreign_stub(*a, **k):
     return cp("")
 
 
-def test_acquire_never_adopts_a_foreign_session(tmp_path, monkeypatch):
+def test_acquire_never_adopts_a_foreign_session(repo, tmp_path, monkeypatch):
     """Successor to the retired adopt-foreign path: a live session
     the lease model did not create is never adopted by an acquire.
     Names are generated unique, so a create mints a fresh session
     beside the foreign one and the record names only its own."""
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
     monkeypatch.setenv("HOME", str(tmp_path))
-    out = lease.acquire(_foreign_stub, REPO, "cpu-highram", now_dt=NOW)
+    out = lease.acquire(_foreign_stub, repo, "cpu-highram", now_dt=NOW)
     assert out["action"] == "created"
     assert out["record"]["session"] != "alpha2"
-    assert lease.load_record(REPO, "alpha2") is None
+    assert lease.load_record(repo, "alpha2") is None
 
 
-def test_reap_reconciles_a_missing_host_silently(tmp_path, monkeypatch):
+def test_reap_reconciles_a_missing_host_silently(repo, tmp_path, monkeypatch):
     """Regression (2026-11-04): a concurrent writer holding a
     pre-capture copy of the record restored a hostless record after
     the adopt-foreign capture saved — the acquire output was fine
     and nothing re-asserted the host, so the approval gate never
     saw the adopted host. Reap re-derives it from the binding; a
     fill baselines silently (the birth event already spooled)."""
-    seed_record(tmp_path, monkeypatch)  # no host key
+    seed_record(repo)  # no host key
     home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_A}"}})
     monkeypatch.setenv("HOME", str(home))
 
@@ -1199,15 +1195,15 @@ def test_reap_reconciles_a_missing_host_silently(tmp_path, monkeypatch):
             return cp("", rc=1)
         return cp("")
 
-    lease.reap(stub, REPO, now_dt=NOW)
-    assert lease.load_record(REPO, "standard")["host"] == HOST_A
+    lease.reap(stub, repo, now_dt=NOW)
+    assert lease.load_record(repo, "standard")["host"] == HOST_A
     assert _approval_events(tmp_path) == []
 
 
-def test_reap_reconciles_a_changed_host_and_spools(tmp_path, monkeypatch):
-    rec = seed_record(tmp_path, monkeypatch)
+def test_reap_reconciles_a_changed_host_and_spools(repo, tmp_path, monkeypatch):
+    rec = seed_record(repo)
     rec["host"] = HOST_A
-    lease.save_record(REPO, rec)
+    lease.save_record(repo, rec)
     home = _write_sessions_binding(tmp_path, {"standard": {"url": f"https://{HOST_B}"}})
     monkeypatch.setenv("HOME", str(home))
 
@@ -1218,8 +1214,8 @@ def test_reap_reconciles_a_changed_host_and_spools(tmp_path, monkeypatch):
             return cp("", rc=1)
         return cp("")
 
-    lease.reap(stub, REPO, now_dt=NOW)
-    assert lease.load_record(REPO, "standard")["host"] == HOST_B
+    lease.reap(stub, repo, now_dt=NOW)
+    assert lease.load_record(repo, "standard")["host"] == HOST_B
     events = _approval_events(tmp_path)
     assert len(events) == 1
     assert events[0]["origin"] == "reconcile" and events[0]["previous_host"] == HOST_A
@@ -1308,9 +1304,9 @@ def _gate_journal(tmp_path):
     return [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
 
 
-def test_authority_refuses_agent_creation_and_journals(tmp_path, monkeypatch):
+def test_authority_refuses_agent_creation_and_journals(repo, tmp_path, monkeypatch):
     _authority_fixture(tmp_path, monkeypatch)
-    out = lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, caller="alpha", seam="acquire")
+    out = lease.enforce_session_admission(repo, "main", shape=HIGH_RAM, caller="alpha", seam="acquire")
     assert out is not None and out["action"] == "caller-start-refused"
     assert out["basis"] == "agent-creation-denied" and out["caller"] == "alpha"
     journal = _gate_journal(tmp_path)
@@ -1318,39 +1314,39 @@ def test_authority_refuses_agent_creation_and_journals(tmp_path, monkeypatch):
     assert journal[0]["caller"] == "alpha" and journal[0]["seam"] == "acquire"
 
 
-def test_authority_shape_refusal_precedes_it(tmp_path, monkeypatch):
+def test_authority_shape_refusal_precedes_it(repo, tmp_path, monkeypatch):
     _authority_fixture(tmp_path, monkeypatch)
-    out = lease.enforce_session_admission(REPO, "plain", shape=STANDARD, caller="alpha")
+    out = lease.enforce_session_admission(repo, "plain", shape=STANDARD, caller="alpha")
     assert out["action"] == "shape-refused"
     assert [e["kind"] for e in _gate_journal(tmp_path)] == ["shape-refused"]
 
 
-def test_authority_non_creation_consult_and_duty_admit(tmp_path, monkeypatch):
+def test_authority_non_creation_consult_and_duty_admit(repo, tmp_path, monkeypatch):
     _authority_fixture(tmp_path, monkeypatch)
-    assert lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, caller="alpha", creation=False) is None
-    assert lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, caller="alpha", duty=True) is None
+    assert lease.enforce_session_admission(repo, "main", shape=HIGH_RAM, caller="alpha", creation=False) is None
+    assert lease.enforce_session_admission(repo, "main", shape=HIGH_RAM, caller="alpha", duty=True) is None
     assert _gate_journal(tmp_path) == []
 
 
-def test_authority_panel_two_halves_and_bypass_claim_admit(tmp_path, monkeypatch):
+def test_authority_panel_two_halves_and_bypass_claim_admit(repo, tmp_path, monkeypatch):
     _authority_fixture(tmp_path, monkeypatch)
     monkeypatch.setenv("COLAB_LEASE_ACTOR", "panel")
     # One half alone is not authority: the panel env claim without
     # its via corroboration is refused like any agent.
-    out = lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, caller="panel")
+    out = lease.enforce_session_admission(repo, "main", shape=HIGH_RAM, caller="panel")
     assert out is not None and out["action"] == "caller-start-refused"
-    assert lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, via="panel", caller="panel") is None
+    assert lease.enforce_session_admission(repo, "main", shape=HIGH_RAM, via="panel", caller="panel") is None
     # A whitelisted non-panel claim bypasses on the env half alone.
     monkeypatch.setenv("COLAB_LEASE_ACTOR", "test")
-    assert lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM) is None
+    assert lease.enforce_session_admission(repo, "main", shape=HIGH_RAM) is None
 
 
-def test_authority_infra_exemption_and_disabled_gate_admit(tmp_path, monkeypatch):
+def test_authority_infra_exemption_and_disabled_gate_admit(repo, tmp_path, monkeypatch):
     _authority_fixture(tmp_path, monkeypatch)
-    assert lease.enforce_session_admission(REPO, "cpu", shape=STANDARD, via="standing", standing=True) is None
+    assert lease.enforce_session_admission(repo, "cpu", shape=STANDARD, via="standing", standing=True) is None
     assert [e["kind"] for e in _gate_journal(tmp_path)] == ["shape-infra"]
     _authority_fixture(tmp_path, monkeypatch, enabled=False)
-    assert lease.enforce_session_admission(REPO, "main", shape=HIGH_RAM, caller="alpha") is None
+    assert lease.enforce_session_admission(repo, "main", shape=HIGH_RAM, caller="alpha") is None
 
 
 def test_state_serves_extend_guard_policy_and_verdicts(tmp_path):
@@ -1413,13 +1409,13 @@ def test_session_state_auth_prompt_is_not_retried(monkeypatch):
     assert calls["n"] == 1 and diag["read_error"] == "auth-prompt"
 
 
-def test_extend_unknown_carries_the_read_error(tmp_path, monkeypatch):
+def test_extend_unknown_carries_the_read_error(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
-    seed_record(tmp_path, monkeypatch)
+    seed_record(repo)
 
     def boom(*a, **k):
         raise subprocess.TimeoutExpired("colab", 120)
 
-    out = lease.extend(boom, REPO, "standard", 2, now_dt=NOW)
+    out = lease.extend(boom, repo, "standard", 2, now_dt=NOW)
     assert out["action"] == "extend-unknown"
     assert out["attempts"] == 3 and "TimeoutExpired" in out["read_error"]
