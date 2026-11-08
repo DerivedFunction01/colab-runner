@@ -7,6 +7,12 @@ the far side with a matching SHA-256 is not moved again (resume), a
 same-size corrupt part is detected by hash and re-moved, and a
 transfer that exhausts its attempts reports the failed stage so a
 later re-run resumes instead of restarting.
+
+The bin/colab-xfer section loads the verb against the same fake and
+pins the E7 contract: the move lands in parts, the transfer record
+at results/xfers/<id>.json tracks part progress as it happens and
+the terminal state at the end, and a failed move re-invoked with
+the same id resumes from the verified parts.
 """
 
 import hashlib
@@ -14,6 +20,7 @@ import importlib.util
 import json
 import re
 import subprocess
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -171,3 +178,125 @@ def test_download_resume_skips_verified_local_parts(tmp_path, monkeypatch):
     r = xfer.chunked_download("s", "big.bin", dest)
     assert r["ok"] and r["resumed_parts"] == 4 and r["downloaded_parts"] == 0
     assert len(fake.download_calls) == calls_before
+
+
+# --- bin/colab-xfer: the verb over the library ------------------------------
+
+vspec = importlib.util.spec_from_loader(
+    "colab_xfer", SourceFileLoader("colab_xfer", str(REPO / "bin" / "colab-xfer")))
+verb = importlib.util.module_from_spec(vspec)
+vspec.loader.exec_module(verb)
+
+
+def verb_harness(tmp_path, monkeypatch):
+    """The verb's own transfer module wired to the fake world, its
+    records rooted in tmp, and no ambient caller claim — the claim
+    the environment happens to carry is not the verb's to inherit
+    in a test."""
+    fake = FakeColab()
+    t = verb.transfer
+    monkeypatch.setattr(t, "REPO", tmp_path)
+    monkeypatch.setattr(t, "CHUNK", 64)
+    monkeypatch.setattr(t, "PART_BACKOFF_S", 0)
+    monkeypatch.setattr(t, "colab", fake)
+    monkeypatch.setattr(verb, "XFERS", tmp_path / "xfers")
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    local = tmp_path / "big.bin"
+    local.write_bytes(CONTENT)
+    return fake, local
+
+
+def read_xfer_record(tmp_path, xfer_id):
+    return json.loads((tmp_path / "xfers" / f"{xfer_id}.json").read_text())
+
+
+def test_xfer_up_completes_in_parts_and_records_terminal_state(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    rc = verb.main(["up", "-s", "s", str(local), "/content/big.bin", "--id", "up-1"])
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    rec = read_xfer_record(tmp_path, "up-1")
+    assert printed == rec  # what the caller sees is the stored record
+    assert rec["state"] == "complete" and rec["direction"] == "up"
+    assert rec["remote_name"] == "big.bin"  # the /content/ prefix was stripped
+    assert rec["parts"] == 4 and rec["parts_done"] == 4
+    assert rec["resumed_parts"] == 0 and rec["moved_parts"] == 4
+    assert rec["sha256"] == sha(CONTENT) and rec["remote_sha256"] == sha(CONTENT)
+    assert rec["bytes"] == len(CONTENT) and rec["bytes"] > verb.transfer.CHUNK
+    assert rec["started_at"] and rec["finished_at"] and rec["error"] is None
+    assert rec["caller"] is None
+    assert fake.remote["big.bin"] == CONTENT
+
+
+def test_xfer_record_tracks_part_progress_as_it_happens(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    record_path = tmp_path / "xfers" / "up-2.json"
+    seen = []
+    real_colab = verb.transfer.colab
+
+    def spying_colab(*a, **kw):
+        if a and a[0] == "upload" and record_path.exists():
+            seen.append(json.loads(record_path.read_text())["parts_done"])
+        return real_colab(*a, **kw)
+
+    monkeypatch.setattr(verb.transfer, "colab", spying_colab)
+    rc = verb.main(["up", "-s", "s", str(local), "big.bin", "--id", "up-2"])
+    capsys.readouterr()
+    assert rc == 0
+    # Each upload after the first could already read a record whose
+    # parts_done counted the parts landed before it.
+    assert seen == [0, 1, 2, 3]
+
+
+def test_xfer_up_exhaustion_records_the_failed_stage(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    fake.fail_uploads["big.bin.part-001"] = 99
+    rc = verb.main(["up", "-s", "s", str(local), "big.bin", "--id", "up-3"])
+    capsys.readouterr()
+    assert rc == 1
+    rec = read_xfer_record(tmp_path, "up-3")
+    assert rec["state"] == "failed" and rec["error"]["stage"] == "upload part 1"
+    assert rec["parts_done"] == 1 and rec["moved_parts"] == 1
+    assert rec["finished_at"]
+
+
+def test_xfer_down_killed_part_then_rerun_resumes_verified_parts(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    fake.remote["big.bin"] = CONTENT
+    fake.fail_downloads["big.bin.dl-002"] = 99  # the run dies on part 2
+    dest = tmp_path / "down" / "big.bin"
+    rc = verb.main(["down", "-s", "s", "big.bin", str(dest), "--id", "down-1"])
+    capsys.readouterr()
+    assert rc == 1
+    rec = read_xfer_record(tmp_path, "down-1")
+    assert rec["state"] == "failed" and rec["error"]["stage"] == "download big.bin.dl-002"
+    assert rec["parts_done"] == 2  # parts 0-1 landed verified before the failure
+    fake.fail_downloads.clear()
+    calls_before = len(fake.download_calls)
+    rc = verb.main(["down", "-s", "s", "big.bin", str(dest), "--id", "down-1"])
+    capsys.readouterr()
+    assert rc == 0
+    assert len(fake.download_calls) - calls_before == 2  # only parts 2-3 re-moved
+    rec = read_xfer_record(tmp_path, "down-1")
+    assert rec["state"] == "complete" and rec["error"] is None
+    assert rec["resumed_parts"] == 2 and rec["moved_parts"] == 2
+    assert dest.read_bytes() == CONTENT
+
+
+def test_xfer_status_reads_the_record_and_needs_no_session(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    assert verb.main(["up", "-s", "s", str(local), "big.bin", "--id", "up-4"]) == 0
+    capsys.readouterr()
+    assert verb.main(["status", "up-4"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["xfer_id"] == "up-4" and out["state"] == "complete"
+    assert verb.main(["status", "no-such-id"]) == 2
+
+
+def test_xfer_refuses_a_remote_path_that_is_not_a_bare_name(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    rc = verb.main(["up", "-s", "s", str(local), "sub/dir.bin", "--id", "up-5"])
+    capsys.readouterr()
+    assert rc == 2
+    assert not (tmp_path / "xfers" / "up-5.json").exists()  # refused before any record
+    assert fake.upload_calls == []

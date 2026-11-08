@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Move one bulk file between this machine and a Colab session.
+
+Usage: colab-xfer up   -s SESSION LOCAL_PATH REMOTE_NAME [--caller TAG] [--id XFER_ID]
+       colab-xfer down -s SESSION REMOTE_NAME LOCAL_PATH [--caller TAG] [--id XFER_ID]
+       colab-xfer status XFER_ID
+
+The chunked machinery (32 MB parts, per-part SHA-256, resume in
+both directions) is sync/transfer.py; this verb is its operator
+surface, built for the moves that sit outside any job's declared
+outputs — the class of move that used to be hand-assembled part by
+part through agent turns. REMOTE_NAME is a bare file name at
+/content (a leading /content/ is accepted and stripped); the parts
+and the assembled file live under that name.
+
+Every move keeps a transfer record at results/xfers/<id>.json,
+written as the parts land (a poller reading it mid-move sees the
+part progress), and finished with the terminal state:
+complete/failed, the end-to-end SHA-256, and the part counts.
+Re-invoking a move with the same --id continues its record; the
+parts themselves resume by hash inside the library, so a killed or
+failed move re-run later — with or without the same id — moves only
+the parts that never landed verified. `status` prints a record
+without touching a session (exit 0 when found, 2 when not).
+
+The caller claim resolves exactly as the other wrappers' does:
+--caller over $COLAB_CALLER, validated against the caller registry
+before anything starts, and stamped on the record.
+
+Exit codes: 0 = the move completed (or the status record was
+found), 1 = the move failed (the record carries the stage), 2 =
+usage error.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+XFERS = REPO / "results" / "xfers"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _load
+
+lease = _load.sync("lease")
+transfer = _load.sync("transfer")
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def save_record(rec: dict) -> None:
+    """Write the transfer record via a .tmp sibling + rename, so a
+    poller never reads it half-written."""
+    XFERS.mkdir(parents=True, exist_ok=True)
+    tmp = XFERS / f".{rec['xfer_id']}.json.tmp"
+    tmp.write_text(json.dumps(rec, indent=2))
+    os.replace(tmp, XFERS / f"{rec['xfer_id']}.json")
+
+
+def load_record(xfer_id: str) -> dict | None:
+    try:
+        return json.loads((XFERS / f"{xfer_id}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def remote_name(raw: str) -> str | None:
+    """The library's remote contract is a bare name at /content;
+    accept a /content-absolute spelling and strip it."""
+    name = raw[len("/content/"):] if raw.startswith("/content/") else raw
+    if not name or "/" in name:
+        return None
+    return name
+
+
+def run_move(args) -> int:
+    claim_err = lease.caller_claim_error(REPO, flag=args.caller, env=os.environ.get("COLAB_CALLER"))
+    if claim_err:
+        print(f"colab-xfer: {claim_err}", file=sys.stderr)
+        return 2
+    caller = lease.resolve_caller(REPO, flag=args.caller, env=os.environ.get("COLAB_CALLER"))
+    name = remote_name(args.remote)
+    if name is None:
+        print(f"colab-xfer: remote must be a bare file name at /content, got {args.remote!r}", file=sys.stderr)
+        return 2
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    xfer_id = args.id or f"{args.op}-{stamp}-{os.getpid()}"
+    rec = load_record(xfer_id) or {}
+    rec.update(
+        xfer_id=xfer_id,
+        direction=args.op,
+        session=args.session,
+        caller=caller,
+        local_path=args.local,
+        remote_name=name,
+        state="starting",
+        started_at=rec.get("started_at") or now(),
+        finished_at=None,
+        error=None,
+    )
+    if args.op == "up":
+        local = Path(args.local)
+        if not local.is_file():
+            print(f"colab-xfer: no such local file: {args.local}", file=sys.stderr)
+            return 2
+        rec["bytes"] = local.stat().st_size
+    save_record(rec)
+    rec["state"] = "running"
+    save_record(rec)
+
+    def progress(p: dict) -> None:
+        rec.update(parts=p["parts"], parts_done=p["parts_done"],
+                   resumed_parts=p["resumed_parts"], moved_parts=p["moved_parts"])
+        save_record(rec)
+
+    if args.op == "up":
+        result = transfer.chunked_upload(args.session, Path(args.local), name, progress=progress)
+        moved_key = "uploaded_parts"
+    else:
+        result = transfer.chunked_download(args.session, name, Path(args.local), progress=progress)
+        moved_key = "downloaded_parts"
+    rec.update(
+        parts=result.get("parts", rec.get("parts")),
+        resumed_parts=result.get("resumed_parts", rec.get("resumed_parts")),
+        moved_parts=result.get(moved_key, rec.get("moved_parts")),
+        retried_parts=result.get("retried_parts"),
+        sha256=result.get("sha256"),
+        remote_sha256=result.get("remote_sha256"),
+    )
+    if "parts" in result:
+        rec["parts_done"] = (result.get("resumed_parts") or 0) + (result.get(moved_key) or 0)
+    if args.op == "down" and result.get("bytes") is not None:
+        rec["bytes"] = result["bytes"]
+    if result.get("ok"):
+        rec["state"] = "complete"
+    else:
+        rec["state"] = "failed"
+        rec["error"] = {"stage": result.get("stage"), "attempts": result.get("attempts"),
+                        "stderr": result.get("stderr") or result.get("stdout")}
+    rec["finished_at"] = now()
+    save_record(rec)
+    print(json.dumps(rec, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def run_status(args) -> int:
+    rec = load_record(args.xfer_id)
+    if rec is None:
+        print(f"colab-xfer: no transfer record {args.xfer_id!r}", file=sys.stderr)
+        return 2
+    print(json.dumps(rec, indent=2))
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="colab-xfer", description="Chunked bulk transfer to/from a Colab session.")
+    sub = ap.add_subparsers(dest="op", required=True)
+    for op, first, second in (("up", "local", "remote"), ("down", "remote", "local")):
+        p = sub.add_parser(op, help=f"{'upload' if op == 'up' else 'download'} one file in 32 MB parts")
+        p.add_argument("-s", "--session", required=True)
+        p.add_argument(first)
+        p.add_argument(second)
+        p.add_argument("--caller", help="caller claim (default: $COLAB_CALLER)")
+        p.add_argument("--id", dest="id", help="transfer id (default: generated); reuse an id to continue its record")
+    p = sub.add_parser("status", help="print a transfer record; never touches a session")
+    p.add_argument("xfer_id")
+    args = ap.parse_args(argv)
+    if args.op == "status":
+        return run_status(args)
+    return run_move(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
