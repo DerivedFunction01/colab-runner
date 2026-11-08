@@ -7,17 +7,16 @@ Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
 --caller TAG (or the manifest's "caller" key, or $COLAB_CALLER)
 attributes the run to its thread: it rides the lease acquire and
 is stamped on the run record.
-The CLI is resolved via $COLAB_BIN (tests point this at a fake), else the
-uv tool venv (~/.local/share/uv/tools/google-colab-cli/bin/colab), else
-PATH, else ~/.local/bin/colab. The CLI is deliberately NOT installed on
-PATH (no global shim): this funnel is the only sanctioned access, and a
-bare `colab` in an agent shell is a contract breach, not a shortcut.
+The CLI funnel — resolution ($COLAB_BIN, else the uv tool venv,
+else PATH, else ~/.local/bin/colab), the NO_PROXY environment, and
+the guarded invocation — lives in sync/cli.py, the one module every
+consumer loads. This module re-exports its colab / colab_bin /
+colab_env / TOKEN under their existing names.
 """
 
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -26,142 +25,21 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 RUNS = REPO / "results" / "runs"
-TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
 
-import importlib.util
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _load
 
-_spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
-lease = importlib.util.module_from_spec(_spec_l)
-_spec_l.loader.exec_module(lease)
+cli = _load.sync("cli")
+lease = _load.sync("lease")
+repo_registry = _load.sync("repo_registry")
+transfer = _load.sync("transfer")
 
-_spec_r = importlib.util.spec_from_file_location("repo_registry", REPO / "sync" / "repo_registry.py")
-repo_registry = importlib.util.module_from_spec(_spec_r)
-_spec_r.loader.exec_module(repo_registry)
-
-_spec_t = importlib.util.spec_from_file_location("transfer", REPO / "sync" / "transfer.py")
-transfer = importlib.util.module_from_spec(_spec_t)
-_spec_t.loader.exec_module(transfer)
-
-
-def colab_bin() -> str:
-    env_bin = os.environ.get("COLAB_BIN")
-    if env_bin:
-        return env_bin
-    venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
-    if venv_bin.exists():
-        return str(venv_bin)
-    return shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
-
-
-def colab_env() -> dict:
-    env = dict(os.environ)
-    for key in ("NO_PROXY", "no_proxy"):
-        suffix = "google.com,googleapis.com,googleusercontent.com,colab.dev"
-        env[key] = f"{env[key]},{suffix}" if env.get(key) else suffix
-    return env
-
-
-AUTH_PROMPT = "Enter the authorization code"
-AUTH_RC = 3
-TOKEN_MIN_REFRESH_LEN = 20
-
-
-def _token_bytes() -> bytes | None:
-    try:
-        return TOKEN.read_bytes()
-    except OSError:
-        return None
-
-
-def _token_valid(data: bytes | None) -> bool:
-    """A stored credential is valid when it parses as JSON and carries
-    a refresh_token of plausible length. The interactive flow's stub
-    (a lone refresh_token key, 15 chars) fails this, as does any
-    truncated or non-JSON write. Contents are never printed."""
-    if not data:
-        return False
-    try:
-        parsed = json.loads(data)
-    except (ValueError, UnicodeDecodeError):
-        return False
-    if not isinstance(parsed, dict):
-        return False
-    rt = parsed.get("refresh_token")
-    return isinstance(rt, str) and len(rt) >= TOKEN_MIN_REFRESH_LEN
-
-
-def _atomic_write_token(data: bytes) -> None:
-    """Write the token via a .tmp sibling + rename, so no reader ever
-    sees a partial credential and an interrupted write cannot destroy
-    the live file (owner ruling, 2026-11-01: token writes are atomic
-    at every seam)."""
-    tmp = TOKEN.with_name(TOKEN.name + ".tmp")
-    tmp.write_bytes(data)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, TOKEN)
-
-
-def _note_auth_required(reason: str) -> None:
-    try:
-        var = lease.var_dir(REPO)
-        var.mkdir(parents=True, exist_ok=True)
-        (var / "auth-required.json").write_text(json.dumps({"noted_at": now(), "reason": reason}, indent=2))
-    except OSError:
-        pass
-
-
-def _clear_auth_required() -> None:
-    try:
-        (lease.var_dir(REPO) / "auth-required.json").unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _auth_blocked(cmd: list[str], reason: str) -> subprocess.CompletedProcess:
-    _note_auth_required(reason)
-    return subprocess.CompletedProcess(args=cmd, returncode=AUTH_RC, stdout="", stderr=f"colab auth required: {reason}")
-
-
-def colab(*args: str, timeout: int = 18000) -> subprocess.CompletedProcess:
-    """The one funnel for every automated Colab CLI call, guarded so a
-    dead credential can never again masquerade as data (2026-11-01: a
-    failed token refresh dropped the CLI into its interactive login
-    flow, which overwrote the stored token with a stub and printed the
-    auth prompt where callers expected a session list / usage text —
-    the prompt read as "session absent" and a live lease's record was
-    deleted under it). The guard:
-    - never invokes the CLI when the stored token is missing/invalid;
-    - snapshots the token before the call and restores it atomically
-      if the call leaves it invalid (the flow writes its stub BEFORE
-      prompting, so this also covers a call that times out blocked on
-      the prompt);
-    - turns any call whose output carries the auth prompt into an
-      auth-required result (rc 3, empty stdout), so downstream reads
-      see "unknown", never junk data.
-    Inert under COLAB_BIN: the test fakes are not credential flows."""
-    cmd = [colab_bin(), "--auth", "oauth2", *args]
-    if os.environ.get("COLAB_BIN"):
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=colab_env())
-    snapshot = _token_bytes()
-    if not _token_valid(snapshot):
-        return _auth_blocked(cmd, "stored token missing or invalid; re-authorization required (no CLI call made)")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=colab_env(), stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        if not _token_valid(_token_bytes()):
-            _atomic_write_token(snapshot)
-            _note_auth_required("CLI call timed out after overwriting the token; snapshot restored")
-        raise
-    if AUTH_PROMPT in (result.stdout + result.stderr):
-        if not _token_valid(_token_bytes()):
-            _atomic_write_token(snapshot)
-        return _auth_blocked(cmd, "CLI entered its interactive login flow")
-    if not _token_valid(_token_bytes()):
-        _atomic_write_token(snapshot)
-        return _auth_blocked(cmd, "CLI call overwrote the stored token; snapshot restored")
-    if result.returncode == 0:
-        _clear_auth_required()
-    return result
+# The funnel, re-exported under the names this module's consumers
+# (bin/colab-lease & friends historically, the test suites) use.
+colab = cli.colab
+colab_bin = cli.colab_bin
+colab_env = cli.colab_env
+TOKEN = cli.TOKEN
 
 
 def mirror(op: str) -> None:
