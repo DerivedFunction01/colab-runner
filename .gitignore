@@ -27,6 +27,11 @@
 # config/notify-routes.example.json — never committed.
 /config/notify-routes.json
 
+# Personal literals for the portability guard's denylist leg:
+# operator state for this machine, never committed — tracked code
+# names no personal literal, not even split into fragments.
+/config/denylist.txt
+
 # Job results: manifests are tracked under jobs/; payload bytes are not.
 /results/*
 !/results/.gitkeep
