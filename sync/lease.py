@@ -86,14 +86,10 @@ def shape_id_for(gpu, tpu, high_mem) -> str:
 
 
 # --- The dynamic shape catalog ------------------------------------------------
-# The picker's option set is NOT hand-listed: the shapes Colab offers
-# are parsed from `colab new --help` (the supported GPU/TPU variants
-# and the high-RAM ignore list), cached in var/cli-catalog.json for a
-# day. A shape's rate is null (unconfirmed) until a real lease
-# measures it (see shape_rate); a help-format change surfaces as
-# `catalog_error` in state rather than a silently invented or
-# missing option set. A parse failure never breaks the lease: the
-# CPU shapes always serve, and state() surfaces the failure.
+# Local why: the option set is parsed, never hand-listed, so a CLI
+# format change surfaces as `catalog_error` instead of an invented
+# or missing catalog; CPU shapes serve even when parsing fails.
+# Mechanics: docs/lease-workflow.md.
 
 CLI_CATALOG_TTL_S = 24 * 3600
 SHAPE_TIMEOUT_S = 18000  # the configured accelerator shapes' timeout
@@ -193,12 +189,8 @@ def _shape_entries(shapes: dict | None) -> dict:
 
 
 # --- Per-shape measured rates ---------------------------------------------------
-# A shape's rate lives in the measured-rate table
-# (var/shape-rates.json: {shape_id: CU/hour}) — runtime state, the
-# catalog cache's home. A CPU shape absent from the table falls
-# back to config/lease.json's per-tier rate map (the map the budget
-# guard always carried). Anything else is null: unconfirmed, and
-# no cost projection is fabricated for it.
+# Local why: an absent rate stays null (unconfirmed); no cost
+# projection is fabricated for it.
 
 
 def shape_rates_path(repo: Path) -> Path:
@@ -266,30 +258,11 @@ def standing_shape(repo: Path) -> str:
 
 
 # --- Session shape gate -------------------------------------------------------
-# Admission control over session creation (plan:
-# .plans/2026-11-04-agent-session-shape-gate.md). An agent-side actor
-# may start or request only High-RAM CPU sessions; the lease UI is
-# the sole bypass, identified by the via tag "panel" AND the env
-# claim COLAB_LEASE_ACTOR=panel, which only the UI server's process
-# tree carries — a bare --via panel flag is not a bypass. Other
-# whitelisted claims (the repo's own live probes use "test") ride
-# the env claim alone and are journaled like any bypass. Policy
-# lives in config/lease.json's session_gate block; an absent or
-# partial block enforces the built-in defaults (fail-closed), and
-# only an explicit "enabled": false inside the block turns the gate
-# off. The core re-reads the config on every invocation, so a policy
-# edit takes effect on the next start attempt everywhere.
-#
-# The gate is admission, not eviction: it is consulted only where a
-# session is about to be created (acquire's creation branch, the
-# demand path, renewal re-creation, the session-creating wrappers),
-# never on adopt, extend, or release. Refusals and bypass/infra
-# admissions are journaled to var/session-gate-journal.jsonl. Like
-# the budget guard, this is a guardrail against accidents and drift
-# at the same trust level — not a security boundary against a
-# determined operator-level agent: its strength is that every
-# legitimate path is funneled and every bypass is deliberate and
-# journaled.
+# Local why: a bare panel tag is not a bypass — the bypass needs the
+# server-carried env claim too — and the gate is admission only,
+# never eviction. It is a journaled guardrail at the same trust
+# level, not a security boundary. Mechanics:
+# docs/lease-workflow.md.
 
 ACTOR_ENV_CLAIM = "COLAB_LEASE_ACTOR"
 PANEL_ACTOR = "panel"
@@ -444,20 +417,10 @@ def renewal_admission(repo: Path, shape_id: str | None, shape: dict) -> dict:
 
 
 # --- Caller attribution -------------------------------------------------------
-# A caller is the named thread doing the work (plan:
-# .plans/2026-11-04-caller-attribution.md) — a sibling of the gate's
-# actor class above, never a substitute: the actor says which
-# channel acted (panel / test / standing / agent), the caller says
-# which thread. The claim arrives as a --caller flag on one-shot
-# calls (legible on the runtime's approval card, which shows the
-# command line) or as $COLAB_CALLER for drivers and machinery.
-# Thread callers are governed by the local, untracked registry
-# config/callers.json (an untracked local registry; schema in
-# tracked config/callers.example.json), read fresh at every
-# resolution like the gate policy. The machinery callers are code
-# constants, always valid, so a missing local registry never breaks
-# the panel or the duty. A claim is a registered base with an
-# optional single ":lane" suffix validated against the base.
+# Local why: caller (which thread) is never a substitute for actor
+# (which channel acted); machinery callers are constants so a
+# missing local registry never breaks the panel or the duties.
+# Mechanics: docs/lease-workflow.md.
 
 CALLER_ENV = "COLAB_CALLER"
 MACHINERY_CALLERS = (PANEL_ACTOR, GATE_DEFAULT_INFRA_ACTOR, "test", "lease")
@@ -659,15 +622,8 @@ def delete_record(repo: Path, session: str) -> None:
 
 
 # --- Generated session names ----------------------------------------------------
-# A created lease's session name is generated (sync/naming.py) and
-# never reused: the taken set is every name this workspace has ever
-# bound to a lease or an attach — the live sessions, the current
-# records, the caller-claims journal, and the spend journal (which
-# names every completed lease segment). A name that once referred
-# to one lease can therefore never come to refer to another, which
-# is what makes a claims-journal attribution unambiguous for all
-# time (the caller-attribution proof's stale-claim defect was a
-# reused name; generated names close it by construction).
+# Local why: names are never reused, so a claims-journal attribution
+# can never silently come to name a different lease.
 
 
 def _taken_session_names(repo: Path, colab=None) -> set:
@@ -770,31 +726,10 @@ def session_alive(colab, session: str) -> bool:
 
 
 # --- Attributed spend accounting ----------------------------------------------
-# Spend is attributed to this repo's own leases, never inferred from
-# the account balance. The old accounting (removed 2026-11-01) read
-# day/month spend as balance-baseline deltas, so every balance
-# movement booked as repo spend — external Colab usage, and credit
-# expirations like the ~66 CU step that day, which produced a
-# day_spent of 71.17 against a 15 CU cap and refused a 0.08 CU standing
-# start with 699 CU in the bank. The CLI's usage output carries no
-# per-source breakdown, so attribution is built from what the repo
-# itself knows: a session burns its shape's rate for exactly the
-# time it is assigned, and every assignment is a lease record.
-#
-# Completed assignments are journaled as segments
-# (var/lease-spend-journal.jsonl: session, shape, caller, start,
-# end, rate) at the seams that end them — release, renewal swap,
-# confirmed-dead clear. Live records contribute their running
-# segment at read time. Day/month figures split segments at the
-# period boundary. A segment journaled at a confirmed-dead clear
-# ends at the reap that confirmed it, so a death detected late
-# overcounts by at most the detection lag (conservative, bounded).
-# Segments completed before this accounting landed were never
-# journaled and are not reconstructed: counters are exact from the
-# first full UTC day after landing. An assignment with no record
-# (an orphan) burns uncounted — the orphan sweep is its cure, as
-# before. A shape with an unconfirmed (null) rate contributes
-# nothing: no number is fabricated for it.
+# Local why: the balance carries no per-source breakdown, so spend
+# is built only from this repo's own lease segments; a late-detected
+# death overcounts by at most the detection lag, and an unconfirmed
+# rate contributes nothing. Mechanics: docs/lease-workflow.md.
 
 
 def spend_journal_path(repo: Path) -> Path:
@@ -1104,13 +1039,9 @@ def created_shape_mismatch(session: str, shape: dict) -> dict | None:
 
 
 # The fallback's unassign replay, run under the CLI's own interpreter.
-# The client's unassign is a two-step flow — GET the unassign URL for an
-# XSRF token, then POST that URL with the token header — but the stock
-# call sends the POST with no body, and the tunnel endpoint answers
-# 411 Length Required (diagnosed 2026-11-04; `colab stop` carries the
-# same defect, which is why this fallback exists at all). Replaying the
-# client's own two steps with an explicit empty-JSON body attached
-# (data=b"{}") is the form that succeeds.
+# Local why: the stock unassign POST is bodiless and the tunnel
+# endpoint answers 411; replaying the client's two steps with an
+# explicit empty-JSON body (data=b"{}") is the form that succeeds.
 UNASSIGN_FALLBACK_SCRIPT = """
 import os
 from urllib.parse import urljoin
@@ -1170,11 +1101,9 @@ def stop_session_safe(colab, session: str) -> str:
     return "stop-failed"
 
 
-# The heartbeat read is deliberately short-bounded: a healthy download
-# of the tiny keepalive log completes in ~2 s (measured 2026-11-01),
-# but the file channel can stall indefinitely on the egress proxy's
-# IPv4 endpoint (same day's diagnosis). A stall must degrade the age
-# to unknown (None) — never wedge status/state reads behind it.
+# The heartbeat read is deliberately short-bounded: the file
+# channel can stall indefinitely, so a stall degrades the age to
+# unknown (None) instead of wedging status/state reads behind it.
 HEARTBEAT_READ_TIMEOUT_S = 10
 
 
@@ -1213,26 +1142,19 @@ def prime_session_host(colab, repo: Path, session: str) -> dict:
     return {"primed": True, "heartbeat_age_s": round(age, 1) if age is not None else None}
 
 
-# The keepalive launch is bounded and non-raising for the same reason
-# as the heartbeat read: its upload rides the file channel that can
-# stall indefinitely (2026-11-01: a 300 s upload stall failed the
-# auto-acquire that had already created lease #9, then failed reap
-# itself and starved the kernel pulse behind it). A failed launch is
-# a result ("launch-failed"), never an exception — the lease stands,
-# the pulse still fires, and the next reap retries the launch.
+# The keepalive launch is bounded and non-raising for the same
+# reason: its upload rides the stall-prone file channel. A failed
+# launch is a result ("launch-failed"), never an exception — the
+# lease stands and the next reap retries.
 KEEPALIVE_UPLOAD_TIMEOUT_S = 30
 KEEPALIVE_LAUNCH_TIMEOUT_S = 90
 
 
-# Renewal (plan .plans/2026-11-01-lease-extension.md): a record's
-# deadline is a window end. A session dies at the platform cap (~12 h
-# from its own start) or early, so a window may outlive several
-# sessions. A renew-flagged record is renewed by the reaper when its
-# session dies mid-window or its age passes the renewal threshold
-# (cap minus the overlap margin). The renewal kit lives in the VM at
-# RENEWAL_KIT_REMOTE; its install rides the same stall-prone file
-# channel as the keepalive, so its timeouts are bounded the same way
-# and a failed install is a result, never an exception.
+# Renewal: a window may outlive several sessions. The renewal
+# kit's install rides the same stall-prone file channel as the
+# keepalive, so its timeouts are bounded the same way and a failed
+# install is a result, never an exception. Mechanics:
+# docs/lease-workflow.md.
 SESSION_CAP_HOURS = 12.0
 RENEWAL_MARGIN = timedelta(minutes=30)
 KIT_UPLOAD_TIMEOUT_S = 30
@@ -2526,17 +2448,12 @@ def _envelope_block(colab, repo: Path, grant: dict | None, budget: dict) -> dict
     }
 
 
-# --- The standing bridge (plan: .plans/2026-11-01-lobby-bridge.md) -------------
+# --- The standing bridge -------------------------------------------------------
 #
-# The bridge is a command/output relay living in the standing lease:
-# an in-VM agent (snippets/bridge_agent.py) executes queued command
-# files — OS commands in the standing lease, or relayed into bridge-minted
-# child sessions — and appends every outcome to a segmented log.
-# The lease core installs the beachhead under an active grant,
-# re-arms it when its heartbeat dies, ferries commands and the log
-# mirror through var/, and folds bridge-child segments into the
-# attributed spend journal (children hold no lease record, so
-# without the fold-in their burn would be invisible to the guard).
+# Local why: bridge children hold no lease record, so their stop
+# segments fold into the attributed spend journal here — without
+# the fold-in their burn would be invisible to the guard.
+# Mechanics: docs/lease-workflow.md.
 
 
 def bridge_limits(cfg: dict) -> dict:
@@ -2877,15 +2794,10 @@ def _bridge_block(colab, repo: Path) -> dict | None:
     }
 
 
-# --- Session access list & unattributed sessions (caller-attribution
-# plan, Steps 5–6) -------------------------------------------------------
+# --- Session access list & unattributed sessions -------------------------------
 #
-# The access list is the panel's answer to "what is running and
-# whose is it": every live session, attributed from its lease
-# record or from the claims journal. A live session with neither is
-# unattributed — a detection state, never a claim value — stamped
-# with a first-seen time by reap()'s detection (Step 6) and
-# releasable from the panel in one tap.
+# Local why: unattributed is a detection state, never a claim
+# value. Mechanics: docs/lease-workflow.md.
 
 
 def session_endpoint(session: str) -> str | None:

@@ -32,9 +32,9 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
   over the served rate table.
 - `GET /api/state` — core `state` JSON plus `caps` read from
   `config/lease.json`.
-- `POST /api/lease/start {shape, hours}`, `POST /api/lease/stop
-  {session}`, `POST /api/lease/extend {session, hours}`,
-  `POST /api/grant {hours, burst}`, `POST /api/ungrant`.
+- Mutations are `POST` calls for lease start/stop/extend, access
+  release, grant/extend/ungrant, budget config, and server restart;
+  the full mapping is the Artifact data plane section below.
   The spec pickers (normal mode, and the burst tier in
   two-tier mode) are rendered from the core's `state.specs` list —
   every spec with its served label and `rate_cu_per_hour`; a null rate
@@ -90,6 +90,43 @@ ladder failed. Hook dry runs probe only and never restore.
 - `COLAB_RUNNER_VAR` — var dir (default `<repo>/var`)
 - `COLAB_LEASE_UI_HOST` / `COLAB_LEASE_UI_PORT`
 
+## Artifact data plane
+
+The published artifact is a thin front-end over this companion
+server (`http://127.0.0.1:8793`). All lease logic stays in the
+server and the lease core behind it; the artifact's server-side
+actions only proxy to the companion, and the page only renders
+what the proxy returns. An unreachable companion is surfaced
+plainly — state is never fabricated. One artifact action per
+endpoint, JSON in/out:
+
+- `state` — `GET /api/state` → core state JSON plus `caps`;
+  `GET /api/state/<part>` serves one portion (`records`, `specs`,
+  `budget`, `grant`, `meta`), and portions fail alone.
+- `start` `{shape, hours}` — `POST /api/lease/start` → core result.
+- `stop` `{session}` — `POST /api/lease/stop` → core result.
+- `extend` `{session, hours}` — `POST /api/lease/extend` → core result.
+- `release` `{session}` — `POST /api/access/release` → core result
+  (the unattributed-session release).
+- `grant` `{hours, burst?}` — `POST /api/grant` → core result.
+- `extend-grant` `{hours}` — `POST /api/grant/extend` → core result.
+- `ungrant` `{}` — `POST /api/ungrant` → core result.
+- `budgetcaps` `{daily_cu_budget?, monthly_cu_budget?,
+  standing_daily_cu_cap?}` — `POST /api/config/budget` → core
+  result. Omitted fields are unchanged; a null clears that cap.
+- `outbox` `{after}` — `GET /api/outbox?after=<seq>` → `{events,
+  last_seq}`.
+- `restart` `{}` — `POST /api/server/restart`. A proxy call cannot
+  reach a down server, so the artifact action starts the server on
+  the host (`bash ui/ui.sh start`, from the repo root) when the
+  companion is unreachable, and never claims a restart without the
+  server answering afterwards.
+
+The page renders only served state: spec pickers from
+`state.specs`, budget and envelope figures from `state`, events
+from the outbox. The only local derivations are arithmetic over
+served timestamps and rates.
+
 ## Published artifact (Library)
 
 The same page is published to the operator's artifacts library as
@@ -100,7 +137,8 @@ surface; this localhost page remains the local one. Redeploy with
 the runtime dir (`$LEASE_UI_RUNTIME_DIR`) → publish step (builder pass via
 the hatchlet CLI when present, otherwise the script prints the exact
 builder request and exits 4, workbench-style). The data-plane
-contract for the artifact lives in `ui/artifact-brief.md`.
+contract is the section above; `ui/artifact-brief.md` is a pointer
+retained because deploy syncs it into the runtime `brief/`.
 `bash ui/deploy.sh check` is the read-only drift check: it compares
 the repo's artifact sources against the deployed copies and exits 3
 on any drift (modified, missing, or deployed-but-not-a-repo-source),

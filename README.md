@@ -11,7 +11,7 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 
 ## Key pieces
 
-- `config/transient.json` + `ops/mirror_transient.py` — everything that would not survive a VM restart (OAuth token, session state, the CLI install) is mirrored into `state/transient/` (untracked) and restored from there, by the reaper hook's poll and on every wrapper use, under per-item rules in the registry.
+- `config/transient.json` + `ops/mirror_transient.py` — transient capture/restore; the canonical runbook is `ops/restore-cron.md`.
 - `config/lease.json` — the lease machinery's config: budget caps, the session shape-gate policy, the default shape jobs fall back to, and the standing lease's caller/shape. The shape catalog itself is dynamic, parsed from the CLI's own help; measured per-shape rates persist in `var/shape-rates.json` (null = unconfirmed).
 - `ui/` — the operator's lease control panel (127.0.0.1:8793): start any spec for a chosen duration, grant a two-tier lease (standing tier + burst shape), terminate early; every action is a `bin/colab-lease` call, and starts/stops/grants are announced to the main chat via the outbox + notify hook. No agent operates the lease.
 - `sync/` — snapshot-bundle construction on the origin lineage, bundle apply, the per-class data manifest (transfer vs driver-plus-regenerate vs network regeneration, priced), and result pull-back with hash verification.

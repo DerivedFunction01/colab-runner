@@ -1,29 +1,9 @@
 #!/usr/bin/env bash
-# ui/deploy.sh — the deploy path for the Colab Lease artifact
-# (the lease control UI as a published Library artifact, backed by
-# the companion server on 127.0.0.1:8793).
-#
-#   ui/deploy.sh [--skip-gate]
-#   ui/deploy.sh check
-#
-# `check` is read-only: it compares the repo's artifact sources
-# against the deployed copies in the runtime space and reports each
-# file in sync or DRIFTED (exit 3 on any drift, including a deployed
-# file the repo no longer ships). It never writes.
-#
-# Steps, fail-fast — red work never deploys:
-#   1. gate    the UI server tests + the lease core test files
-#   2. deploy  copy the artifact-facing sources (ui/static design
-#              source + ui/artifact-brief.md) into the runtime
-#              space (LEASE_UI_RUNTIME_DIR — required, set in the
-#              operator's environment; the deployed location is
-#              machine-local and never named in this repo)
-#   3. publish the web-artifact builder pass over the runtime
-#              space, via the hatchlet CLI when it is on PATH
-#              (HATCHLET env override). Without a builder CLI this
-#              step prints the exact builder request needed and
-#              exits 4 — the source is deployed but NOT published,
-#              and the script says so plainly.
+# ui/deploy.sh — deploy or check the Colab Lease artifact.
+# Contract and deploy story: ui/README.md. `check` is read-only and
+# exits 3 on any drift. A full deploy gates first, syncs sources to
+# $LEASE_UI_RUNTIME_DIR, then publishes via the hatchlet CLI when
+# present; without one it prints the builder request and exits 4.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,9 +130,8 @@ NOT published. Run the builder pass with the artifact tool:
   goal_id goal_e56641726a1f (the builder assigned slug colab-lease-2);
   later updates: artifact.edit on slug colab-lease-2. Either way the
   deployed source in the runtime dir (LEASE_UI_RUNTIME_DIR) is the input
-  (client/ is the design source, brief/artifact-brief.md is the
-  data-plane contract: server-side actions proxy
-  http://127.0.0.1:8793).
+  (client/ is the design source; brief/artifact-brief.md points to
+  the data-plane contract in ui/README.md).
 EOF
   exit 4
 fi

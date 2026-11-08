@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Capture/restore transient files between canonical homes and the repo mirror.
 
-Registry: config/transient.json. Canonical paths resolve against $HOME, or
-$COLAB_RUNNER_HOME when set (sandboxed tests). File contents are never
-printed; reports carry only existence, size, mtime, and action taken.
+Registry: config/transient.json; runbook: ops/restore-cron.md. Canonical
+paths resolve against $HOME, or $COLAB_RUNNER_HOME when set. Reports
+carry only existence, size, mtime, and action taken.
 """
 
 import argparse

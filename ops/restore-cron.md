@@ -1,15 +1,56 @@
-# Restore cron — definition (installed 2026-10-29, after login)
+# Transient restore — runbook and specification
 
-Purpose: keep transient files (auth token, session list) restored from the
-repo mirror even if nothing invokes a wrapper — e.g. after a VM reset wipes
-`~/.config/colab-cli/`. Runs the mirror restore only; it never logs in and
-never prints file contents.
+Findings first: `config/transient.json` is the specification and
+`ops/mirror_transient.py` is the mechanism. Everything else points
+here. File contents are never printed or logged; capture, restore,
+and status report only existence, size, mtime, and the action taken.
 
-## Crontab line (install after the first successful `colab` login)
+## Registry and operations
+
+The registry names each item's canonical path, mirror path under
+`state/transient/`, kind, mode, conflict rule, triggers, and any
+verification or validation rule. The mirror script performs three
+operations against it:
+
+- `capture` — canonical → mirror.
+- `restore` — mirror → canonical.
+- `status` — metadata only, no copies.
+
+Copies are atomic (temporary sibling + rename), carry the registry
+mode, and preserve the source mtime so newest-wins comparisons stay
+honest. A `recreate` item (the CLI install) is not file-mirrored;
+bootstrap recreates it from its pin when missing or below the
+registry minimum.
+
+## Conflict rules
+
+- `newest-wins` items copy only when the source is newer.
+- `restore-if-missing` items restore only into an absent canonical
+  path and capture the canonical file when it exists.
+- The token item is validated on both operations: an invalid
+  canonical heals from a valid mirror during capture, and an
+  invalid mirror never overwrites the canonical file during
+  restore, whatever the mtimes say.
+- The sessions item never captures an empty binding over a
+  non-empty mirror.
+- Disabled registry items are skipped.
+
+## Triggers
+
+- Wrappers restore on entry and capture on exit.
+- The reaper hook's restore duty runs the same restore on its poll.
+- Bootstrap restores, recreates the CLI item when needed, and
+  reports whether a restore trigger is registered.
+- The cron line below is the standing trigger on a machine with
+  cron. On this machine the registered trigger is the script-level
+  reaper hook; the marker `state/transient/cron-registered.json`
+  records that a trigger is registered, whatever the mechanism.
+
+## Cron definition (install after the first successful login)
 
 Substitute the checkout's absolute path for `/path/to/colab-runner`
-(cron needs absolute paths; the path itself is machine-local and
-lives only in the installed crontab, never in this repo):
+(cron needs absolute paths; the installed path is machine-local and
+lives only in the crontab, never in this repo):
 
 ```
 */5 * * * * /usr/bin/python3 /path/to/colab-runner/ops/mirror_transient.py restore >> /path/to/colab-runner/var/restore-cron.log 2>&1
@@ -25,23 +66,6 @@ mkdir -p var
 touch state/transient/cron-registered.json
 ```
 
-Verify: `crontab -l | grep mirror_transient` shows the line; after deleting
-`~/.config/colab-cli/token.json`, it reappears (mode 600, hash-equal to the
-mirror) within 5 minutes.
-
-Why staged: before the first login there is no token to mirror, so the job
-would only log `no-mirror` every 5 minutes. `ops/bootstrap_local.sh` reports
-registration state and re-offers install once a token exists.
-
-## As installed on this machine (2026-10-29)
-
-This VM has no `crontab` binary and no user systemd bus. The trigger was at
-first a Muse scheduled job (`colab-runner-transient-restore`, every 5
-minutes, restore + reap, report only on failure); it was found silently
-disabled on 2026-10-31 after a dead lease went unreaped for ~5 hours, and
-was retired once its replacement proved duty-equivalent. The trigger now
-is the script-level hook `colab-lease-reaper` (120 s poll), whose first
-duty is the same restore command. The crontab line above remains the
-definition for a machine that has cron. The marker file
-`state/transient/cron-registered.json` records that a trigger is
-registered (any mechanism counts).
+Verify: `crontab -l | grep mirror_transient` shows the line; after
+deleting the canonical token file, it reappears (mode 600,
+hash-equal to the mirror) within 5 minutes.
