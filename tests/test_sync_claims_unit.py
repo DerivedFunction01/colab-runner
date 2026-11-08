@@ -332,3 +332,160 @@ def test_claim_sync_verbs_round_trip(tmp_path, monkeypatch):
     assert rc == 0 and out["action"] == "sync-released"
     rc, out = _run_lease(env, root, "release-sync", SESSION, "--caller", "alpha")
     assert rc == 0 and out["action"] == "sync-no-claim"
+
+
+# --- Duration cap policy and long holds (E3) ---
+
+import pytest
+
+
+def test_max_sync_seconds_policy_default_override_and_invalid(tmp_path, monkeypatch):
+    """E3: the policy resolves max_sync_seconds beside the TTL and
+    window — 300 by default, config-overridable, and a non-positive
+    value falls back to the default rather than disabling the cap."""
+    root = repo(tmp_path, monkeypatch)
+    assert lease_mod.sync_claim_policy(root)["max_sync_seconds"] == 300
+    cfg = json.loads((root / "config" / "lease.json").read_text())
+    cfg["sync_claim"] = {"max_sync_seconds": 42}
+    (root / "config" / "lease.json").write_text(json.dumps(cfg))
+    assert lease_mod.sync_claim_policy(root)["max_sync_seconds"] == 42
+    cfg["sync_claim"] = {"max_sync_seconds": -5}
+    (root / "config" / "lease.json").write_text(json.dumps(cfg))
+    assert lease_mod.sync_claim_policy(root)["max_sync_seconds"] == 300
+
+
+def test_long_hold_survives_quiet_and_the_original_ttl(tmp_path, monkeypatch):
+    """E3 (decision 1, amended): while the hold is unexpired the
+    claim is live evidence — it does not lapse when the holder
+    goes quiet, and it does not die at the original TTL either;
+    a second caller is still refused by it. Past the hold's end
+    the claim is gone."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    lease_mod.claim_sync(root, SESSION, "alpha", now_dt=T0)
+    claim = lease_mod.syncclaims.note_long_hold(root, SESSION, "alpha", 7200, now_dt=T0)
+    assert claim["long_hold_until"] == iso(T0 + timedelta(seconds=7200))
+    assert claim["expires_at"] == claim["long_hold_until"]
+    inside = T0 + timedelta(minutes=90)  # past the 60-minute TTL
+    assert lease_mod.read_sync_claim(root, SESSION, now_dt=inside) is not None
+    ev = lease_mod.active_callers(root, SESSION, inside)
+    assert ev["alpha"][0]["kind"] == "long-hold"
+    verdict = lease_mod.sync_rights(root, SESSION, "beta", now_dt=inside)
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "claim"
+    past = T0 + timedelta(seconds=7201)
+    assert lease_mod.read_sync_claim(root, SESSION, now_dt=past) is None
+
+
+def test_note_long_hold_requires_the_callers_own_claim(tmp_path, monkeypatch):
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    lease_mod.claim_sync(root, SESSION, "alpha", now_dt=T0)
+    with pytest.raises(ValueError):
+        lease_mod.syncclaims.note_long_hold(root, SESSION, "beta", 7200, now_dt=T0)
+    with pytest.raises(ValueError):
+        lease_mod.syncclaims.note_long_hold(root, "no-such-session", "alpha", 7200, now_dt=T0)
+
+
+# --- Refresh degradation (E12, decision 8 amended) ---
+
+
+def test_refresh_degrades_under_write_denial(tmp_path, monkeypatch):
+    """E12: the holder's refresh whose store write fails is
+    allowed on the stored claim and journaled as a degradation —
+    never a refusal."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    lease_mod.claim_sync(root, SESSION, "alpha", now_dt=T0)
+
+    def denied(*a, **k):
+        raise PermissionError("flap")
+
+    monkeypatch.setattr(lease_mod.records, "save_record", denied)
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0 + timedelta(minutes=5))
+    assert verdict["allowed"] is True and verdict["refresh_degraded"] is True
+    assert verdict["claim"]["caller"] == "alpha"
+    lines = [json.loads(x) for x in lease_mod.caller_claims_path(root).read_text().splitlines() if x.strip()]
+    assert any(
+        ln.get("seam") == "sync-claim-refresh-degraded" and ln.get("caller") == "alpha" for ln in lines
+    )
+
+
+def test_grant_stays_strict_under_write_denial(tmp_path, monkeypatch):
+    """E12's other half: a grant under the same denial raises —
+    an unstored claim is not granted."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+
+    def denied(*a, **k):
+        raise PermissionError("flap")
+
+    monkeypatch.setattr(lease_mod.records, "save_record", denied)
+    with pytest.raises(PermissionError):
+        lease_mod.claim_sync(root, SESSION, "alpha", now_dt=T0)
+    assert lease_mod.read_sync_claim(root, SESSION, now_dt=T0) is None
+
+
+# --- Bounded journal tail (E15b) ---
+
+
+def test_journal_tail_read_matches_full_read_verdicts(tmp_path, monkeypatch):
+    """E15(b): with a journal far larger than the tail bound, the
+    verdicts are the full-read verdicts — stale callers beyond the
+    window are absent, the fresh attach inside it is evidence."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    stale = T0 - timedelta(days=2)
+    path = lease_mod.caller_claims_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for i in range(3000):
+            fh.write(json.dumps({
+                "ts": iso(stale), "seam": "colab-sh", "caller": "gamma",
+                "session": SESSION, "action": "attach",
+            }) + "\n")
+    write_attach(root, "beta", T0 - timedelta(minutes=5))
+    assert path.stat().st_size > lease_mod.syncclaims.JOURNAL_TAIL_BYTES
+    tail = lease_mod.syncclaims._journal_tail_lines(path)
+    assert sum(len(x) for x in tail) < path.stat().st_size
+    ev = lease_mod.active_callers(root, SESSION, T0)
+    assert "gamma" not in ev
+    assert ev["beta"][0]["kind"] == "attach"
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "activity"
+    assert verdict["holder"] == "beta"
+
+
+# --- Detached records as evidence (E8) ---
+
+
+def detached_rec(did, caller="beta", state="running", session=SESSION):
+    return {
+        "id": did, "session": session, "caller": caller, "state": state,
+        "exit_code": None if state == "running" else 0,
+        "started_at": iso(T0), "finished_at": None if state == "running" else iso(T0),
+    }
+
+
+def test_detached_record_is_activity_evidence_until_terminal(tmp_path, monkeypatch):
+    """E8: a running detached record is a second caller's refusal
+    evidence (kind detached); once terminal it evidences nothing."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    lease_mod.syncclaims.write_detached_record(root, detached_rec("d1"))
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0 + timedelta(minutes=1))
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "activity"
+    assert verdict["holder"] == "beta" and verdict["evidence"][0]["kind"] == "detached"
+    lease_mod.syncclaims.mark_detached_terminal(root, "d1", "complete", 0, now_dt=T0 + timedelta(minutes=2))
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0 + timedelta(minutes=3))
+    assert verdict["allowed"] is True
+
+
+def test_detached_evidence_dedupes_record_jobs_and_scan(tmp_path, monkeypatch):
+    """The same launch seen via the record's jobs list and the
+    record scan is one evidence entry, not two."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root, jobs=["detached:d2"])
+    lease_mod.syncclaims.write_detached_record(root, detached_rec("d2"))
+    ev = lease_mod.active_callers(root, SESSION, T0 + timedelta(minutes=1))
+    kinds = [item["kind"] for item in ev["beta"]]
+    assert kinds == ["detached"]

@@ -50,6 +50,7 @@
   },
   "sync_claim": {
     "attach_window_minutes": 15,
+    "max_sync_seconds": 300,
     "ttl_minutes": 60
   }
 }

@@ -19,8 +19,18 @@ from . import foundation, records, callers
 
 CLAIM_KEY = "sync_claim"
 NONTERMINAL_RUN_STATES = ("starting", "running", "polling")
+NONTERMINAL_DETACHED_STATES = ("running",)
 DEFAULT_TTL_MINUTES = 60
 DEFAULT_ATTACH_WINDOW_MINUTES = 15
+DEFAULT_MAX_SYNC_SECONDS = 300
+
+# The journal evidence read is a bounded tail, not the whole file:
+# evidence only ever names attaches inside the freshness window,
+# and a journal line is ~150 bytes, so 256 KiB of tail is on the
+# order of a thousand attaches — days of burst traffic, far beyond
+# anything the window can reach. The bound exists so the gate's
+# hot path stops paying for the journal's whole history (E15).
+JOURNAL_TAIL_BYTES = 256 * 1024
 
 
 def _now(now_dt: datetime | None) -> datetime:
@@ -43,14 +53,15 @@ def _iso(dt: datetime) -> str:
 
 def sync_claim_policy(repo: Path) -> dict:
     """The sync_claim block of the lease config, resolved:
-    {ttl_minutes, attach_window_minutes}. A missing block or a
-    non-positive/non-numeric value falls back to the default —
-    the knobs tune the window, they never disable the claim."""
+    {ttl_minutes, attach_window_minutes, max_sync_seconds}. A
+    missing block or a non-positive/non-numeric value falls back
+    to the default — the knobs tune the window, they never
+    disable the claim."""
     block = foundation.load_config(repo).get("sync_claim")
     if not isinstance(block, dict):
         block = {}
     out = {}
-    for key, default in (("ttl_minutes", DEFAULT_TTL_MINUTES), ("attach_window_minutes", DEFAULT_ATTACH_WINDOW_MINUTES)):
+    for key, default in (("ttl_minutes", DEFAULT_TTL_MINUTES), ("attach_window_minutes", DEFAULT_ATTACH_WINDOW_MINUTES), ("max_sync_seconds", DEFAULT_MAX_SYNC_SECONDS)):
         value = block.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             value = default
@@ -77,14 +88,98 @@ def _run_records(repo: Path) -> list[dict]:
     return out
 
 
+# --- Detached shell records -----------------------------------------------------
+# colab-sh --detach launches register locally (E8): one record per
+# launch at results/detached/<id>.json, in the run-record
+# vocabulary — {id, session, caller, state, exit_code, started_at,
+# finished_at}. Written at launch, marked terminal by the poll
+# that observes the end. This is the record shape the orphan
+# census and the claim gate both read; it is a contract, kept
+# exact.
+
+
+def detached_record_path(repo: Path, did: str) -> Path:
+    return repo / "results" / "detached" / f"{did}.json"
+
+
+def write_detached_record(repo: Path, rec: dict) -> None:
+    """Persist one detached record (staged sibling + rename, the
+    records discipline: a denied write leaves the standing record
+    intact and surfaces instead)."""
+    p = detached_record_path(repo, rec["id"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(rec, indent=2))
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def read_detached_record(repo: Path, did: str) -> dict | None:
+    data = foundation.load_json(detached_record_path(repo, did), None)
+    return data if isinstance(data, dict) else None
+
+
+def _detached_records(repo: Path) -> list[dict]:
+    """Every detached record on disk, read tolerantly — the
+    _run_records discipline over results/detached/."""
+    out = []
+    detached = repo / "results" / "detached"
+    if detached.is_dir():
+        for path in sorted(detached.glob("*.json")):
+            rec = foundation.load_json(path, None)
+            if isinstance(rec, dict):
+                out.append(rec)
+    return out
+
+
+def mark_detached_terminal(repo: Path, did: str, state: str, exit_code, now_dt: datetime | None = None) -> dict | None:
+    """Mark a detached record terminal (state "complete"/"failed",
+    with the job's exit code and finish stamp) as its poll
+    observes the end. Returns the updated record, or None when no
+    local record exists — a launch from another machine is not
+    this machine's to mark."""
+    rec = read_detached_record(repo, did)
+    if rec is None:
+        return None
+    rec["state"] = state
+    rec["exit_code"] = exit_code
+    rec["finished_at"] = _iso(_now(now_dt))
+    write_detached_record(repo, rec)
+    return rec
+
+
+def _journal_tail_lines(path: Path) -> list[str]:
+    """The caller-claims journal's tail lines: the last
+    JOURNAL_TAIL_BYTES of the file, with the first (possibly
+    partial) line dropped when the read started mid-file. See
+    the bound's note at the constant."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > JOURNAL_TAIL_BYTES:
+                fh.seek(size - JOURNAL_TAIL_BYTES)
+            raw = fh.read()
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if size > JOURNAL_TAIL_BYTES and lines:
+        lines = lines[1:]
+    return lines
+
+
 def active_callers(repo: Path, session: str, now_dt: datetime | None = None) -> dict:
     """The distinct callers with live evidence on one session:
-    {caller: [evidence, ...]}. Evidence is exactly three kinds —
-    a job registered on the lease record, a non-terminal run
-    record naming the caller, or a channel attach in the
-    caller-claims journal inside the freshness window. Anything
-    older or weaker is not activity; a caller with no live
-    evidence is not active, however recent their lease is."""
+    {caller: [evidence, ...]}. Evidence kinds — a job registered
+    on the lease record, a non-terminal run record naming the
+    caller, a running detached record naming the caller, a
+    channel attach in the caller-claims journal inside the
+    freshness window, or an unexpired long hold on the session's
+    claim. Anything older or weaker is not activity; a caller
+    with no live evidence is not active, however recent their
+    lease is."""
     now = _now(now_dt)
     window_s = sync_claim_policy(repo)["attach_window_minutes"] * 60
     evidence: dict[str, list[dict]] = {}
@@ -95,22 +190,46 @@ def active_callers(repo: Path, session: str, now_dt: datetime | None = None) -> 
 
     runs = _run_records(repo)
     by_run = {r.get("run_id"): r for r in runs if r.get("run_id")}
+    detached = _detached_records(repo)
+    by_detached = {d.get("id"): d for d in detached if d.get("id")}
     rec = records.load_record(repo, session)
+    seen_detached: set = set()
     if rec is not None:
-        for run_id in rec.get("jobs") or []:
-            run = by_run.get(run_id) or {}
-            add(run.get("caller") or rec.get("caller"), {"kind": "job", "run_id": run_id})
+        for job_id in rec.get("jobs") or []:
+            if isinstance(job_id, str) and job_id.startswith("detached:"):
+                det_id = job_id.split(":", 1)[1]
+                det = by_detached.get(det_id) or {}
+                if det.get("state", "running") in NONTERMINAL_DETACHED_STATES:
+                    add(det.get("caller") or rec.get("caller"), {"kind": "detached", "id": det_id})
+                    seen_detached.add(det_id)
+                continue
+            run = by_run.get(job_id) or {}
+            add(run.get("caller") or rec.get("caller"), {"kind": "job", "run_id": job_id})
     for run in runs:
         if run.get("session") == session and run.get("state") in NONTERMINAL_RUN_STATES:
             add(run.get("caller"), {"kind": "run", "run_id": run.get("run_id"), "state": run.get("state")})
+    for det in detached:
+        if det.get("id") in seen_detached:
+            continue
+        if det.get("session") == session and det.get("state") in NONTERMINAL_DETACHED_STATES:
+            add(det.get("caller"), {"kind": "detached", "id": det.get("id")})
+    # An unexpired long hold is its holder's live evidence until
+    # its stated end (the decision-1 amendment): the holder makes
+    # no attaches during a hold, so without this the claim would
+    # lapse holder-quiet mid-hold and admit a second sync caller
+    # into the collision the hold journal exists to prevent.
+    stored = _stored_claim(repo, session)
+    if stored is not None:
+        hold_until = _parse(stored.get("long_hold_until"))
+        expires = _parse(stored.get("expires_at"))
+        if hold_until is not None and now < hold_until and expires is not None and now < expires:
+            add(stored.get("caller"), {"kind": "long-hold", "until": stored.get("long_hold_until")})
     # Channel attaches: the freshest attach per caller inside the
-    # window is the evidence; older lines are history.
+    # window is the evidence; older lines are history. The read is
+    # the journal's bounded tail (E15) — the window it must cover
+    # is minutes, the tail is days.
     freshest: dict[str, dict] = {}
-    try:
-        lines = callers.caller_claims_path(repo).read_text().splitlines()
-    except OSError:
-        lines = []
-    for line in lines:
+    for line in _journal_tail_lines(callers.caller_claims_path(repo)):
         line = line.strip()
         if not line:
             continue
@@ -156,6 +275,9 @@ def _write_claim_file(repo: Path, session: str, claim: dict) -> None:
         raise
 
 
+_CLAIM_FIELDS = ("caller", "claimed_at", "expires_at", "last_attach_at", "long_hold_until")
+
+
 def _stored_claim(repo: Path, session: str) -> dict | None:
     """The claim as stored (no lapse evaluation): the record's
     field wins when a record carries one; the standalone file is
@@ -165,7 +287,7 @@ def _stored_claim(repo: Path, session: str) -> dict | None:
         return rec[CLAIM_KEY]
     data = foundation.load_json(_claim_file(repo, session), None)
     if isinstance(data, dict) and isinstance(data.get("caller"), str):
-        return {k: data.get(k) for k in ("caller", "claimed_at", "expires_at", "last_attach_at")}
+        return {k: data.get(k) for k in _CLAIM_FIELDS}
     return None
 
 
@@ -195,7 +317,10 @@ def read_sync_claim(repo: Path, session: str, now_dt: datetime | None = None) ->
     whose last attach is older than the freshness window and who
     shows no other live evidence has lapsed — the stored claim
     reads as absent (a later grant overwrites it), so a dead
-    claimant never squats past their own silence."""
+    claimant never squats past their own silence. One exception
+    (the decision-1 amendment): a holder inside a journaled long
+    hold is never quiet — the hold is live evidence until its
+    stated end, so the claim cannot lapse mid-hold."""
     now = _now(now_dt)
     claim = _stored_claim(repo, session)
     if claim is None:
@@ -203,6 +328,9 @@ def read_sync_claim(repo: Path, session: str, now_dt: datetime | None = None) ->
     expires = _parse(claim.get("expires_at"))
     if expires is None or now >= expires:
         return None
+    hold_until = _parse(claim.get("long_hold_until"))
+    if hold_until is not None and now < hold_until:
+        return {"session": session, **claim}
     last_attach = _parse(claim.get("last_attach_at"))
     window_s = sync_claim_policy(repo)["attach_window_minutes"] * 60
     fresh = last_attach is not None and (now - last_attach).total_seconds() <= window_s
@@ -218,6 +346,7 @@ def _grant(repo: Path, session: str, caller: str, now: datetime) -> dict:
         "claimed_at": _iso(now),
         "expires_at": _iso(now + timedelta(minutes=policy["ttl_minutes"])),
         "last_attach_at": _iso(now),
+        "long_hold_until": None,
     }
     _store_claim(repo, session, claim)
     # The grant is journaled in the caller-claims journal, the
@@ -229,8 +358,34 @@ def _grant(repo: Path, session: str, caller: str, now: datetime) -> dict:
 
 def _refresh(repo: Path, session: str, claim: dict, now: datetime) -> dict:
     claim = {**claim, "last_attach_at": _iso(now)}
-    stored = {k: claim.get(k) for k in ("caller", "claimed_at", "expires_at", "last_attach_at")}
+    stored = {k: claim.get(k) for k in _CLAIM_FIELDS}
     _store_claim(repo, session, stored)
+    return {"session": session, **stored}
+
+
+def note_long_hold(repo: Path, session: str, caller: str, bound_seconds: float, now_dt: datetime | None = None) -> dict:
+    """Record a --long hold on the caller's own live claim (E3):
+    the claim gains long_hold_until = now + the hold's bound, its
+    expiry extends to the hold's end when that is later (the
+    claim must live at least as long as the hold it evidences),
+    and the attach stamp refreshes. The hold is journaled in the
+    caller-claims journal. Strict, like a grant: a hold that
+    cannot be stored is not recorded — it raises — because an
+    unrecorded hold is exactly the invisible collision the cap
+    exists to prevent."""
+    now = _now(now_dt)
+    claim = read_sync_claim(repo, session, now)
+    if claim is None or claim.get("caller") != caller:
+        raise ValueError(f"no live sync claim by {caller!r} on session {session!r} to hold")
+    hold_until = now + timedelta(seconds=float(bound_seconds))
+    stored = {k: claim.get(k) for k in _CLAIM_FIELDS}
+    stored["long_hold_until"] = _iso(hold_until)
+    stored["last_attach_at"] = _iso(now)
+    expires = _parse(stored.get("expires_at"))
+    if expires is None or hold_until > expires:
+        stored["expires_at"] = _iso(hold_until)
+    _store_claim(repo, session, stored)
+    callers.append_caller_claim(repo, session, caller, "sync-long-hold")
     return {"session": session, **stored}
 
 
@@ -283,12 +438,27 @@ def sync_rights(repo: Path, session: str, caller: str | None, now_dt: datetime |
             "claim": claim,
         }
     auto = False
+    refresh_degraded = False
     if caller is not None and claim is None:
         claim = _grant(repo, session, caller, now)
         auto = True
     elif claim is not None:
-        claim = _refresh(repo, session, claim, now)
-    return {"allowed": True, "action": "sync-allowed", "claim": claim, "auto_claimed": auto}
+        # A refresh is best-effort (E12, decision 8): the claim
+        # already stands and was just read live; a failed refresh
+        # write degrades to the stored claim and journals the
+        # degradation — it never refuses a valid holder for a
+        # local write condition. A grant, above, stays strict:
+        # an unstored claim is not granted, and its write failure
+        # propagates to the wrapper's fail-closed verdict.
+        try:
+            claim = _refresh(repo, session, claim, now)
+        except Exception:  # noqa: BLE001
+            refresh_degraded = True
+            try:
+                callers.append_caller_claim(repo, session, caller, "sync-claim-refresh-degraded")
+            except Exception:  # noqa: BLE001
+                pass
+    return {"allowed": True, "action": "sync-allowed", "claim": claim, "auto_claimed": auto, "refresh_degraded": refresh_degraded}
 
 
 def claim_sync(repo: Path, session: str, caller: str | None, now_dt: datetime | None = None) -> dict:
