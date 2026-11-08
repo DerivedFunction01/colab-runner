@@ -589,7 +589,18 @@ def save_record(repo: Path, rec: dict) -> None:
     session = rec["session"]
     p = session_record_path(repo, session)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(rec, indent=2))
+    # Staged sibling + rename, never an in-place write: a writer
+    # whose write is denied mid-save (the sandbox write-denial
+    # flap truncates in-place targets, then refuses) must leave
+    # the standing record intact — a torn sibling is discarded
+    # and the failure surfaces to the caller instead.
+    tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(rec, indent=2))
+        os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     for other in _record_files(repo):
         if other == p:
             continue
