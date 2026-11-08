@@ -72,8 +72,9 @@ DEFAULT_READ_MAX_BYTES = 50 * 1024 * 1024
 # hashes the file in slices of this size, never the whole file.
 _READ_CHUNK = 64 * 1024
 
-# The bytes bytes.splitlines treats as line boundaries.
-_LINE_BOUNDARIES = frozenset(b"\n\r\v\f\x1c\x1d\x1e")
+# The only bytes bytes.splitlines treats as line boundaries
+# (the wider str.splitlines set never applies to bytes).
+_LINE_BOUNDARIES = frozenset(b"\n\r")
 
 
 def _open_read(path: Path):
@@ -83,10 +84,11 @@ def _open_read(path: Path):
 
 def _iter_lines(chunks):
     """Yield the lines of a byte stream, split exactly as
-    bytes.splitlines(keepends=True) splits — boundaries are \\n,
-    \\r, \\r\\n (one boundary), \\v, \\f, and \\x1c-\\x1e — from an
-    iterable of byte chunks. Only one partial line plus one chunk
-    is ever held: the file's line list is never materialized."""
+    bytes.splitlines(keepends=True) splits — the boundaries are
+    \\n, \\r, and \\r\\n (one boundary); bytes have no others —
+    from an iterable of byte chunks. Only one partial line plus
+    one chunk is ever held: the file's line list is never
+    materialized."""
     buf = bytearray()
     pos = 0  # scan cursor: buf[:pos] is the current line's scanned prefix
 

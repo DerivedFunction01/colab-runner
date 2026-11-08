@@ -388,17 +388,18 @@ def test_payload_read_streams_bounded_chunks_and_never_materializes(tmp_path, mo
 
 def test_payload_read_line_boundaries_match_splitlines(tmp_path):
     """The streaming splitter's line definition is bytes.splitlines'
-    own — \\r, \\r\\n, \\v, \\f, \\x1c-\\x1e all bound lines — including
-    a \\r\\n pair straddling the chunk seam."""
+    own — \\r, \\r\\n, and \\n bound lines, and nothing else does:
+    \\v, \\f, and \\x1c-\\x1e are str.splitlines boundaries, never
+    bytes ones — including a \\r\\n pair straddling the chunk seam."""
     payload = b"a\rb\r\nc\vd\fe\x1cf\x1dg\x1eh\nlast"
     target = tmp_path / "bounds.txt"
     target.write_bytes(payload)
     v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 0})
     assert v["ok"] is True
-    assert v["total_lines"] == len(payload.splitlines(keepends=True)) == 9
+    assert v["total_lines"] == len(payload.splitlines(keepends=True)) == 4
     assert base64.b64decode(v["content_b64"]) == payload
     v = fs_ops.run_spec({"op": "read", "path": str(target), "offset": 2, "max_lines": 2})
-    assert base64.b64decode(v["content_b64"]) == b"b\r\nc\v"
+    assert base64.b64decode(v["content_b64"]) == b"b\r\nc\vd\fe\x1cf\x1dg\x1eh\n"
     seam = tmp_path / "seam.txt"
     blob = b"x" * 65535 + b"\r\ny\n"  # the \r is chunk 1's last byte
     seam.write_bytes(blob)

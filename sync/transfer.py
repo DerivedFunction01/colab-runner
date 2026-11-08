@@ -225,7 +225,7 @@ def chunked_download(session: str, remote_name: str, dest: Path, progress=None) 
         f"REMOTE = {json.dumps(remote_name)}\n"
         "path = os.path.join(BASE, REMOTE)\n"
         "size = os.path.getsize(path)\n"
-        "CH = 32 * 1024 * 1024\n"
+        f"CH = {CHUNK}\n"
         "whole = hashlib.sha256()\n"
         "parts = []\n"
         "with open(path, 'rb') as f:\n"

@@ -90,8 +90,9 @@ class FakeColab:
             remote = json.loads(re.search(r'REMOTE = (".*?")', code).group(1))
             blob = self.remote[remote]
             parts = []
-            for i in range(0, len(blob), xfer.CHUNK):
-                c = blob[i:i + xfer.CHUNK]
+            ch = int(re.search(r"CH = (\d+)", code).group(1))
+            for i in range(0, len(blob), ch):
+                c = blob[i:i + ch]
                 name = f"{remote}.dl-{len(parts):03d}"
                 self.remote[name] = c
                 parts.append({"name": name, "size": len(c), "sha256": sha(c)})
@@ -178,6 +179,22 @@ def test_download_resume_skips_verified_local_parts(tmp_path, monkeypatch):
     r = xfer.chunked_download("s", "big.bin", dest)
     assert r["ok"] and r["resumed_parts"] == 4 and r["downloaded_parts"] == 0
     assert len(fake.download_calls) == calls_before
+
+
+def test_download_exhaustion_reports_stage_then_rerun_resumes(tmp_path, monkeypatch):
+    fake, local = harness(tmp_path, monkeypatch)
+    fake.remote["big.bin"] = CONTENT
+    fake.fail_downloads["big.bin.dl-002"] = 99  # part 2 never lands
+    dest = tmp_path / "down" / "big.bin"
+    r = xfer.chunked_download("s", "big.bin", dest)
+    assert not r["ok"] and r["stage"] == "download big.bin.dl-002" and r["attempts"] == xfer.PART_ATTEMPTS
+    fake.fail_downloads.clear()
+    calls_before = len(fake.download_calls)
+    r2 = xfer.chunked_download("s", "big.bin", dest)
+    # Parts 0-1 landed verified before the failure; part 3 was never attempted.
+    assert r2["ok"] and r2["resumed_parts"] == 2 and r2["downloaded_parts"] == 2
+    assert len(fake.download_calls) - calls_before == 2  # only the missing parts moved
+    assert dest.read_bytes() == CONTENT
 
 
 # --- bin/colab-xfer: the verb over the library ------------------------------
