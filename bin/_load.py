@@ -18,6 +18,7 @@ SourceFileLoader under the name "colab_run".
 """
 
 import importlib.util
+import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -32,8 +33,30 @@ def _exec(name: str, path: Path):
     return module
 
 
+def _exec_package(name: str, pkg_dir: Path):
+    """Load a package directory's __init__.py by path and exec it.
+
+    A package load must register the module in sys.modules before
+    exec: its leaves import each other relative to the package
+    name, and the import system resolves the parent through
+    sys.modules.
+    """
+    spec = importlib.util.spec_from_file_location(
+        name, pkg_dir / "__init__.py",
+        submodule_search_locations=[str(pkg_dir)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def sync(name: str, module_name: str | None = None):
-    """Load sync/<name>.py by path and exec it."""
+    """Load sync/<name>.py by path and exec it; when sync/<name>
+    is a package directory instead, load its __init__.py as a
+    package."""
+    pkg_dir = REPO / "sync" / name
+    if (pkg_dir / "__init__.py").is_file():
+        return _exec_package(module_name or name, pkg_dir)
     return _exec(module_name or name, REPO / "sync" / f"{name}.py")
 
 

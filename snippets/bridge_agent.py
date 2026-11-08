@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bridge agent: the in-VM half of the standing bridge
 (.plans/2026-11-01-lobby-bridge.md). Installed into the standing
-lease by the lease core (sync/lease.py's install_bridge_kit)
+lease by the lease core (sync/lease/bridge.py's install_bridge_kit)
 alongside _remote_guard.py, the bridge config, and the account
 token. Two modes:
 

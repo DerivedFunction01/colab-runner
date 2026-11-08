@@ -195,7 +195,7 @@ def main() -> int:
         rec["bundle_seed"] = {"repo": seed_repo_id, "dest": seed_dest, "sha256": seed_manifest["sha256"], "bytes": seed_manifest["bytes"], "snapshot_commit": seed_manifest["snapshot_commit"], "tree": seed_manifest["tree"]}
         save_record(rec)
     usage_before = colab("usage", timeout=120).stdout.strip()
-    # Lease model (sync/lease.py): adopt-or-acquire the shared session and
+    # Lease model (sync/lease/): adopt-or-acquire the shared session and
     # leave it up at the end; the reaper owns its lifecycle. With the lease
     # disabled in config, fall back to the original per-job session.
     use_lease = bool(lease.load_config(REPO).get("enabled"))

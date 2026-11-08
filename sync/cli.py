@@ -53,7 +53,7 @@ TOKEN_MIN_REFRESH_LEN = 20
 
 
 def _var_dir() -> Path:
-    # The lease core's var seam (sync/lease.py var_dir): the
+    # The lease core's var seam (sync/lease/foundation.py var_dir): the
     # COLAB_RUNNER_VAR override, else this repo's var/. Mirrored
     # here so the funnel carries no lease import; the auth-required
     # marker is the only var/ state the guard touches.

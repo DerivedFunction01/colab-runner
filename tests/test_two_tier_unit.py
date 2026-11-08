@@ -18,8 +18,12 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+import sys
+spec = importlib.util.spec_from_file_location(
+    "lease", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease = importlib.util.module_from_spec(spec)
+sys.modules["lease"] = lease
 spec.loader.exec_module(lease)
 
 import pytest
@@ -43,7 +47,7 @@ def repo(tmp_path, monkeypatch):
 def gate_permissive(monkeypatch):
     """Session shape gate: permissive fixture state, declared
     explicitly (see test_lease_unit.gate_permissive)."""
-    monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
+    monkeypatch.setattr(lease.gate, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
 
 
 def cp(stdout="", rc=0):
@@ -165,7 +169,7 @@ def test_extend_grant_inactive_when_expired(repo, tmp_path, monkeypatch):
 def test_write_grant_records_scope_snapshot(repo, tmp_path, monkeypatch):
     cfg = lease.load_config(repo)
     cfg = {**cfg, "daily_cu_budget": 42, "monthly_cu_budget": 4242, "standing": {**cfg.get("standing", {}), "daily_cu_cap": 2.0}}
-    monkeypatch.setattr(lease, "load_config", lambda repo: cfg)
+    monkeypatch.setattr(lease.foundation, "load_config", lambda repo: cfg)
     out = lease.write_grant(repo, 8, burst_shape="cpu-highram", now_dt=T0)
     grant = out["grant"]
     # The grant's granted_at is its envelope id.
@@ -181,12 +185,12 @@ def test_write_grant_records_scope_snapshot(repo, tmp_path, monkeypatch):
 
 def test_extend_grant_moves_window_only_scope_frozen(repo, tmp_path, monkeypatch):
     cfg = {**lease.load_config(repo), "daily_cu_budget": 42}
-    monkeypatch.setattr(lease, "load_config", lambda repo: cfg)
+    monkeypatch.setattr(lease.foundation, "load_config", lambda repo: cfg)
     lease.write_grant(repo, 8, now_dt=T0)
     scope_before = lease.load_grant(repo)["scope"]
     # Config caps move after the grant: the recorded scope must not.
     cfg2 = {**cfg, "daily_cu_budget": 7, "monthly_cu_budget": 70}
-    monkeypatch.setattr(lease, "load_config", lambda repo: cfg2)
+    monkeypatch.setattr(lease.foundation, "load_config", lambda repo: cfg2)
     out = lease.extend_grant(make_stub(set()), repo, 2, now_dt=T0)
     assert out["action"] == "grant-extended"
     grant = lease.load_grant(repo)
@@ -243,7 +247,7 @@ def test_budget_check_caps_override_replaces_live_caps(repo, tmp_path, monkeypat
 
 def _cfg_holder(monkeypatch, repo, **over):
     holder = {"cfg": {**lease.load_config(repo), **over}}
-    monkeypatch.setattr(lease, "load_config", lambda repo: holder["cfg"])
+    monkeypatch.setattr(lease.foundation, "load_config", lambda repo: holder["cfg"])
     return holder
 
 

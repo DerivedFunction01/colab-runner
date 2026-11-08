@@ -37,8 +37,11 @@ spec.loader.exec_module(cr)
 
 TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
 
-spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+spec_l = importlib.util.spec_from_file_location(
+    "lease", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease = importlib.util.module_from_spec(spec_l)
+sys.modules["lease"] = lease
 spec_l.loader.exec_module(lease)
 
 spec_r = importlib.util.spec_from_file_location("repo_registry", REPO / "sync" / "repo_registry.py")
@@ -110,7 +113,7 @@ def main() -> int:
     manifest = json.loads(bundle.stdout)
     bundle_path = Path(manifest["bundle"])
     repo_url = subprocess.run(["git", "-C", str(local_checkout), "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
-    # Lease model (sync/lease.py): share the shape's lease session and
+    # Lease model (sync/lease/): share the shape's lease session and
     # leave it up; a per-run session only when the lease is disabled.
     use_lease = bool(lease.load_config(REPO).get("enabled"))
     lease_id = f"check-{int(time.time())}"

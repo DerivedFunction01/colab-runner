@@ -68,7 +68,7 @@ def record(probe: str, data: dict) -> Path:
 # endpoint answers 411 Length Required (diagnosed 2026-11-04), so the
 # client's own two steps (GET for the XSRF token, then POST) are
 # replayed with an explicit empty-JSON body attached. Same form as
-# sync/lease.py's UNASSIGN_FALLBACK_SCRIPT.
+# sync/lease/sessions.py's UNASSIGN_FALLBACK_SCRIPT.
 _UNASSIGN_SCRIPT = """
 import os
 from urllib.parse import urljoin

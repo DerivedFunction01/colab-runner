@@ -12,7 +12,7 @@ shape is ever named by them — the name is an identifier, nothing
 more.
 
 This module is pure: it knows nothing of the lease's state files.
-sync/lease.py assembles the taken set and owns the journals.
+sync/lease/ assembles the taken set and owns the journals.
 """
 
 import random

@@ -2,7 +2,7 @@
 """Renewal kit: the in-VM half of window-lease renewal (driver 1).
 
 Installed into a renew-flagged lease's session by the lease core
-(sync/lease.py's install_renewal_kit) alongside _remote_guard.py, the
+(sync/lease/renewal.py's install_renewal_kit) alongside _remote_guard.py, the
 window config (renewal.json), and the account token. Two modes:
 
   --setup   one-shot: place the staged token at its canonical path

@@ -9,8 +9,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-_spec = importlib.util.spec_from_file_location("lease_mod", REPO / "sync" / "lease.py")
+import sys
+_spec = importlib.util.spec_from_file_location(
+    "lease_mod", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease_mod = importlib.util.module_from_spec(_spec)
+sys.modules["lease_mod"] = lease_mod
 _spec.loader.exec_module(lease_mod)
 
 

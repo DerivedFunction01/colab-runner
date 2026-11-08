@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin CLI over sync/lease.py — the shared-session lease.
+"""Thin CLI over sync/lease/ — the shared-session lease.
 
 Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG] [--create]|extend SESSION --hours H [--caller TAG]|adopt SESSION [--deadline ISO|--hours H] [--caller TAG] [--shape ID]|shorten SESSION (--deadline ISO|--hours H) [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
@@ -42,8 +42,11 @@ spec = importlib.util.spec_from_loader("colab_run", SourceFileLoader("colab_run"
 cr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cr)
 
-spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+spec_l = importlib.util.spec_from_file_location(
+    "lease", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease = importlib.util.module_from_spec(spec_l)
+sys.modules["lease"] = lease
 spec_l.loader.exec_module(lease)
 
 TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"

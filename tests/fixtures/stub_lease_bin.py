@@ -14,7 +14,7 @@ with exit 1 (a core refusal).
 $STUB_SHORTEN_REFUSE=1 makes `shorten` answer shorten-not-earlier
 with exit 1 (a core refusal).
 
-The `state` shape mirrors sync/lease.py's state() exactly: records
+The `state` shape mirrors sync/lease/state.py's state() exactly: records
 are status entries wrapping the lease record (keyed by session),
 the budget carries its caps, and every spec carries its catalog
 label.

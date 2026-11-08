@@ -15,8 +15,11 @@ spec = importlib.util.spec_from_loader("colab_run", SourceFileLoader("colab_run"
 cr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cr)
 
-spec_l = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+spec_l = importlib.util.spec_from_file_location(
+    "lease", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease = importlib.util.module_from_spec(spec_l)
+sys.modules["lease"] = lease
 spec_l.loader.exec_module(lease)
 
 spec_g = importlib.util.spec_from_file_location("extend_guard", REPO / "sync" / "extend_guard.py")

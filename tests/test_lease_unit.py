@@ -15,8 +15,12 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("lease", REPO / "sync" / "lease.py")
+import sys
+spec = importlib.util.spec_from_file_location(
+    "lease", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease = importlib.util.module_from_spec(spec)
+sys.modules["lease"] = lease
 spec.loader.exec_module(lease)
 
 _fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
@@ -43,7 +47,7 @@ def gate_permissive(monkeypatch):
     permissive fixture state explicitly — the same explicit
     disable a fixture-owned config would carry. The gate's own
     tests live in test_lease_fake."""
-    monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
+    monkeypatch.setattr(lease.gate, "session_gate_policy", lambda repo: {"enabled": False, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"})
 
 
 def cp(stdout="", rc=0):
@@ -361,7 +365,7 @@ def test_release_guard_aborts_when_deadline_moved_on_disk(repo, tmp_path, monkey
             rec = dict(rec, deadline="2026-10-30T05:00:00+00:00")
         return rec
 
-    monkeypatch.setattr(lease, "load_record", moved_load)
+    monkeypatch.setattr(lease.records, "load_record", moved_load)
     calls = []
 
     def stub(*a, **k):
@@ -1229,16 +1233,16 @@ def _stop_harness(monkeypatch, tmp_path, *, stop_rc, alive, unassign_rc):
 
     binding = tmp_path / "sessions.json"
     binding.write_text(json.dumps({"sess": {"endpoint": "m-s-fake-endpoint"}}))
-    monkeypatch.setattr(lease, "local_sessions_path", lambda: binding)
-    monkeypatch.setattr(lease, "session_alive", lambda c, s: alive)
-    monkeypatch.setattr(lease, "time", SimpleNamespace(sleep=lambda s: None))
+    monkeypatch.setattr(lease.sessions, "local_sessions_path", lambda: binding)
+    monkeypatch.setattr(lease.sessions, "session_alive", lambda c, s: alive)
+    monkeypatch.setattr(lease.sessions, "time", SimpleNamespace(sleep=lambda s: None))
     calls = []
 
     def fake_run(args, **kwargs):
         calls.append(args)
         return cp(rc=unassign_rc)
 
-    monkeypatch.setattr(lease, "subprocess", SimpleNamespace(run=fake_run))
+    monkeypatch.setattr(lease.sessions, "subprocess", SimpleNamespace(run=fake_run))
 
     def colab(*args, **kwargs):
         return cp(rc=stop_rc)
@@ -1273,7 +1277,10 @@ def test_no_raw_unassign_call_remains():
     """The bodiless-POST defect (411, 2026-11-04) lived in three raw
     call sites; none may return. The sanctioned form replays the
     client's two-step flow with a body attached."""
-    for rel in ("sync/lease.py", "probes/_driver.py", "snippets/unassign_orphans.py"):
+    lease_src = "".join(
+        p.read_text() for p in sorted((REPO / "sync" / "lease").glob("*.py")))
+    assert "client.unassign(" not in lease_src
+    for rel in ("probes/_driver.py", "snippets/unassign_orphans.py"):
         assert "client.unassign(" not in (REPO / rel).read_text(), rel
     assert 'data=b"{}"' in lease.UNASSIGN_FALLBACK_SCRIPT
 
@@ -1292,8 +1299,8 @@ STANDARD = {"high_mem": False}
 
 def _authority_fixture(tmp_path, monkeypatch, enabled=True):
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
-    monkeypatch.setattr(lease, "session_gate_policy", lambda repo: {"enabled": enabled, "agent_classes": ["high_ram"], "bypass_actors": ["panel", "test"], "infra_actor": "standing"})
-    monkeypatch.setattr(lease, "load_config", lambda repo: {"standing": {"shape": "cpu"}})
+    monkeypatch.setattr(lease.gate, "session_gate_policy", lambda repo: {"enabled": enabled, "agent_classes": ["high_ram"], "bypass_actors": ["panel", "test"], "infra_actor": "standing"})
+    monkeypatch.setattr(lease.foundation, "load_config", lambda repo: {"standing": {"shape": "cpu"}})
     monkeypatch.delenv("COLAB_LEASE_ACTOR", raising=False)
 
 
@@ -1364,7 +1371,7 @@ def test_state_serves_extend_guard_policy_and_verdicts(tmp_path):
 
 
 def test_session_state_retries_a_transient_failure(monkeypatch):
-    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    monkeypatch.setattr(lease.sessions, "_SESSION_READ_BACKOFF_S", (0, 0))
     calls = {"n": 0}
 
     def flaky(*a, **k):
@@ -1379,7 +1386,7 @@ def test_session_state_retries_a_transient_failure(monkeypatch):
 
 
 def test_session_state_unknown_only_after_exhausted_retries(monkeypatch):
-    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    monkeypatch.setattr(lease.sessions, "_SESSION_READ_BACKOFF_S", (0, 0))
 
     def dead(*a, **k):
         raise subprocess.TimeoutExpired("colab", 120)
@@ -1390,14 +1397,14 @@ def test_session_state_unknown_only_after_exhausted_retries(monkeypatch):
 
 
 def test_session_state_empty_output_retries_then_unknown(monkeypatch):
-    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    monkeypatch.setattr(lease.sessions, "_SESSION_READ_BACKOFF_S", (0, 0))
     diag = {}
     assert lease.session_state(lambda *a, **k: cp(""), "lilac-reef-93", diag) == "unknown"
     assert diag == {"attempts": 3, "read_error": "empty-output"}
 
 
 def test_session_state_auth_prompt_is_not_retried(monkeypatch):
-    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    monkeypatch.setattr(lease.sessions, "_SESSION_READ_BACKOFF_S", (0, 0))
     calls = {"n": 0}
 
     def prompt(*a, **k):
@@ -1410,7 +1417,7 @@ def test_session_state_auth_prompt_is_not_retried(monkeypatch):
 
 
 def test_extend_unknown_carries_the_read_error(repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(lease, "_SESSION_READ_BACKOFF_S", (0, 0))
+    monkeypatch.setattr(lease.sessions, "_SESSION_READ_BACKOFF_S", (0, 0))
     seed_record(repo)
 
     def boom(*a, **k):
@@ -1651,7 +1658,7 @@ def seed_accelerator_catalog(repo):
 def plant_highram_binding(tmp_path, monkeypatch, session):
     binding = tmp_path / "sessions-binding.json"
     binding.write_text(json.dumps({session: {"endpoint": "https://m-hm-fake.prod.r.colab.dev"}}))
-    monkeypatch.setattr(lease, "local_sessions_path", lambda: binding)
+    monkeypatch.setattr(lease.sessions, "local_sessions_path", lambda: binding)
 
 
 def test_adopt_orphan_shape_ambiguous_refuses_with_candidates(repo, tmp_path, monkeypatch):

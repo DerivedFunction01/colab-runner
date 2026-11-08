@@ -204,8 +204,11 @@ def test_reap_renews_window_lease_with_fresh_session(tmp_path):
 
 import importlib.util
 
-_spec = importlib.util.spec_from_file_location("lease_mod", REPO / "sync" / "lease.py")
+_spec = importlib.util.spec_from_file_location(
+    "lease_mod", REPO / "sync" / "lease" / "__init__.py",
+    submodule_search_locations=[str(REPO / "sync" / "lease")])
 lease_mod = importlib.util.module_from_spec(_spec)
+sys.modules["lease_mod"] = lease_mod
 _spec.loader.exec_module(lease_mod)
 
 PNOW = datetime(2026, 10, 29, 18, 0, tzinfo=timezone.utc)
@@ -921,7 +924,7 @@ def test_release_session_stops_strays_and_refuses_records(tmp_path, monkeypatch)
     out = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW)
     session = out["record"]["session"]
     lease_mod.save_unattributed(repo, {"stray": {"first_seen": PNOW.isoformat(), "endpoint": None, "shape_class": None}})
-    monkeypatch.setattr(lease_mod, "stop_session_safe", lambda colab, session: "stopped")
+    monkeypatch.setattr(lease_mod.sessions, "stop_session_safe", lambda colab, session: "stopped")
     out = lease_mod.release_session(fake, repo, "stray")
     assert out["action"] == "session-released" and out["stop"] == "stopped"
     assert lease_mod.load_unattributed(repo) == {}
