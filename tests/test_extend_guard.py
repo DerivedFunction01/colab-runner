@@ -197,3 +197,41 @@ def test_guard_treats_lease_normally_after_operator_extend(tmp_path, monkeypatch
     assert code == 0
     mine = [line for line in lines if line["session"] == session]
     assert len(mine) == 1 and mine[0]["action"] == "extended"
+
+
+# --- detached work is in-flight work (E8) ---
+
+
+def _plant_detached(repo, did, session, state):
+    det_dir = repo / "results" / "detached"
+    det_dir.mkdir(parents=True, exist_ok=True)
+    (det_dir / f"{did}.json").write_text(json.dumps({
+        "id": did, "session": session, "caller": "alpha", "state": state,
+        "exit_code": None if state == "running" else 0,
+        "started_at": PNOW.isoformat(),
+        "finished_at": None if state == "running" else PNOW.isoformat(),
+    }))
+
+
+def test_inflight_sessions_count_running_detached_records(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    _plant_detached(repo, "d-run", "det-lease-1", "running")
+    _plant_detached(repo, "d-done", "det-lease-2", "complete")
+    inflight = guard_mod._inflight_sessions(repo)
+    assert "det-lease-1" in inflight and "det-lease-2" not in inflight
+
+
+def test_guard_active_only_extends_a_lease_with_detached_work(tmp_path, monkeypatch):
+    """An idle-by-last-used lease whose only work is a detached
+    launch in flight is active work, not idle: under an
+    active-only policy it extends (the same lease without the
+    detached record is the skipped-idle case the suite already
+    pins)."""
+    repo = scratch_repo(tmp_path, monkeypatch)
+    _craft(repo, "det-lease-1", last_used_h=5)
+    _plant_detached(repo, "d1", "det-lease-1", "running")
+    fake = FakeColab(alive={"det-lease-1"})
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW, policy=_policy(shapes={"cpu": "active-only"}))
+    assert code == 0
+    mine = [line for line in lines if line["session"] == "det-lease-1"]
+    assert len(mine) == 1 and mine[0]["action"] == "extended"

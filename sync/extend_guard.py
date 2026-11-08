@@ -99,6 +99,18 @@ def _inflight_sessions(repo: Path) -> set:
                 continue
             if rec.get("state") in ("starting", "running", "polling") and rec.get("session"):
                 out.add(rec["session"])
+    # Detached shell work (E8) is in-flight work beside the runs:
+    # a session busy with a detached launch is not idle, whatever
+    # its run records say.
+    detached = repo / "results" / "detached"
+    if detached.is_dir():
+        for path in detached.glob("*.json"):
+            try:
+                rec = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if rec.get("state") == "running" and rec.get("session"):
+                out.add(rec["session"])
     return out
 
 
