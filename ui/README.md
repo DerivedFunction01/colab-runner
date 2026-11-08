@@ -32,8 +32,9 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
   over the served rate table.
 - `GET /api/state` — core `state` JSON plus `caps` read from
   `config/lease.json`.
-- Mutations are `POST` calls for lease start/stop/extend, access
-  release, grant/extend/ungrant, budget config, and server restart;
+- Mutations are `POST` calls for lease start/stop/extend/adopt/
+  shorten, access release, grant/extend/ungrant, budget config,
+  and server restart;
   the full mapping is the Artifact data plane section below.
   The spec pickers (normal mode, and the burst tier in
   two-tier mode) are rendered from the core's `state.specs` list —
@@ -102,10 +103,22 @@ endpoint, JSON in/out:
 
 - `state` — `GET /api/state` → core state JSON plus `caps`;
   `GET /api/state/<part>` serves one portion (`records`, `specs`,
-  `budget`, `grant`, `meta`), and portions fail alone.
+  `budget`, `grant`, `meta`, `orphans`), and portions fail alone.
+  The `orphans` portion is the orphan census: live sessions with
+  no lease record, each carrying its derived deadline and the
+  evidence behind it.
 - `start` `{shape, hours}` — `POST /api/lease/start` → core result.
 - `stop` `{session}` — `POST /api/lease/stop` → core result.
 - `extend` `{session, hours}` — `POST /api/lease/extend` → core result.
+- `adopt` `{session, deadline?, hours?, shape?}` — `POST /api/lease/adopt`
+  → core result. With neither deadline nor hours the derived
+  evidence plants itself; `shape` names the catalog shape for a
+  class-ambiguous orphan. A core refusal answers 409 with the
+  verdict.
+- `shorten` `{session, hours}` or `{session, deadline}` —
+  `POST /api/lease/shorten` → core result. Exactly one target:
+  pull the deadline in by hours, or set it to the ISO deadline.
+  A core refusal answers 409 with the verdict.
 - `release` `{session}` — `POST /api/access/release` → core result
   (the unattributed-session release).
 - `grant` `{hours, burst?}` — `POST /api/grant` → core result.

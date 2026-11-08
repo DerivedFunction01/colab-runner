@@ -21,6 +21,15 @@ const EXT_DURATIONS = [1, 2, 4, 8, 12, 16, 24, 48, 72];
 const extHours = {}; // state key -> hours
 const extOpen = new Set(); // state keys whose picker is open
 
+/* Shorten pickers (lease cards): open state, the chosen pull-in
+ * hours and any absolute-deadline draft live outside the render,
+ * the same rule as the extend pickers. The last input touched
+ * wins: choosing hours clears the deadline draft, and typing a
+ * deadline supersedes the hours. */
+const shortOpen = new Set(); // sessions whose shorten picker is open
+const shortHours = {}; // session -> hours
+const shortDeadline = {}; // session -> datetime-local string
+
 /* Budget cap editor: open state and the typed drafts live outside
  * the render (same rule as the extend pickers), so a poll re-render
  * never loses them. A draft is the input's string; "" means no cap. */
@@ -83,6 +92,23 @@ async function api(path, body) {
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
   return data;
+}
+
+/* Adopt and shorten answer a core refusal as 409 with the
+ * verdict JSON in the body; api() would reduce that to
+ * "HTTP 409" and lose the reason, so their callers post through
+ * apiResult: the parsed body returns on 200 and 409 alike, and
+ * only a request error (400) or an unreachable core (502)
+ * throws, with the server's error text. */
+async function apiResult(path, body) {
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (resp.ok || resp.status === 409) return data;
+  throw new Error(data.error || `HTTP ${resp.status}`);
 }
 
 function notice(msg) {
@@ -280,6 +306,122 @@ function reportExtend(res, kind, key) {
   }
 }
 
+/* The shorten picker: extend's mirror on the lease cards. The
+ * operator picks a pull-in from the shared duration set (chips +
+ * custom hours) or an absolute deadline (a datetime-local input,
+ * read as local wall-clock and posted as an ISO instant); the
+ * apply posts through apiResult and the refusal text reads the
+ * verdict's action, as reportExtend does for extend. */
+function shortenPickerHTML(session) {
+  const hours = shortHours[session] ?? 8;
+  const deadline = shortDeadline[session] || "";
+  const chips = EXT_DURATIONS.map((h) =>
+    `<button type="button" data-shours="${h}" class="${h === hours && !deadline ? "selected" : ""}">${h === 24 ? "24h" : fmtDur(h)}</button>`).join("");
+  return `<div class="extend-box shorten-box">
+    <div class="chips" data-shortpicker="${esc(session)}">
+      ${chips}
+      <input class="custom" data-scustom type="number" min="0.25" step="0.25" placeholder="Custom (hours)">
+    </div>
+    <div class="deadline-row">
+      <span class="lab">or end at</span>
+      <input class="deadline-input" data-sdeadline type="datetime-local" value="${esc(deadline)}">
+    </div>
+    <button type="button" class="primary block" data-sapply="${esc(session)}" style="margin-top:10px">${deadline ? "Shorten to the chosen time" : `Shorten by ${esc(fmtDur(hours))}`}</button>
+  </div>`;
+}
+
+function shortenRefusalText(res) {
+  switch (res.action) {
+    case "shorten-deadline-past":
+      return "that target has already passed — Terminate ends the lease now";
+    case "shorten-not-earlier":
+      return "that is not earlier than the current deadline — Extend moves it later";
+    case "shorten-standing-managed":
+      return "the standing lease is grant-managed — its deadline follows the grant";
+    case "shorten-unknown":
+      return "session state unreadable — nothing changed";
+    case "shorten-no-lease":
+      return "no live lease to shorten";
+    case "lease-disabled":
+      return "the lease is disabled in config";
+    default:
+      return res.action || "failed";
+  }
+}
+
+function reportShorten(res, session) {
+  if (res.action === "shortened") {
+    shortOpen.delete(session);
+    delete shortDeadline[session];
+    notice(`Shortened — new deadline ${fmtTime(res.new_deadline)}`);
+  } else {
+    notice(`Shorten refused: ${shortenRefusalText(res)}`);
+  }
+}
+
+function wireShortenPickers(container) {
+  container.querySelectorAll("[data-shortpicker]").forEach((row) => {
+    const session = row.getAttribute("data-shortpicker");
+    row.querySelectorAll("button[data-shours]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        shortHours[session] = parseFloat(btn.getAttribute("data-shours"));
+        delete shortDeadline[session];
+        renderLeases();
+      });
+    });
+    const custom = row.querySelector("[data-scustom]");
+    if (custom) {
+      custom.addEventListener("input", (e) => {
+        const v = parseFloat(e.target.value);
+        if (v > 0) {
+          shortHours[session] = v;
+          delete shortDeadline[session];
+          row.querySelectorAll("button").forEach((b) => b.classList.remove("selected"));
+          const box = row.closest(".shorten-box");
+          const apply = box && box.querySelector("[data-sapply]");
+          if (apply) apply.textContent = `Shorten by ${fmtDur(v)}`;
+          const dl = box && box.querySelector("[data-sdeadline]");
+          if (dl) dl.value = "";
+        }
+      });
+    }
+  });
+  container.querySelectorAll("[data-sdeadline]").forEach((input) => {
+    input.addEventListener("input", (e) => {
+      const box = e.target.closest(".shorten-box");
+      const apply = box && box.querySelector("[data-sapply]");
+      if (!apply) return;
+      const session = apply.getAttribute("data-sapply");
+      if (e.target.value) {
+        shortDeadline[session] = e.target.value;
+        box.querySelectorAll("button[data-shours]").forEach((b) => b.classList.remove("selected"));
+        apply.textContent = "Shorten to the chosen time";
+      } else {
+        delete shortDeadline[session];
+        apply.textContent = `Shorten by ${fmtDur(shortHours[session] ?? 8)}`;
+      }
+    });
+  });
+  container.querySelectorAll("[data-sapply]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const session = btn.getAttribute("data-sapply");
+      const body = { session };
+      const dl = shortDeadline[session];
+      if (dl) {
+        const when = new Date(dl);
+        if (Number.isNaN(when.getTime())) {
+          notice("Shorten refused: the chosen time is not a valid time");
+          return;
+        }
+        body.deadline = when.toISOString();
+      } else {
+        body.hours = shortHours[session] ?? 8;
+      }
+      act(btn, async () => reportShorten(await apiResult("/api/lease/shorten", body), session));
+    });
+  });
+}
+
 function wireExtendPickers(container) {
   container.querySelectorAll("[data-extpicker]").forEach((row) => {
     const [kind, key] = row.getAttribute("data-extpicker").split(":");
@@ -334,7 +476,9 @@ function renderLeases() {
       <p class="kvline">Heartbeat <b>${age == null ? "unknown" : `${Math.round(age)}s ago`}</b> · Pulse <b>${esc(pulse || "—")}</b> · Burn <b>${esc(burn)}</b></p>
       <button type="button" class="danger" data-stop="${esc(session)}">Terminate</button>
       <button type="button" class="ghost" data-xtoggle="${esc(session)}">Extend</button>
+      <button type="button" class="ghost" data-stoggle="${esc(session)}">Shorten</button>
       ${extOpen.has(extKey("lease", session)) ? extendPickerHTML("lease", session) : ""}
+      ${shortOpen.has(session) ? shortenPickerHTML(session) : ""}
     </div>`;
   }).join("");
   box.querySelectorAll("[data-stop]").forEach((btn) => {
@@ -351,7 +495,15 @@ function renderLeases() {
       renderLeases();
     });
   });
+  box.querySelectorAll("[data-stoggle]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const session = btn.getAttribute("data-stoggle");
+      if (shortOpen.has(session)) shortOpen.delete(session); else shortOpen.add(session);
+      renderLeases();
+    });
+  });
   wireExtendPickers(box);
+  wireShortenPickers(box);
 }
 
 function renderAccess() {
@@ -673,6 +825,12 @@ function renderSections(names) {
     renderControls();
   }
   if (names.includes("grant")) renderGrant();
+  // renderOrphans lives in orphans.js (loaded after this file);
+  // the specs portion landing re-renders it because the orphan
+  // cards label shapes and candidates from the served catalog.
+  if ((names.includes("orphans") || names.includes("specs")) && typeof renderOrphans === "function") {
+    renderOrphans();
+  }
 }
 
 /* ---------- controls wiring ---------- */
@@ -737,6 +895,7 @@ const PARTS = {
   specs: { url: "/api/state/specs", cadence: 60000 },
   budget: { url: "/api/state/budget", cadence: 30000 },
   grant: { url: "/api/state/grant", cadence: 60000 },
+  orphans: { url: "/api/state/orphans", cadence: 15000 },
   logs: { url: "/api/outbox?after=0", cadence: 15000 },
 };
 const partState = {};
@@ -746,7 +905,7 @@ for (const name of Object.keys(PARTS)) {
 
 function mergeParts() {
   const merged = {};
-  for (const name of ["records", "specs", "budget", "grant"]) {
+  for (const name of ["records", "specs", "budget", "grant", "orphans"]) {
     if (partState[name].data) Object.assign(merged, partState[name].data);
   }
   S = merged;

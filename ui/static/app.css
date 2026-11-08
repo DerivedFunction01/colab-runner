@@ -59,8 +59,10 @@ body { margin: 0; }
 #slot-budget { order: 1; }
 #slot-control { order: 2; }
 #slot-leases { order: 3; }
+#slot-orphans { order: 3; }
+#slot-orphans[hidden] { display: none; }
 #slot-events { order: 4; }
-#slot-leases, #slot-events, #slot-budget, #slot-control { min-width: 0; }
+#slot-leases, #slot-orphans, #slot-events, #slot-budget, #slot-control { min-width: 0; }
 
 @media (min-width: 1024px) {
   .page { max-width: 1200px; }
@@ -270,6 +272,26 @@ button.block { display: block; width: 100%; min-height: 40px; font-size: var(--w
 
 .extend-box { margin-top: var(--wb-space-12); }
 .extend-box .chips { margin-top: 0; }
+
+/* ---- shorten picker (lease cards): the absolute-deadline row ---- */
+
+.deadline-row {
+  display: flex;
+  gap: var(--wb-space-8);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: var(--wb-space-8);
+}
+.deadline-input {
+  border: 1px dashed var(--wb-border-strong);
+  border-radius: var(--wb-radius-pill);
+  background: transparent;
+  color: var(--wb-content-primary);
+  font-family: var(--wb-font-ui);
+  font-size: var(--wb-font-size-sm);
+  padding: 4px 14px;
+  min-height: 30px;
+}
 
 /* ---- budget cap editor ---- */
 

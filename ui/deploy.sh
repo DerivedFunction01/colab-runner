@@ -41,7 +41,7 @@ space_json() {
 JSON
 }
 
-CLIENT_FILES="index.html theme.css app.css app.js colab-icon.svg"
+CLIENT_FILES="index.html theme.css app.css app.js orphans.js colab-icon.svg"
 # Generated icon PNGs (ui/make-icon-png.sh) ship when they exist; the
 # SVG is the tracked source and the only required icon file.
 OPTIONAL_CLIENT_FILES="colab-icon-192.png colab-icon-512.png colab-icon-180.png"
