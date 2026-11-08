@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ui/deploy.sh — deploy or check the Colab Lease artifact.
 # Contract and deploy story: ui/README.md. `check` is read-only and
-# exits 3 on any drift. A full deploy gates first, syncs sources to
+# exits 3 on any drift. A full deploy syncs sources to
 # $LEASE_UI_RUNTIME_DIR, then publishes via the hatchlet CLI when
 # present; without one it prints the builder request and exits 4.
+# Deploy never runs tests: the suite runs on Colab and gates the
+# commit long before a deploy happens.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"
 RUNTIME="${LEASE_UI_RUNTIME_DIR:-}"
 if [ -z "$RUNTIME" ]; then
   echo "deploy: LEASE_UI_RUNTIME_DIR is not set — point it at the deployed runtime dir" >&2
@@ -15,14 +16,11 @@ if [ -z "$RUNTIME" ]; then
 fi
 HATCHLET="${HATCHLET:-hatchlet}"
 
-SKIP_GATE=0
 CHECK=0
-if [ "${1:-}" = "--skip-gate" ]; then
-  SKIP_GATE=1
-elif [ "${1:-}" = "check" ]; then
+if [ "${1:-}" = "check" ]; then
   CHECK=1
 elif [ -n "${1:-}" ]; then
-  echo "usage: ui/deploy.sh [--skip-gate|check]" >&2
+  echo "usage: ui/deploy.sh [check]" >&2
   exit 2
 fi
 
@@ -92,16 +90,6 @@ if [ "$CHECK" -eq 1 ]; then
   fi
   echo "check: drift present — run ui/deploy.sh to re-sync" >&2
   exit 3
-fi
-
-if [ "$SKIP_GATE" -eq 0 ]; then
-  step "gate — UI + lease core tests"
-  if ! (cd "$ROOT" && ~/.local/bin/uvx pytest tests/test_ui_server.py tests/test_lease_fake.py tests/test_two_tier_fake.py tests/test_auto_fake.py -q); then
-    echo "deploy: gate is RED — not deploying, not publishing" >&2
-    exit 1
-  fi
-else
-  step "gate — SKIPPED (--skip-gate)"
 fi
 
 step "deploy — sync artifact sources to $RUNTIME"

@@ -146,7 +146,7 @@ The same page is published to the operator's artifacts library as
 **Colab Lease** (slug `colab-lease-2`), a fullstack artifact whose
 server-side actions proxy this companion server — the phone-friendly
 surface; this localhost page remains the local one. Redeploy with
-`bash ui/deploy.sh`: gate (tests) → sync the artifact sources to
+`bash ui/deploy.sh`: sync the artifact sources to
 the runtime dir (`$LEASE_UI_RUNTIME_DIR`) → publish step (builder pass via
 the hatchlet CLI when present, otherwise the script prints the exact
 builder request and exits 4, workbench-style). The data-plane
