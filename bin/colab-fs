@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# colab-fs — write/patch/delete/read files on a Colab session.
+#
+#   colab-fs write  -s SESSION PATH (--from LOCALFILE | --stdin)
+#   colab-fs patch  -s SESSION PATH (--old TEXT --new TEXT | --old-file F --new-file F)
+#   colab-fs delete -s SESSION PATH [--missing-ok]
+#   colab-fs read   -s SESSION PATH [--offset N] [--max-lines N]
+#
+# A read is paged: --offset is the 1-based first line (default 1)
+# and --max-lines caps the lines returned (default
+# $COLAB_FS_READ_MAX_LINES or 900; 0 means no cap) — a monolith
+# read is never the default; the verdict on stderr reports
+# total_lines and whether the window was truncated.
+#
+# The session comes from -s or $COLAB_SH_SESSION (bin/colab-sh's
+# convention); the tool never creates a session — it rides
+# bin/colab-sh, which attaches to live sessions only. One stdin
+# stream goes to colab-sh: it plants snippets/fs_ops.py (base64,
+# read from this repo at runtime) at an in-session temp path and
+# runs it with one JSON spec as its stdin. Text and content travel
+# base64 so the spec survives the channel byte-exact; the path is
+# a plain JSON string, so a path containing a double quote or a
+# backslash is refused. The driver itself writes no local files.
+#
+# write/patch/delete print the payload's one-line JSON verdict on
+# stdout; read decodes the verdict's content to stdout and puts
+# the verdict on stderr. The exit code is the payload's: 0 ok,
+# 1 not ok, 2 usage error.
+
+set -u
+
+usage() {
+    printf 'usage: colab-fs write|patch|delete|read -s SESSION PATH [options]\n' >&2
+    exit 2
+}
+
+b64() { base64 | tr -d '\n'; }
+
+[ $# -ge 1 ] || usage
+op=$1
+shift
+case $op in
+    write | patch | delete | read) ;;
+    *) usage ;;
+esac
+
+session=${COLAB_SH_SESSION:-}
+path=
+from_file=
+use_stdin=0
+old_text=
+new_text=
+old_set=0
+new_set=0
+old_file=
+new_file=
+missing_ok=0
+read_offset=1
+read_max_lines=${COLAB_FS_READ_MAX_LINES:-900}
+paging_set=0
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -s)
+            [ $# -ge 2 ] || usage
+            session=$2
+            shift 2
+            ;;
+        --from)
+            [ $# -ge 2 ] || usage
+            from_file=$2
+            shift 2
+            ;;
+        --stdin)
+            use_stdin=1
+            shift
+            ;;
+        --old)
+            [ $# -ge 2 ] || usage
+            old_text=$2
+            old_set=1
+            shift 2
+            ;;
+        --new)
+            [ $# -ge 2 ] || usage
+            new_text=$2
+            new_set=1
+            shift 2
+            ;;
+        --old-file)
+            [ $# -ge 2 ] || usage
+            old_file=$2
+            shift 2
+            ;;
+        --new-file)
+            [ $# -ge 2 ] || usage
+            new_file=$2
+            shift 2
+            ;;
+        --missing-ok)
+            missing_ok=1
+            shift
+            ;;
+        --offset)
+            [ $# -ge 2 ] || usage
+            case $2 in '' | *[!0-9]* | 0) usage ;; esac
+            read_offset=$2
+            paging_set=1
+            shift 2
+            ;;
+        --max-lines)
+            [ $# -ge 2 ] || usage
+            case $2 in '' | *[!0-9]*) usage ;; esac
+            read_max_lines=$2
+            paging_set=1
+            shift 2
+            ;;
+        -*)
+            usage
+            ;;
+        *)
+            [ -z "$path" ] || usage
+            path=$1
+            shift
+            ;;
+    esac
+done
+
+[ -n "$session" ] || usage
+[ -n "$path" ] || usage
+case $path in
+    *'"'* | *'\'* | *$'\n'*) usage ;;
+esac
+
+case $read_max_lines in '' | *[!0-9]*) usage ;; esac
+
+# Per-op option discipline and the spec body.
+spec=
+case $op in
+    write)
+        [ "$old_set" = 0 ] && [ "$new_set" = 0 ] && [ -z "$old_file" ] && [ -z "$new_file" ] && [ "$missing_ok" = 0 ] && [ "$paging_set" = 0 ] || usage
+        content_b64=
+        if [ -n "$from_file" ] && [ "$use_stdin" = 0 ]; then
+            [ -f "$from_file" ] || usage
+            content_b64=$(b64 <"$from_file")
+        elif [ -z "$from_file" ] && [ "$use_stdin" = 1 ]; then
+            content_b64=$(b64)
+        else
+            usage
+        fi
+        spec=$(printf '{"op":"write","path":"%s","content_b64":"%s"}' "$path" "$content_b64")
+        ;;
+    patch)
+        [ -z "$from_file" ] && [ "$use_stdin" = 0 ] && [ "$missing_ok" = 0 ] && [ "$paging_set" = 0 ] || usage
+        old_b64=
+        new_b64=
+        if [ "$old_set" = 1 ] && [ "$new_set" = 1 ] && [ -z "$old_file" ] && [ -z "$new_file" ]; then
+            old_b64=$(printf %s "$old_text" | b64)
+            new_b64=$(printf %s "$new_text" | b64)
+        elif [ "$old_set" = 0 ] && [ "$new_set" = 0 ] && [ -n "$old_file" ] && [ -n "$new_file" ]; then
+            [ -f "$old_file" ] && [ -f "$new_file" ] || usage
+            old_b64=$(b64 <"$old_file")
+            new_b64=$(b64 <"$new_file")
+        else
+            usage
+        fi
+        spec=$(printf '{"op":"patch","path":"%s","old_b64":"%s","new_b64":"%s"}' "$path" "$old_b64" "$new_b64")
+        ;;
+    delete)
+        [ -z "$from_file" ] && [ "$use_stdin" = 0 ] && [ "$old_set" = 0 ] && [ "$new_set" = 0 ] && [ -z "$old_file" ] && [ -z "$new_file" ] && [ "$paging_set" = 0 ] || usage
+        if [ "$missing_ok" = 1 ]; then
+            spec=$(printf '{"op":"delete","path":"%s","missing_ok":true}' "$path")
+        else
+            spec=$(printf '{"op":"delete","path":"%s","missing_ok":false}' "$path")
+        fi
+        ;;
+    read)
+        [ -z "$from_file" ] && [ "$use_stdin" = 0 ] && [ "$old_set" = 0 ] && [ "$new_set" = 0 ] && [ -z "$old_file" ] && [ -z "$new_file" ] && [ "$missing_ok" = 0 ] || usage
+        spec=$(printf '{"op":"read","path":"%s","offset":%s,"max_lines":%s}' "$path" "$read_offset" "$read_max_lines")
+        ;;
+esac
+
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SH_BIN=${COLAB_FS_SH:-$REPO/bin/colab-sh}
+[ -f "$REPO/snippets/fs_ops.py" ] || {
+    printf 'colab-fs: payload %s missing\n' "$REPO/snippets/fs_ops.py" >&2
+    exit 2
+}
+payload_b64=$(b64 <"$REPO/snippets/fs_ops.py")
+
+emit_stream() {
+    printf '%s\n' 'TMPD=$(mktemp -d) || exit 1'
+    printf '%s\n' 'trap '"'"'rm -rf "$TMPD"'"'"' EXIT'
+    printf '%s\n' 'base64 -d >"$TMPD/fs_ops.py" <<'"'"'COLAB_FS_PAYLOAD_B64'"'"
+    printf '%s\n' "$payload_b64"
+    printf '%s\n' 'COLAB_FS_PAYLOAD_B64'
+    printf '%s\n' 'python3 "$TMPD/fs_ops.py" <<'"'"'COLAB_FS_SPEC_JSON'"'"
+    printf '%s\n' "$spec"
+    printf '%s\n' 'COLAB_FS_SPEC_JSON'
+}
+
+if [ "$op" = read ]; then
+    verdict=$("$SH_BIN" -s "$session" < <(emit_stream))
+    rc=$?
+    printf '%s\n' "$verdict" >&2
+    if [ "$rc" = 0 ]; then
+        content_b64=$(printf %s "$verdict" | sed -n 's/.*"content_b64": *"\([A-Za-z0-9+/=]*\)".*/\1/p')
+        printf %s "$content_b64" | base64 -d
+    fi
+    exit "$rc"
+fi
+
+emit_stream | "$SH_BIN" -s "$session"
+exit $?
