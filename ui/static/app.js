@@ -504,6 +504,7 @@ function renderLeases() {
       <p class="big num" data-countdown="${esc(rec.deadline || "")}">${esc(countdownText(rec.deadline))}</p>
       <p class="kvline">Deadline <b>${esc(fmtTime(rec.deadline))}</b> · session <span class="mono">${esc(rec.session || "—")}</span>${rec.caller ? ` · Caller <b>${esc(rec.caller)}</b>` : ""}</p>
       <p class="kvline">Heartbeat <b>${age == null ? "unknown" : `${Math.round(age)}s ago`}</b> · Pulse <b>${esc(pulse || "—")}</b> · Burn <b>${esc(burn)}</b></p>
+      ${entry.sync_claim ? `<p class="kvline">Sync claim <b>${esc(entry.sync_claim.caller || "—")}</b> · until <b>${esc(fmtTime(entry.sync_claim.expires_at))}</b></p>` : ""}
       <button type="button" class="danger" data-stop="${esc(session)}">Terminate</button>
       <button type="button" class="ghost" data-xtoggle="${esc(session)}">Extend</button>
       <button type="button" class="ghost" data-stoggle="${esc(session)}">Shorten</button>

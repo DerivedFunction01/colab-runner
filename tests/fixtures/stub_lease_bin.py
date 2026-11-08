@@ -67,12 +67,21 @@ def record(session, shape="cpu-highram"):
 
 
 def state_entry(session):
+    claim = None
+    if os.environ.get("STUB_SYNC_CLAIM") == "1":
+        claim = {
+            "caller": "alpha",
+            "claimed_at": "2026-11-01T00:00:00+00:00",
+            "expires_at": "2099-01-01T01:00:00+00:00",
+            "last_attach_at": "2026-11-01T00:00:00+00:00",
+        }
     return {
         "action": "active",
         "record": record(session),
         "keepalive_heartbeat_age_s": 12,
         "session": session,
         "warm": None,
+        "sync_claim": claim,
     }
 
 

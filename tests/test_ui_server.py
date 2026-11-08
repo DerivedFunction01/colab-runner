@@ -450,6 +450,24 @@ def test_envelope_state_passes_through(tmp_path):
         server.close()
 
 
+def test_records_serve_the_sync_claim_and_the_card_renders_it(tmp_path):
+    """The records portion carries each lease's live sync claim
+    (the state leaf serves it on the status entry); the server
+    passes it through untouched, and the lease card renders the
+    holder + expiry from the served field — nothing when the
+    claim is absent (the default stub entry serves null)."""
+    server = UiServer(tmp_path, extra_env={"STUB_SYNC_CLAIM": "1"})
+    try:
+        data = server.get_json("/api/state")
+        entry = data["records"][0]
+        assert entry["sync_claim"]["caller"] == "alpha"
+        assert entry["sync_claim"]["expires_at"] == "2099-01-01T01:00:00+00:00"
+    finally:
+        server.close()
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    assert "entry.sync_claim" in js and "Sync claim" in js
+
+
 def test_envelope_spool_kinds_drain_into_the_outbox(ui):
     """The envelope outbox kinds ride the same reaper-events drain as
     lease-renewed: spooled by the core, folded in by the server."""
