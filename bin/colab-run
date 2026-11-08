@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
-"""Run a named job on Colab: sweep orphans, sync in, execute detached, poll,
+"""Run a named job on Colab: sync in, execute detached, poll,
 pull results, stop the session on every exit path.
 
-Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [-- <job args>...]
+Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [-- <job args>...]
+       colab-run --poll RUN_ID | --wait RUN_ID [--max SECONDS] | --sweep
 Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
 --caller TAG (or the manifest's "caller" key, or $COLAB_CALLER)
 attributes the run to its thread: it rides the lease acquire and
 is stamped on the run record.
+--detach launches exactly as the foreground form and returns at
+once with {run_id, session, state}: the run's record then advances
+only when something reconciles it — --poll (one bounded reconcile:
+reader exec + pull + record update; exit 0 complete, 1 failed or
+orphaned, 3 still running), a later launch's --resume, or --sweep.
+--wait polls the LOCAL record only (zero channel use) until the
+run is terminal or --max seconds pass (exit 0 complete, 1 failed
+or orphaned, 3 still running at the bound). --sweep reconciles
+every non-terminal record against the live list. A launched run's
+terminal transition appends exactly one run-terminal event to
+var/ui-outbox.jsonl.
 The CLI funnel — resolution ($COLAB_BIN, else the uv tool venv,
 else PATH, else ~/.local/bin/colab), the NO_PROXY environment, and
 the guarded invocation — lives in sync/cli.py, the one module every
@@ -55,31 +67,448 @@ def save_record(rec: dict) -> None:
     (RUNS / f"{rec['run_id']}.json").write_text(json.dumps(rec, indent=2))
 
 
-def orphan_sweep() -> list[dict]:
-    """Reconcile non-terminal run records against live sessions."""
+TERMINAL_STATES = ("complete", "failed", "orphaned")
+
+# E11: consecutive poll failures before the poller classifies the
+# session. The classification itself uses the reap pass's reduced
+# read budget (2 attempts x 45 s), so one classification costs a
+# bounded ~90 s worst case, never the standard ~370 s.
+POLL_FAILURE_BOUND = 3
+
+# E6: the file channel's measured single-file reliability ceiling
+# (AGENTS.md, file channel) — a declared output larger than this
+# moves by the chunked route, never as one download.
+SINGLE_FILE_CEILING_BYTES = 50 * 1024 * 1024
+
+
+def load_run_record(run_id: str) -> dict | None:
+    try:
+        rec = json.loads((RUNS / f"{run_id}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def outbox_path() -> Path:
+    # The UI outbox lives in the runner var dir (the panel's own
+    # var_dir() convention: $COLAB_RUNNER_VAR, else the repo's var).
+    return Path(os.environ.get("COLAB_RUNNER_VAR", REPO / "var")) / "ui-outbox.jsonl"
+
+
+def emit_terminal_event(rec: dict) -> bool:
+    """Append the run's one run-terminal event to the UI outbox.
+
+    The lease core already appends its own kinds there (the
+    lease-extended chain the adoption census reads is the
+    precedent); a run's terminal transition is the runner's kind.
+    Guarded on the record: terminal_event_state stamps the state
+    the event announced, so a second terminal observation of the
+    same run (a --poll after the foreground poller finished, a
+    sweep after a finalize) never double-announces — while a
+    resumed run, whose resume clears the stamp, announces its new
+    terminal state afresh. Best-effort: a failed append stamps
+    nothing, so a later transition may retry it. Returns True
+    when it appended."""
+    if rec.get("terminal_event_state") == rec.get("state"):
+        return False
+    path = outbox_path()
+    seq = 0
+    try:
+        lines = path.read_text().splitlines()
+        for line in reversed(lines):
+            if line.strip():
+                try:
+                    seq = int(json.loads(line).get("seq", 0))
+                except (ValueError, json.JSONDecodeError):
+                    seq = len(lines)
+                break
+    except OSError:
+        seq = 0
+    event = {
+        "seq": seq + 1,
+        "ts": now(),
+        "kind": "run-terminal",
+        "detail": {"run_id": rec["run_id"], "job": rec.get("job"), "caller": rec.get("caller"), "state": rec["state"], "session": rec.get("session")},
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps(event) + "\n")
+    except OSError:
+        return False
+    rec["terminal_event_state"] = rec["state"]
+    rec["terminal_event_at"] = event["ts"]
+    return True
+
+
+def mark_terminal(rec: dict, state: str, **fields) -> None:
+    """Move a launched run to a terminal state: record update,
+    save, and its exactly-one run-terminal outbox event."""
+    rec.update(state=state, **fields)
+    save_record(rec)
+    if emit_terminal_event(rec):
+        save_record(rec)
+
+
+def orphan_sweep() -> tuple[list[dict], bool]:
+    """Reconcile non-terminal run records against live sessions.
+
+    Membership is exact-name, through the lease core's live-list
+    parser (lease.live_sessions) — never substring on raw stdout:
+    a name that textually collides with a live one must not read
+    as alive, and a partial list must not read as a census. An
+    unreadable list (None) reconciles nothing — the session_state
+    rule, that no caller may act on a list it could not read. A
+    torn record is skipped, never fatal: one damaged file must
+    not block the reconcile of every other run (it blocked every
+    runner entry in the 2026-11-08 flap). The sweep runs on the
+    reconcile cadences (--poll, --sweep), never on the launch
+    path. Returns (findings, live_list_readable)."""
     findings = []
     if not RUNS.exists():
-        return findings
-    live = colab("sessions", timeout=120).stdout if TOKEN.exists() or os.environ.get("COLAB_BIN") else ""
+        return findings, True
+    live = lease.live_sessions(colab, REPO)
+    if live is None:
+        return findings, False
+    live_names = {entry["session"] for entry in live}
     for f in sorted(RUNS.glob("*.json")):
-        rec = json.loads(f.read_text())
-        if rec["state"] in ("running", "polling") and rec.get("session") not in live:
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if rec.get("state") in ("running", "polling") and rec.get("session") not in live_names:
             rec["state"] = "orphaned"
             rec["orphan_noted_at"] = now()
             save_record(rec)
+            if emit_terminal_event(rec):
+                save_record(rec)
             findings.append({"run_id": rec["run_id"], "job": rec["job"], "action": "marked orphaned; relaunch with --resume RUN_ID to continue from its remote run-id"})
-    return findings
+    return findings, True
+
+
+def write_reader(run_id: str, remote_out: str, outputs: list) -> Path:
+    """The per-run reader payload: checkpoint, heartbeat tail,
+    launcher log tail, payload pids — plus each declared output's
+    size/mtime, the change evidence pull_outputs skips on (E6)."""
+    reader = REPO / "var" / f"read-{run_id}.py"
+    reader.parent.mkdir(parents=True, exist_ok=True)
+    reader.write_text(
+        "import json, subprocess\n"
+        "from pathlib import Path\n"
+        f"d = Path({remote_out!r})\n"
+        "ck = d / 'checkpoint.json'\n"
+        "log = d / 'heartbeat.log'\n"
+        f"jlog = Path({remote_out + '.log'!r})\n"
+        f"names = {json.dumps(outputs)}\n"
+        "def _stat(p):\n"
+        "    try:\n"
+        "        s = p.stat()\n"
+        "        return {'size': s.st_size, 'mtime': s.st_mtime}\n"
+        "    except OSError:\n"
+        "        return None\n"
+        "out = {'checkpoint': json.loads(ck.read_text()) if ck.exists() else None,\n"
+        "       'heartbeat_tail': log.read_text().strip().split('\\n')[-3:] if log.exists() else [],\n"
+        "       'job_log_tail': jlog.read_text(errors='replace').strip().split('\\n')[-5:] if jlog.exists() else [],\n"
+        f"       'job_pids': subprocess.run(['pgrep','-f',{remote_out!r}], capture_output=True, text=True).stdout.split(),\n"
+        "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split(),\n"
+        "       'outputs': {n: _stat(d / n) for n in names}}\n"
+        "print(json.dumps(out))\n"
+    )
+    return reader
+
+
+def read_reader(session: str, reader: Path, poll_timeout: int) -> tuple[dict | None, str | None]:
+    """One bounded reader exec. Returns (state, None) on a
+    readable poll, (None, error) on a failed one — a subprocess
+    timeout and an unparseable answer are the same class here:
+    this poll produced no evidence (E11 counts both)."""
+    try:
+        chk = colab("exec", "-s", session, "--timeout", "120", "-f", str(reader), timeout=poll_timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"checkpoint poll timed out at {now()}"
+    try:
+        return json.loads(chk.stdout[chk.stdout.index("{"):]), None
+    except (ValueError, json.JSONDecodeError):
+        return None, f"checkpoint poll returned no readable state at {now()}"
+
+
+def register_poll_failure(rec: dict, session: str, error: str) -> str:
+    """Count one consecutive poll failure (E11) and, at the
+    bound, classify the session at the reap pass's reduced read
+    budget. Confirmed absent fails the run fast — the payload
+    died with its session, and the record carries the resume
+    note. Alive means the reader, not the session, is flaky: the
+    count resets. Unknown never fails a run; the count stands,
+    so the next failure classifies again. Returns "failed" when
+    this failure ended the run, else "continue"."""
+    rec["last_poll_error"] = error
+    rec["poll_failures"] = int(rec.get("poll_failures") or 0) + 1
+    save_record(rec)
+    if rec["poll_failures"] < POLL_FAILURE_BOUND:
+        return "continue"
+    diag: dict = {}
+    verdict = lease.session_state(colab, session, diag, attempts=lease._REAP_READ_ATTEMPTS, timeout=lease._REAP_READ_TIMEOUT_S)
+    rec["last_classification"] = {"verdict": verdict, "at": now(), **diag}
+    if verdict == "absent":
+        mark_terminal(
+            rec,
+            "failed",
+            error=(
+                f"session {session} confirmed absent after {rec['poll_failures']} consecutive poll failures; "
+                f"the payload died with its session — relaunch with --resume {rec['run_id']} to continue from its remote run-id"
+            ),
+        )
+        return "failed"
+    if verdict == "alive":
+        rec["poll_failures"] = 0
+    save_record(rec)
+    return "continue"
+
+
+def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict | None = None) -> list:
+    """Download the declared outputs to results/<run_id>/.
+
+    Runs at every checkpoint cadence while the job runs — the
+    manifest's checkpoint_pull_seconds is a pull cadence, not
+    only a poll cadence (2026-11-07: the venue relay starved
+    because outputs landed only at completion, so a 12 h job's
+    log never reached the local reader waiting on it) — and once
+    more after the loop as the authoritative final pull. A failed
+    or timed-out download is noted on the record and never breaks
+    the poll loop; a missing remote file (the job has not written
+    it yet) simply pulls nothing.
+
+    Change detection (E6): the reader reports each output's
+    size/mtime; an output whose stat still equals the stat its
+    last successful pull recorded is skipped — a long job's
+    stable outputs are no longer re-moved whole at every cadence.
+    An output above the single-file ceiling moves via
+    transfer.chunked_download (32 MB parts, whole-file SHA-256
+    verified) instead of one plain download."""
+    pulled_now = []
+    stats = (reader_state or {}).get("outputs") or {}
+    stored = rec.setdefault("output_stats", {})
+    for name in job.get("outputs", []):
+        dest = REPO / "results" / rec["run_id"] / name
+        stat = stats.get(name)
+        if stat is not None and stored.get(name) == stat and dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if stat is not None and stat["size"] > SINGLE_FILE_CEILING_BYTES:
+            res = transfer.chunked_download(session, f"{remote_out}/{name}", dest)
+            if not res.get("ok"):
+                rec["last_pull_error"] = f"chunked pull of {name} failed at {now()}: {res.get('stage', 'unknown stage')}"
+                continue
+            pulled_now.append({"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "chunked"})
+            stored[name] = stat
+            continue
+        try:
+            colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
+        except subprocess.TimeoutExpired:
+            rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
+            continue
+        if dest.exists():
+            pulled_now.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest(), "route": "single"})
+            if stat is not None:
+                stored[name] = stat
+    if pulled_now:
+        rec["last_checkpoint_pull_at"] = now()
+    return pulled_now
+
+
+def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before) -> tuple[int, dict]:
+    """The terminal tail, shared by the foreground poll loop and
+    --poll: final pull, the payload's own exit code, the terminal
+    record + its one outbox event. Returns (exit_code, result).
+
+    The payload's checkpoint exit_code is the truth about the
+    outcome (2026-11-05: a job-zero build whose init_venv.py
+    failed recorded "complete" with a clean-looking pull; only a
+    human reading the pulled report saw assertions_passed:
+    false). Jobs whose checkpoints carry no exit_code are
+    unaffected. Outputs are pulled regardless — reports and
+    verdicts land locally either way."""
+    pulled = pull_outputs(rec, job, session, remote_out, reader_state)
+    exit_code = (reader_state.get("checkpoint") or {}).get("exit_code")
+    usage_after = colab("usage", timeout=120).stdout.strip()
+    if exit_code not in (None, 0):
+        mark_terminal(rec, "failed", finished_at=now(), error=f"job payload exited {exit_code}", pulled=pulled, usage_before=usage_before, usage_after=usage_after)
+        return 1, {"run_id": rec["run_id"], "state": "failed", "error": rec["error"], "pulled": pulled}
+    mark_terminal(rec, "complete", finished_at=now(), pulled=pulled, usage_before=usage_before, usage_after=usage_after)
+    return 0, {"run_id": rec["run_id"], "state": "complete", "pulled": pulled}
+
+
+def close_out_lease(rec: dict) -> None:
+    """The terminal close-out for a run reconciled by --poll:
+    what the foreground poller's finally does — release the job
+    registration (finish_job no-ops when none matches) and
+    capture the transient state."""
+    if lease.load_config(REPO).get("enabled"):
+        lease.finish_job(REPO, rec["run_id"])
+    mirror("capture")
+
+
+def poll_run(run_id: str) -> int:
+    """One bounded reconcile of a launched run (E5): orphan
+    sweep, one reader exec, one pull, one record update — nothing
+    here waits, so any caller (an agent, a scheduler job) can
+    drive a detached run to its terminal state by repeating the
+    verb. Exit 0 complete, 1 failed/orphaned, 2 no such run or
+    not staged, 3 still running."""
+    rec = load_run_record(run_id)
+    if rec is None:
+        print(f"colab-run --poll: no run record at {RUNS / f'{run_id}.json'}", file=sys.stderr)
+        return 2
+    if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
+        print("colab-run: STAGED — no colab login yet. Run ops/bootstrap_local.sh, then the one-time login (see README).", file=sys.stderr)
+        return 2
+    manifest_path = REPO / "jobs" / str(rec.get("job")) / "job.json"
+    if not manifest_path.exists():
+        print(f"colab-run --poll: no job manifest at {manifest_path}", file=sys.stderr)
+        return 2
+    job = json.loads(manifest_path.read_text())
+    orphan_sweep()
+    rec = load_run_record(run_id) or rec
+    if rec.get("state") in TERMINAL_STATES:
+        print(json.dumps({"run_id": run_id, "state": rec["state"]}, indent=2))
+        return 0 if rec["state"] == "complete" else 1
+    session = rec.get("session")
+    remote_out = rec.get("remote_out")
+    if not session or not remote_out:
+        print(json.dumps({"run_id": run_id, "state": rec.get("state"), "error": "record predates launch (no session/remote_out); --resume relaunches it"}, indent=2))
+        return 1
+    reader = write_reader(run_id, remote_out, job.get("outputs", []))
+    poll_timeout = int(os.environ.get("COLAB_RUN_POLL_TIMEOUT_S", "300"))
+    state, poll_error = read_reader(session, reader, poll_timeout)
+    if state is None:
+        if register_poll_failure(rec, session, poll_error) == "failed":
+            close_out_lease(rec)
+            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+            return 1
+        print(json.dumps({"run_id": run_id, "state": rec["state"]}, indent=2))
+        return 3
+    rec["poll_failures"] = 0
+    done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
+    rec["last_checkpoint_units"] = done_units
+    save_record(rec)
+    if job.get("outputs"):
+        pull_outputs(rec, job, session, remote_out, state)
+        save_record(rec)
+    log = state.get("heartbeat_tail") or []
+    complete = any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"])
+    if not complete and not state.get("job_pids") and state.get("job_log_tail"):
+        # The launched process is gone with no completion signal:
+        # the same death the poll loop fails on (see main).
+        tail = "\n".join(state["job_log_tail"])
+        mark_terminal(rec, "failed", error=(f"job exited before completing; remote log tail: {tail}")[-500:])
+        close_out_lease(rec)
+        print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+        return 1
+    past_deadline = False
+    try:
+        past_deadline = time.time() >= datetime.fromisoformat(rec["started_at"]).timestamp() + job.get("timeout", 18000)
+    except (KeyError, ValueError):
+        past_deadline = False
+    if complete or past_deadline:
+        rc, result = finalize_run(rec, job, session, remote_out, state, rec.get("usage_before"))
+        close_out_lease(rec)
+        print(json.dumps(result, indent=2))
+        return rc
+    print(json.dumps({"run_id": run_id, "state": rec["state"]}, indent=2))
+    return 3
+
+
+def wait_run(run_id: str, max_seconds: int) -> int:
+    """A bounded wait over the LOCAL run record only (E13): zero
+    channel use — no CLI call, no lease read — so waiting never
+    becomes the polling loop it replaces. Exit 0 complete, 1
+    failed/orphaned, 2 no such record, 3 still running when the
+    bound runs out."""
+    if not (RUNS / f"{run_id}.json").exists():
+        print(f"colab-run --wait: no run record for {run_id}", file=sys.stderr)
+        return 2
+    end = time.time() + max_seconds
+    while True:
+        rec = load_run_record(run_id)
+        state = (rec or {}).get("state")
+        if state == "complete":
+            print(json.dumps({"run_id": run_id, "state": state}))
+            return 0
+        if state in ("failed", "orphaned"):
+            print(json.dumps({"run_id": run_id, "state": state}))
+            return 1
+        remaining = end - time.time()
+        if remaining <= 0:
+            print(json.dumps({"run_id": run_id, "state": state}))
+            return 3
+        time.sleep(min(2, remaining))
+
+
+def orphan_notes(shape_id: str, shape: dict) -> list[str]:
+    """E1, runner half — failure path only: after an acquire
+    refusal, name any live-but-unrecorded sessions at the
+    requested shape and print the verb that restores them, the
+    refusal-prints-the-alternative pattern. Costs one live-list
+    read, so it never runs on a hot path; never fatal — a nicety
+    must not mask the refusal it annotates."""
+    try:
+        live = lease.live_sessions(colab, REPO)
+        if not live:
+            return []
+        recorded = {r.get("session") for r in lease.all_records(REPO)}
+        want_class = "high_ram" if (shape or {}).get("high_mem") else "standard"
+        notes = []
+        for entry in live:
+            name = entry["session"]
+            if name in recorded or entry.get("shape_class") not in (None, want_class):
+                continue
+            notes.append(f"colab-run: note: session {name} is live but has no lease record (orphaned) — restore it with: bin/colab-lease adopt {name}")
+        return notes
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def main() -> int:
     args = sys.argv[1:]
+    # Verbs that never launch dispatch first: --sweep reconciles
+    # records, --poll reconciles one launched run, --wait reads
+    # the local record only. None of them may pay the launch
+    # path's costs (mirror restore, catalog, acquire).
+    core_args = args[: args.index("--")] if "--" in args else list(args)
+    if "--sweep" in core_args:
+        findings, live_ok = orphan_sweep()
+        print(json.dumps({"findings": findings, "live_list_unreadable": not live_ok}, indent=2))
+        return 0
+    if "--poll" in core_args:
+        idx = core_args.index("--poll")
+        if idx + 1 >= len(core_args):
+            print("usage: colab-run --poll RUN_ID", file=sys.stderr)
+            return 2
+        return poll_run(core_args[idx + 1])
+    if "--wait" in core_args:
+        idx = core_args.index("--wait")
+        if idx + 1 >= len(core_args):
+            print("usage: colab-run --wait RUN_ID [--max SECONDS]", file=sys.stderr)
+            return 2
+        max_seconds = 120
+        if "--max" in core_args:
+            midx = core_args.index("--max")
+            if midx + 1 >= len(core_args):
+                print("usage: colab-run --wait RUN_ID [--max SECONDS]", file=sys.stderr)
+                return 2
+            try:
+                max_seconds = int(core_args[midx + 1])
+            except ValueError:
+                print("colab-run --wait: --max must be an integer number of seconds", file=sys.stderr)
+                return 2
+        return wait_run(core_args[idx + 1], max_seconds)
     # Flags travel in pairs and may sit on either side of the job
     # name — extract them first and take the first remaining token
     # as the job. (Job-first-only parsing read a leading --caller
     # as a job name; it bit a consumer following shorthand in a
     # message, 2026-11-05.)
     resume = caller_flag = None
-    seed_flag = False
+    seed_flag = detach_flag = False
     extra_args = []
     positional = []
     i = 0
@@ -93,6 +522,9 @@ def main() -> int:
         if args[i] == "--seed":
             seed_flag = True
             i += 1
+        elif args[i] == "--detach":
+            detach_flag = True
+            i += 1
         elif args[i] == "--resume" and i + 1 < len(args):
             resume = args[i + 1]
             i += 2
@@ -103,7 +535,7 @@ def main() -> int:
             positional.append(args[i])
             i += 1
     if not positional:
-        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [-- <job args>...]", file=sys.stderr)
+        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [-- <job args>...]", file=sys.stderr)
         return 2
     job_name = positional[0]
     manifest_path = REPO / "jobs" / job_name / "job.json"
@@ -125,13 +557,6 @@ def main() -> int:
         return 2
 
     mirror("restore")
-    findings = orphan_sweep()
-    for f in findings:
-        # Findings ride stderr: stdout is the run's JSON result,
-        # and a sweep line ahead of it breaks every consumer that
-        # parses the result (hit live 2026-11-05, again in the
-        # co-tenancy tests 2026-11-06).
-        print(f"orphan sweep: {f['run_id']} ({f['job']}) — {f['action']}", file=sys.stderr)
 
     # A manifest may name its shape; otherwise the config's
     # default_shape is the only fallback — no shape is hardcoded
@@ -153,6 +578,11 @@ def main() -> int:
         prior = RUNS / f"{run_id}.json"
         if prior.exists():
             rec = json.loads(prior.read_text())
+            # A resurrected run announces its NEW terminal state
+            # afresh: the sweep's orphan event is history, not
+            # this run's outcome.
+            rec.pop("terminal_event_state", None)
+            rec.pop("terminal_event_at", None)
             rec.update(state="starting", resumed=True, resumed_at=now())
     if rec is None:
         rec = {"run_id": run_id, "job": job_name, "shape": shape_id, "state": "starting", "started_at": now(), "resumed": bool(resume)}
@@ -199,12 +629,27 @@ def main() -> int:
     # leave it up at the end; the reaper owns its lifecycle. With the lease
     # disabled in config, fall back to the original per-job session.
     use_lease = bool(lease.load_config(REPO).get("enabled"))
+    if detach_flag and not use_lease:
+        # --detach leaves the job running with no poller; the
+        # lease-disabled fallback's per-run session is stopped by
+        # the poller's own finally, so a detached launch there
+        # would kill the job it just started.
+        rec.update(state="failed", error="--detach requires the lease path (lease.enabled); the fallback per-job session dies with the poller")
+        save_record(rec)
+        print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+        return 2
     session = run_id  # the lease-disabled fallback's per-run session
     if use_lease:
         got = lease.acquire(colab, REPO, shape_id, via="runner", caller=caller)
         if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused", "unknown-shape"):
             rec.update(state="failed", error=json.dumps(got)[:300])
             save_record(rec)
+            # E1: if live sessions sit unrecorded at this shape,
+            # the refusal may be the record loss talking — name
+            # the state and the verb that restores it (stderr;
+            # stdout stays the run's JSON result).
+            for note in orphan_notes(shape_id, shape):
+                print(note, file=sys.stderr)
             print(json.dumps({"run_id": run_id, "state": "failed", "lease": got}, indent=2))
             return 1
         rec["lease_action"] = got["action"]
@@ -227,6 +672,7 @@ def main() -> int:
             save_record(rec)
             print(json.dumps({"run_id": run_id, "state": "failed", "lease": refusal}, indent=2))
             return 1
+    detached = False
     try:
         if not use_lease:
             new_args = ["new", "-s", session] + lease._session_shape_args(shape)
@@ -302,49 +748,21 @@ def main() -> int:
         colab("exec", "-s", session, "--timeout", "120", "-f", str(launcher), timeout=300)
         rec["state"] = "polling"
         save_record(rec)
-        reader = REPO / "var" / f"read-{run_id}.py"
-        reader.write_text(
-            "import json, subprocess\n"
-            "from pathlib import Path\n"
-            f"d = Path('{remote_out}')\n"
-            "ck = d / 'checkpoint.json'\n"
-            "log = d / 'heartbeat.log'\n"
-            f"jlog = Path('{remote_out}.log')\n"
-            "out = {'checkpoint': json.loads(ck.read_text()) if ck.exists() else None,\n"
-            "       'heartbeat_tail': log.read_text().strip().split('\\n')[-3:] if log.exists() else [],\n"
-            f"       'job_log_tail': jlog.read_text(errors='replace').strip().split('\\n')[-5:] if jlog.exists() else [],\n"
-            f"       'job_pids': subprocess.run(['pgrep','-f','{remote_out}'], capture_output=True, text=True).stdout.split(),\n"
-            "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split()}\n"
-            "print(json.dumps(out))\n"
-        )
-        def pull_outputs() -> list:
-            """Download the declared outputs to results/<run_id>/.
-
-            Runs at every checkpoint cadence while the job runs —
-            the manifest's checkpoint_pull_seconds is a pull
-            cadence, not only a poll cadence (2026-11-07: the
-            venue relay starved because outputs landed only at
-            completion, so a 12 h job's log never reached the
-            local reader waiting on it) — and once more after the
-            loop as the authoritative final pull. A failed or
-            timed-out download is noted on the record and never
-            breaks the poll loop; a missing remote file (the job
-            has not written it yet) simply pulls nothing."""
-            pulled_now = []
-            for name in job.get("outputs", []):
-                dest = REPO / "results" / run_id / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
-                except subprocess.TimeoutExpired:
-                    rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
-                    continue
-                if dest.exists():
-                    pulled_now.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest()})
-            if pulled_now:
-                rec["last_checkpoint_pull_at"] = now()
-            return pulled_now
-
+        reader = write_reader(run_id, remote_out, job.get("outputs", []))
+        if detach_flag:
+            # E5: launch exactly as the foreground form, write
+            # the record, return. usage_before is stamped now —
+            # the reconcile that finalizes this run reads it from
+            # the record, not from a dead process's locals. The
+            # finally below skips the close-out for a detached
+            # launch: no finish_job (the registration is the
+            # run's liveness evidence), no stop, no capture.
+            detached = True
+            rec["detached_launch"] = True
+            rec["usage_before"] = usage_before
+            save_record(rec)
+            print(json.dumps({"run_id": run_id, "session": session, "state": rec["state"]}, indent=2))
+            return 0
         deadline = time.time() + job.get("timeout", 18000)
         cadence = job.get("checkpoint_pull_seconds", 300)
         # A checkpoint poll that outlives its subprocess timeout
@@ -357,21 +775,23 @@ def main() -> int:
         state = {}
         while time.time() < deadline:
             time.sleep(cadence)
-            try:
-                chk = colab("exec", "-s", session, "--timeout", "120", "-f", str(reader), timeout=poll_timeout)
-            except subprocess.TimeoutExpired:
-                rec["last_poll_error"] = f"checkpoint poll timed out at {now()}"
-                save_record(rec)
-                continue
-            try:
-                state = json.loads(chk.stdout[chk.stdout.index("{"):])
-            except (ValueError, json.JSONDecodeError):
+            # A failed poll — subprocess timeout or unreadable
+            # answer — is counted, not fatal (2026-11-06: an
+            # uncaught TimeoutExpired killed the poller and
+            # stranded the record at polling while the payload
+            # completed); E11 bounds the count and classifies it.
+            state, poll_error = read_reader(session, reader, poll_timeout)
+            if state is None:
+                if register_poll_failure(rec, session, poll_error) == "failed":
+                    print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                    return 1
                 continue
             done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
             rec["last_checkpoint_units"] = done_units
+            rec["poll_failures"] = 0
             save_record(rec)
             if job.get("outputs"):
-                pull_outputs()
+                pull_outputs(rec, job, session, remote_out, state)
                 save_record(rec)
             log = state.get("heartbeat_tail") or []
             if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]):
@@ -388,38 +808,23 @@ def main() -> int:
                 # same poll, so reaching here means death, not
                 # completion: fail with the log tail in hand.
                 tail = "\n".join(state["job_log_tail"])
-                rec.update(state="failed", error=(f"job exited before completing; remote log tail: {tail}")[-500:])
-                save_record(rec)
+                mark_terminal(rec, "failed", error=(f"job exited before completing; remote log tail: {tail}")[-500:])
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
-        # Pull expected outputs and verify by the job's own unit hashes.
-        pulled = pull_outputs()
-        exit_code = (state.get("checkpoint") or {}).get("exit_code")
-        if exit_code not in (None, 0):
-            # The payload ran and stamped its own failure in the
-            # checkpoint (shell_job carries the script's exit code):
-            # the outputs above are pulled regardless — reports and
-            # verdicts land locally either way — but the run record
-            # tells the truth about the outcome. (2026-11-05: a
-            # job-zero build whose init_venv.py failed recorded
-            # "complete" with a clean-looking pull; only a human
-            # reading the pulled report saw assertions_passed:
-            # false.) Jobs whose checkpoints carry no exit_code are
-            # unaffected.
-            rec.update(state="failed", finished_at=now(), error=f"job payload exited {exit_code}", pulled=pulled, usage_before=usage_before, usage_after=colab("usage", timeout=120).stdout.strip())
-            save_record(rec)
-            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"], "pulled": pulled}, indent=2))
-            return 1
-        rec.update(state="complete", finished_at=now(), pulled=pulled, usage_before=usage_before, usage_after=colab("usage", timeout=120).stdout.strip())
-        save_record(rec)
-        print(json.dumps({"run_id": run_id, "state": "complete", "pulled": pulled}, indent=2))
-        return 0
+        rc, result = finalize_run(rec, job, session, remote_out, state, usage_before)
+        print(json.dumps(result, indent=2))
+        return rc
     finally:
-        if use_lease:
-            lease.finish_job(REPO, run_id)
-        else:
-            colab("stop", "-s", session, timeout=120)
-        mirror("capture")
+        # A detached launch returns with the job still running:
+        # no finish_job (the registration is the run's liveness
+        # evidence until a reconcile closes it out), no stop, no
+        # capture — the reconcile owns the close-out.
+        if not detached:
+            if use_lease:
+                lease.finish_job(REPO, run_id)
+            else:
+                colab("stop", "-s", session, timeout=120)
+            mirror("capture")
 
 
 if __name__ == "__main__":
