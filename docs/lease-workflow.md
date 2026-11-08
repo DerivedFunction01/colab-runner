@@ -124,6 +124,44 @@ snippet jobs:
   traffic — the bridge serves session channels only — so it is
   not a substrate for reaching VM services or for automation.
 
+## Synchronous channel claims
+
+A runtime admits one SSH connection at a time, so a synchronous
+`colab-sh` / `colab-fs` call holds the channel for its whole
+duration. Synchronous use is therefore a claim, not a default
+(design: `.plans/2026-11-08-sync-channel-design.md`):
+
+- A session has at most one sync claim: {caller, claimed_at,
+  expires_at, last_attach_at}, TTL'd by `sync_claim.ttl_minutes`
+  (lease config, default 60). It lives on the lease record when
+  a record exists, else at `var/sync-claim-<session>.json`;
+  both homes are written staged-sibling + rename.
+- Activity is evidence, read per attach: a job registered on
+  the lease record, a non-terminal run record naming its
+  caller, or a channel attach in the caller-claims journal
+  inside `sync_claim.attach_window_minutes` (default 15).
+- `sync_rights` (`sync/lease/syncclaims.py`) is the one gate,
+  checked by `bin/colab-sh` before connecting and by the
+  probes' driver for its long calls: a live claim held by
+  another caller refuses, and any other active caller refuses
+  — synchronous is off while multiple threads are active, for
+  the claimant too; their claim is not revoked and resumes
+  when the session is single-occupancy again. A sole active
+  caller's attach auto-claims, journaled in the caller-claims
+  journal. Refusals exit 2 naming the holder, the evidence,
+  the expiry, and the detached form of the refused command.
+- A claim lapses at its TTL or when its holder goes quiet
+  (last attach older than the window, no other live evidence);
+  a lapsed claim reads as absent. `bin/colab-lease claim-sync`
+  and `release-sync` take and end a claim explicitly; only
+  the holder releases by name.
+- Detached work never needs a claim: `colab-run` jobs and
+  `bin/colab-sh --detach` / `--poll` (launch under nohup at
+  `/content/sync-detached/<id>`; poll state + log tail with
+  one short call) stay open to every caller. The records
+  state serves each lease's live claim as `sync_claim` (or
+  null), and the panel card renders holder + expiry from it.
+
 ## Reaper and auto-lease
 
 The reap duty runs as a script-level hook (`colab-lease-reaper`,
