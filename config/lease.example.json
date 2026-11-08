@@ -47,5 +47,9 @@
     "max_session_hours": 12,
     "shape": "cpu",
     "warm_on_renew": true
+  },
+  "sync_claim": {
+    "attach_window_minutes": 15,
+    "ttl_minutes": 60
   }
 }
