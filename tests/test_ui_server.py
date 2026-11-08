@@ -205,11 +205,11 @@ def test_frontend_loads_state_in_portions(ui):
     portion endpoints, and every section carries its own load-state
     line in the served page."""
     _, js = ui.get("/static/app.js")
-    for part in ("records", "specs", "budget", "grant"):
+    for part in ("records", "specs", "budget", "grant", "orphans"):
         assert f"/api/state/{part}" in js
     assert 'api("/api/state")' not in js
     _, html = ui.get("/")
-    for part in ("records", "specs", "budget", "grant", "logs"):
+    for part in ("records", "specs", "budget", "grant", "orphans", "logs"):
         assert f'data-part-status="{part}"' in html
 
 
@@ -642,3 +642,51 @@ def test_shorten_endpoint_validation(ui):
     status, _ = ui.post("/api/lease/shorten", {"session": "amber-otter-42", "deadline": "not-a-date"})
     assert status == 400
     assert not any(line.startswith("shorten ") for line in ui.invocations())
+
+
+def test_frontend_polls_orphans_portion_and_loads_module(ui):
+    """The orphan census reaches the page as its own state portion
+    and its renderer ships as a sibling module: app.js polls the
+    portion, index.html carries the section (with its own
+    load-state line) and loads orphans.js after app.js."""
+    _, js = ui.get("/static/app.js")
+    assert "/api/state/orphans" in js
+    _, html = ui.get("/")
+    assert 'id="slot-orphans"' in html
+    assert 'id="orphan-cards"' in html
+    assert "/static/orphans.js" in html
+
+
+def test_frontend_renders_orphans_and_posts_adoptions():
+    """orphans.js renders only the served census fields (derived
+    deadline with its source and stale flag, conflicts, evidenced
+    or candidate shape, creator caller, in-flight jobs, handover
+    flag) and posts the adoption to the panel endpoint, carrying
+    the picked shape for a class-ambiguous orphan."""
+    js = (REPO / "ui" / "static" / "orphans.js").read_text()
+    assert "renderOrphans" in js
+    assert "/api/lease/adopt" in js
+    for field in ("derived_deadline", "deadline_source", "deadline_stale_possible", "conflicts", "shape_candidates", "shape_evidenced", "creator_caller", "jobs_in_flight", "handover_pending"):
+        assert field in js, field
+    assert "adopt-shape-ambiguous" in js  # refusal text reads the verdict
+
+
+def test_frontend_shorten_picker_beside_extend():
+    """The lease cards carry a Shorten toggle beside Extend; the
+    picker posts hours or an absolute deadline to the shorten
+    endpoint through the verdict-returning helper and surfaces
+    the core's refusal actions."""
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    assert "/api/lease/shorten" in js
+    assert "apiResult" in js
+    assert "data-stoggle" in js and "data-sapply" in js
+    for action in ("shorten-not-earlier", "shorten-deadline-past", "shorten-standing-managed"):
+        assert action in js, action
+
+
+def test_deploy_syncs_the_orphans_module():
+    """deploy.sh's client file list is the artifact's source set:
+    a static file it does not name never reaches the published
+    page, and check would flag the deployed copy as drift."""
+    deploy = (REPO / "ui" / "deploy.sh").read_text()
+    assert "orphans.js" in deploy
