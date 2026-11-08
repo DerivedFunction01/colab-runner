@@ -17,6 +17,10 @@ directions resume: before moving a part, the far side's copy is
 verified by per-part SHA-256 and skipped when it already matches, so
 re-running a failed transfer moves only the missing or corrupt parts.
 The end-to-end SHA-256 still gates the assembled file.
+
+bin/colab-xfer is the verb over this library: it drives the two
+functions with a progress callback and keeps a pollable transfer
+record per move.
 """
 
 import hashlib
@@ -134,11 +138,15 @@ def _remote_part_hashes(session: str, names: list) -> dict:
         return {}
 
 
-def chunked_upload(session: str, local: Path, remote_name: str) -> dict:
+def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -> dict:
     """Upload local to /content/<remote_name> in 32 MB parts; verify hash.
 
     Parts already on the VM with a matching SHA-256 are skipped
     (resume); each remaining part is retried up to PART_ATTEMPTS times.
+    When progress is given it is called with {"parts", "parts_done",
+    "resumed_parts", "moved_parts"} once the part count is known and
+    again after every part lands or is skipped — the transfer
+    record bin/colab-xfer keeps is written from these calls.
     """
     local = Path(local)
     digest = sha256_file(local)
@@ -151,11 +159,19 @@ def chunked_upload(session: str, local: Path, remote_name: str) -> dict:
             part.write_bytes(chunk)
             metas.append({"name": part.name, "path": part, "sha256": sha256_bytes(chunk)})
             i += 1
+
+    def emit(resumed: int, moved: int) -> None:
+        if progress is not None:
+            progress({"parts": len(metas), "parts_done": resumed + moved,
+                      "resumed_parts": resumed, "moved_parts": moved})
+
     remote_hashes = _remote_part_hashes(session, [m["name"] for m in metas])
     resumed = uploaded = retried = 0
+    emit(0, 0)
     for i, m in enumerate(metas):
         if remote_hashes.get(m["name"]) == m["sha256"]:
             resumed += 1
+            emit(resumed, uploaded)
             continue
         r, used = _attempt(lambda m=m: colab("upload", "-s", session, str(m["path"]), f"/content/{m['name']}", timeout=3600))
         if r is None or r.returncode != 0:
@@ -165,6 +181,7 @@ def chunked_upload(session: str, local: Path, remote_name: str) -> dict:
         uploaded += 1
         if used > 1:
             retried += 1
+        emit(resumed, uploaded)
     names = json.dumps([m["name"] for m in metas])
     r = _exec_file(session, (
         "# transfer:reassemble\n"
@@ -190,13 +207,16 @@ def chunked_upload(session: str, local: Path, remote_name: str) -> dict:
             "uploaded_parts": uploaded, "retried_parts": retried}
 
 
-def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
+def chunked_download(session: str, remote_name: str, dest: Path, progress=None) -> dict:
     """Download /content/<remote_name> in 32 MB parts; verify hash locally.
 
     The remote split reports a SHA-256 per part and for the whole file.
     A local part copy whose hash already matches is skipped (resume);
     each remaining part is retried up to PART_ATTEMPTS times, and a
     downloaded part whose hash mismatches counts as a failed attempt.
+    When progress is given it is called with {"parts", "parts_done",
+    "resumed_parts", "moved_parts"} once the remote split reports and
+    again after every part lands or is skipped.
     """
     r = _exec_file(session, (
         "# transfer:split\n"
@@ -205,7 +225,7 @@ def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
         f"REMOTE = {json.dumps(remote_name)}\n"
         "path = os.path.join(BASE, REMOTE)\n"
         "size = os.path.getsize(path)\n"
-        "CH = 32 * 1024 * 1024\n"
+        f"CH = {CHUNK}\n"
         "whole = hashlib.sha256()\n"
         "parts = []\n"
         "with open(path, 'rb') as f:\n"
@@ -226,6 +246,13 @@ def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     resumed = downloaded = retried = 0
+
+    def emit() -> None:
+        if progress is not None:
+            progress({"parts": len(parts), "parts_done": resumed + downloaded,
+                      "resumed_parts": resumed, "moved_parts": downloaded})
+
+    emit()
     local_parts = []
     for meta in parts:
         name, want_sha = meta["name"], meta["sha256"]
@@ -234,6 +261,7 @@ def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
         if tmp.exists() and tmp.stat().st_size == meta["size"] and sha256_file(tmp) == want_sha:
             resumed += 1
             local_parts.append(tmp)
+            emit()
             continue
 
         def fetch(tmp=tmp, name=name, want_sha=want_sha):
@@ -253,6 +281,7 @@ def chunked_download(session: str, remote_name: str, dest: Path) -> dict:
         if used > 1:
             retried += 1
         local_parts.append(tmp)
+        emit()
     h = hashlib.sha256()
     with open(dest, "wb") as out:
         for tmp in local_parts:

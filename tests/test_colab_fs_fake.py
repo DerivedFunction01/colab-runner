@@ -9,17 +9,32 @@ snippets/fs_ops.py byte-for-byte, the spec JSON carries the right
 op/path/base64 fields, verdicts and exit codes propagate, read
 splits content (stdout) from verdict (stderr), and usage errors
 exit 2.
+
+The E7 section pins the payload bounds: the driver refuses an
+over-ceiling write before the channel is touched (naming
+bin/colab-xfer, the bulk verb), every read spec carries the byte
+cap, and the payload itself streams a read in bounded chunks —
+never materializing the file's lines — and refuses a window over
+the byte cap.
 """
 
 import base64
+import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FS_OPS_BYTES = (REPO / "snippets" / "fs_ops.py").read_bytes()
+
+fs_spec = importlib.util.spec_from_loader(
+    "fs_ops", SourceFileLoader("fs_ops", str(REPO / "snippets" / "fs_ops.py")))
+fs_ops = importlib.util.module_from_spec(fs_spec)
+fs_spec.loader.exec_module(fs_ops)
 
 STUB = """#!/usr/bin/env bash
 cat > "${COLAB_FS_STUB_CAPTURE:?}"
@@ -272,3 +287,150 @@ def test_channel_refusal_is_terminal_no_retry(tmp_path):
     assert r.returncode == 2
     assert len(count.read_text().splitlines()) == 1
 
+
+
+# --- E7: payload bounds ------------------------------------------------------
+
+
+def test_write_over_the_ceiling_refuses_before_the_channel(tmp_path, monkeypatch):
+    """An over-ceiling write is refused by the driver itself: the
+    channel is never invoked (the stub would have created its
+    capture file), nothing is written, and the refusal names the
+    bulk verb. --from and --stdin are bounded alike; an
+    under-ceiling write proceeds as before."""
+    monkeypatch.setenv("COLAB_FS_MAX_WRITE_BYTES", "10")
+    driver = make_fake_repo(tmp_path)
+    local = tmp_path / "local.txt"
+    local.write_bytes(b"x" * 20)
+    verdict = ok_verdict("write", "/content/a.txt")
+    r, capture = run_driver(driver, tmp_path, ["write", "/content/a.txt", "--from", str(local)], verdict)
+    assert r.returncode == 2
+    assert b"colab-xfer" in r.stderr
+    assert not capture.exists()
+    r, capture = run_driver(
+        driver, tmp_path, ["write", "/content/a.txt", "--stdin"], verdict, stdin=b"x" * 20
+    )
+    assert r.returncode == 2
+    assert b"colab-xfer" in r.stderr
+    assert not capture.exists()
+    r, capture = run_driver(
+        driver, tmp_path, ["write", "/content/a.txt", "--stdin"], verdict, stdin=b"short"
+    )
+    assert r.returncode == 0
+    assert base64.b64decode(captured_spec(capture)["content_b64"]) == b"short"
+
+
+def test_read_spec_carries_the_byte_cap(tmp_path, monkeypatch):
+    driver = make_fake_repo(tmp_path)
+    verdict = ok_verdict("read", "/content/a.txt", content_b64="")
+    r, capture = run_driver(driver, tmp_path, ["read", "/content/a.txt"], verdict)
+    assert r.returncode == 0
+    assert captured_spec(capture)["max_bytes"] == 50 * 1024 * 1024
+    monkeypatch.setenv("COLAB_FS_MAX_READ_BYTES", "4096")
+    r, capture = run_driver(driver, tmp_path, ["read", "/content/a.txt"], verdict)
+    assert r.returncode == 0
+    assert captured_spec(capture)["max_bytes"] == 4096
+
+
+class _CountingReader:
+    """Wraps a binary file object, recording every read size."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.read_sizes = []
+
+    def read(self, n=-1):
+        self.read_sizes.append(n)
+        return self.raw.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.raw.close()
+        return False
+
+
+def test_payload_read_streams_bounded_chunks_and_never_materializes(tmp_path, monkeypatch):
+    """A paged read of a file larger than the payload's chunk:
+    every in-session read is one bounded chunk, the whole-file
+    read the old implementation materialized with is never called,
+    and the verdict is the same as the materializing one's."""
+    target = tmp_path / "big.txt"
+    blob = b"".join(b"line %05d xxxxxxxxxxxxxxxxxxxx\n" % i for i in range(5000))
+    target.write_bytes(blob)
+    readers = []
+    real_open = fs_ops._open_read
+
+    def counting_open(path):
+        reader = _CountingReader(real_open(path))
+        readers.append(reader)
+        return reader
+
+    monkeypatch.setattr(fs_ops, "_open_read", counting_open)
+
+    def no_whole_read(self):
+        raise AssertionError("read op materialized the whole file")
+
+    monkeypatch.setattr(Path, "read_bytes", no_whole_read)
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "offset": 4990, "max_lines": 5})
+    assert v["ok"] is True
+    assert v["total_lines"] == 5000 and v["lines_returned"] == 5
+    assert v["offset"] == 4990 and v["truncated"] is True
+    assert base64.b64decode(v["content_b64"]) == b"".join(
+        b"line %05d xxxxxxxxxxxxxxxxxxxx\n" % i for i in range(4989, 4994)
+    )
+    assert v["before_sha256"] == hashlib.sha256(blob).hexdigest()
+    assert v["bytes_before"] == len(blob)
+    sizes = readers[0].read_sizes
+    assert len(sizes) > 1 and all(0 < n <= 65536 for n in sizes)
+
+
+def test_payload_read_line_boundaries_match_splitlines(tmp_path):
+    """The streaming splitter's line definition is bytes.splitlines'
+    own — \\r, \\r\\n, and \\n bound lines, and nothing else does:
+    \\v, \\f, and \\x1c-\\x1e are str.splitlines boundaries, never
+    bytes ones — including a \\r\\n pair straddling the chunk seam."""
+    payload = b"a\rb\r\nc\vd\fe\x1cf\x1dg\x1eh\nlast"
+    target = tmp_path / "bounds.txt"
+    target.write_bytes(payload)
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 0})
+    assert v["ok"] is True
+    assert v["total_lines"] == len(payload.splitlines(keepends=True)) == 4
+    assert base64.b64decode(v["content_b64"]) == payload
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "offset": 2, "max_lines": 2})
+    assert base64.b64decode(v["content_b64"]) == b"b\r\nc\vd\fe\x1cf\x1dg\x1eh\n"
+    seam = tmp_path / "seam.txt"
+    blob = b"x" * 65535 + b"\r\ny\n"  # the \r is chunk 1's last byte
+    seam.write_bytes(blob)
+    v = fs_ops.run_spec({"op": "read", "path": str(seam), "max_lines": 0})
+    assert v["ok"] is True
+    assert v["total_lines"] == len(blob.splitlines(keepends=True)) == 2
+    assert base64.b64decode(v["content_b64"]) == blob
+
+
+def test_payload_read_window_over_the_byte_cap_refuses_naming_xfer(tmp_path):
+    target = tmp_path / "capped.txt"
+    line = b"y" * 100 + b"\n"
+    target.write_bytes(line * 10)
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 0, "max_bytes": 250})
+    assert v["ok"] is False
+    assert "colab-xfer" in v["error"]
+    assert "content_b64" not in v
+    assert v["bytes_before"] == 1010  # the refusal still describes the file
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 3, "max_bytes": 303})
+    assert v["ok"] is True and v["bytes_after"] == 303  # exactly at the cap is a read
+
+
+def test_payload_read_default_cap_bounds_a_huge_window(tmp_path):
+    """--max-lines 0 no longer lifts every cap: a window past the
+    default 50 MB byte cap refuses under a bare spec, and an
+    explicit max_bytes of 0 is the deliberate lift."""
+    target = tmp_path / "huge.txt"
+    blob = b"x" * (50 * 1024 * 1024 + 1) + b"\n"
+    target.write_bytes(blob)
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 0})
+    assert v["ok"] is False and "colab-xfer" in v["error"]
+    v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 0, "max_bytes": 0})
+    assert v["ok"] is True and v["bytes_after"] == len(blob)
+    assert base64.b64decode(v["content_b64"]) == blob

@@ -6,7 +6,8 @@ One JSON spec arrives on stdin:
     {"op": "write",  "path": P, "content_b64": B}
     {"op": "patch",  "path": P, "old_b64": B, "new_b64": B}
     {"op": "delete", "path": P, "missing_ok": false}
-    {"op": "read",   "path": P, "offset": 1, "max_lines": 900}
+    {"op": "read",   "path": P, "offset": 1, "max_lines": 900,
+     "max_bytes": N}
 
 Text fields travel base64 so the spec survives the shell channel
 byte-exact; patch also accepts plain "old_text"/"new_text" fields.
@@ -17,8 +18,15 @@ unlinks (a missing file is an error unless missing_ok), read
 mutates nothing. A read is paged: "offset" is the 1-based first
 line (default 1) and "max_lines" caps the lines returned (default
 DEFAULT_READ_MAX_LINES; 0 means no cap), so a read never returns a
-monolith unasked. Writes land atomically — a fresh sibling temp in
-the same directory, then os.replace over the target.
+monolith unasked. "max_bytes" caps the returned window's bytes
+(default DEFAULT_READ_MAX_BYTES; 0 means no cap): a window over
+the cap is an error verdict naming bin/colab-xfer, the bulk-move
+verb — a read is a window onto a file, never a transfer. The read
+streams the file in bounded chunks and splits lines as it goes:
+the file's lines are never materialized in-session, however large
+it is; only the returned window is held. Writes land atomically —
+a fresh sibling temp in the same directory, then os.replace over
+the target.
 
 Exactly one JSON verdict line goes to stdout:
 
@@ -53,6 +61,141 @@ OPS = ("write", "patch", "delete", "read")
 # default. The driver mirrors this default and can override it
 # per call or via its environment.
 DEFAULT_READ_MAX_LINES = 900
+
+# A read's window is also capped in bytes (0 lifts the cap): the
+# measured single-file channel ceiling, above which bulk movement
+# rides bin/colab-xfer's chunked route instead. The driver mirrors
+# this default the same way.
+DEFAULT_READ_MAX_BYTES = 50 * 1024 * 1024
+
+# One streaming-read chunk in the read pass: the payload reads and
+# hashes the file in slices of this size, never the whole file.
+_READ_CHUNK = 64 * 1024
+
+# The only bytes bytes.splitlines treats as line boundaries
+# (the wider str.splitlines set never applies to bytes).
+_LINE_BOUNDARIES = frozenset(b"\n\r")
+
+
+def _open_read(path: Path):
+    """Open path for binary streaming reads (the read pass's seam)."""
+    return path.open("rb")
+
+
+def _iter_lines(chunks):
+    """Yield the lines of a byte stream, split exactly as
+    bytes.splitlines(keepends=True) splits — the boundaries are
+    \\n, \\r, and \\r\\n (one boundary); bytes have no others —
+    from an iterable of byte chunks. Only one partial line plus
+    one chunk is ever held: the file's line list is never
+    materialized."""
+    buf = bytearray()
+    pos = 0  # scan cursor: buf[:pos] is the current line's scanned prefix
+
+    def scan(final: bool) -> bytes | None:
+        nonlocal pos
+        i = pos
+        while i < len(buf) and buf[i] not in _LINE_BOUNDARIES:
+            i += 1
+        if i == len(buf):
+            pos = i
+            if final and buf:
+                line = bytes(buf)
+                buf.clear()
+                pos = 0
+                return line
+            return None
+        end = i + 1
+        if buf[i] == 0x0D:  # \r: a following \n joins it into one boundary
+            if i + 1 == len(buf) and not final:
+                pos = i  # undecidable until the next chunk arrives
+                return None
+            if i + 1 < len(buf) and buf[i + 1] == 0x0A:
+                end = i + 2
+        line = bytes(buf[:end])
+        del buf[:end]
+        pos = 0
+        return line
+
+    for chunk in chunks:
+        buf += chunk
+        while True:
+            line = scan(final=False)
+            if line is None:
+                break
+            yield line
+    while True:
+        line = scan(final=True)
+        if line is None:
+            break
+        yield line
+
+
+def _run_read(spec: dict, path: Path, raw_path: str, verdict: dict) -> None:
+    """Execute a read spec into verdict, streaming the file once.
+
+    The pass hashes and counts the whole file (before_* describe
+    it, as the verdict contract states) while collecting only the
+    requested window's lines. A window past the byte cap fails the
+    read after the pass — the verdict still describes the file,
+    and the error names the bulk-move verb.
+    """
+    offset = spec.get("offset", 1)
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
+        raise ValueError("offset must be a positive integer (1-based)")
+    max_lines = spec.get("max_lines", DEFAULT_READ_MAX_LINES)
+    if max_lines is None:
+        max_lines = DEFAULT_READ_MAX_LINES
+    if not isinstance(max_lines, int) or isinstance(max_lines, bool) or max_lines < 0:
+        raise ValueError("max_lines must be a non-negative integer (0 means no cap)")
+    max_bytes = spec.get("max_bytes", DEFAULT_READ_MAX_BYTES)
+    if max_bytes is None:
+        max_bytes = DEFAULT_READ_MAX_BYTES
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0:
+        raise ValueError("max_bytes must be a non-negative integer (0 means no cap)")
+    try:
+        fh = _open_read(path)
+    except FileNotFoundError:
+        raise ValueError(f"no such file: {raw_path}") from None
+    digest = hashlib.sha256()
+    total_bytes = 0
+    total_lines = 0
+    lines_returned = 0
+    window = bytearray()
+    window_over_cap = False
+    with fh:
+
+        def chunks():
+            nonlocal total_bytes
+            while chunk := fh.read(_READ_CHUNK):
+                digest.update(chunk)
+                total_bytes += len(chunk)
+                yield chunk
+
+        for line in _iter_lines(chunks()):
+            total_lines += 1
+            if total_lines < offset:
+                continue
+            if max_lines and lines_returned >= max_lines:
+                continue
+            window += line
+            lines_returned += 1
+            if max_bytes and len(window) > max_bytes:
+                window_over_cap = True
+    verdict["before_sha256"] = digest.hexdigest()
+    verdict["bytes_before"] = total_bytes
+    if window_over_cap:
+        raise ValueError(
+            f"read window exceeds the {max_bytes}-byte cap; bulk movement rides bin/colab-xfer"
+        )
+    data = bytes(window)
+    verdict["content_b64"] = base64.b64encode(data).decode("ascii")
+    verdict["after_sha256"] = _sha(data)
+    verdict["bytes_after"] = len(data)
+    verdict["total_lines"] = total_lines
+    verdict["lines_returned"] = lines_returned
+    verdict["offset"] = offset
+    verdict["truncated"] = (offset - 1 + lines_returned) < total_lines
 
 
 def _sha(data: bytes | None) -> str | None:
@@ -120,6 +263,10 @@ def run_spec(spec: dict) -> dict:
         if not raw_path or not isinstance(raw_path, str):
             raise ValueError("spec is missing 'path'")
         path = Path(raw_path)
+        if op == "read":
+            _run_read(spec, path, raw_path, verdict)
+            verdict["ok"] = True
+            return verdict
         before = _before(path)
         if before is not None:
             verdict["before_sha256"] = _sha(before)
@@ -147,33 +294,12 @@ def run_spec(spec: dict) -> dict:
             _atomic_write(path, data)
             verdict["after_sha256"] = _sha(data)
             verdict["bytes_after"] = len(data)
-        elif op == "delete":
+        else:  # delete
             if before is None and not path.exists():
                 if not spec.get("missing_ok"):
                     raise ValueError(f"no such file: {raw_path}")
             else:
                 path.unlink()
-        else:  # read
-            if before is None:
-                raise ValueError(f"no such file: {raw_path}")
-            offset = spec.get("offset", 1)
-            if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
-                raise ValueError("offset must be a positive integer (1-based)")
-            max_lines = spec.get("max_lines", DEFAULT_READ_MAX_LINES)
-            if max_lines is None:
-                max_lines = DEFAULT_READ_MAX_LINES
-            if not isinstance(max_lines, int) or isinstance(max_lines, bool) or max_lines < 0:
-                raise ValueError("max_lines must be a non-negative integer (0 means no cap)")
-            lines = before.splitlines(keepends=True)
-            window = lines[offset - 1 :] if max_lines == 0 else lines[offset - 1 : offset - 1 + max_lines]
-            data = b"".join(window)
-            verdict["content_b64"] = base64.b64encode(data).decode("ascii")
-            verdict["after_sha256"] = _sha(data)
-            verdict["bytes_after"] = len(data)
-            verdict["total_lines"] = len(lines)
-            verdict["lines_returned"] = len(window)
-            verdict["offset"] = offset
-            verdict["truncated"] = (offset - 1 + len(window)) < len(lines)
         verdict["ok"] = True
     except Exception as exc:  # noqa: BLE001 — failures are verdicts
         verdict["error"] = str(exc) if isinstance(exc, ValueError) else f"{type(exc).__name__}: {exc}"

@@ -12,6 +12,13 @@
 # read is never the default; the verdict on stderr reports
 # total_lines and whether the window was truncated.
 #
+# Payloads are bounded by the measured single-file ceiling
+# (50 MB): a write larger than $COLAB_FS_MAX_WRITE_BYTES (default
+# 52428800) is refused before the channel is touched, and a read
+# spec carries a byte cap for its window ($COLAB_FS_MAX_READ_BYTES,
+# same default; the payload enforces it) — both refusals name
+# bin/colab-xfer, the chunked verb bulk movement rides instead.
+#
 # The session comes from -s or $COLAB_SH_SESSION (bin/colab-sh's
 # convention); the tool never creates a session — it rides
 # bin/colab-sh, which attaches to live sessions only. One stdin
@@ -57,6 +64,8 @@ new_file=
 missing_ok=0
 read_offset=1
 read_max_lines=${COLAB_FS_READ_MAX_LINES:-900}
+read_max_bytes=${COLAB_FS_MAX_READ_BYTES:-52428800}
+max_write_bytes=${COLAB_FS_MAX_WRITE_BYTES:-52428800}
 paging_set=0
 
 while [ $# -gt 0 ]; do
@@ -133,6 +142,13 @@ case $path in
 esac
 
 case $read_max_lines in '' | *[!0-9]*) usage ;; esac
+case $read_max_bytes in '' | *[!0-9]*) usage ;; esac
+case $max_write_bytes in '' | *[!0-9]*) usage ;; esac
+
+refuse_oversize_write() {
+    printf 'colab-fs: write payload of %s bytes exceeds the %s-byte single-call ceiling; bulk movement rides bin/colab-xfer (colab-xfer up -s %s LOCAL_PATH REMOTE_NAME)\n' "$1" "$max_write_bytes" "$session" >&2
+    exit 2
+}
 
 # Per-op option discipline and the spec body.
 spec=
@@ -142,9 +158,20 @@ case $op in
         content_b64=
         if [ -n "$from_file" ] && [ "$use_stdin" = 0 ]; then
             [ -f "$from_file" ] || usage
+            src_bytes=$(wc -c <"$from_file")
+            src_bytes=${src_bytes//[[:space:]]/}
+            [ "$src_bytes" -gt "$max_write_bytes" ] && refuse_oversize_write "$src_bytes"
             content_b64=$(b64 <"$from_file")
         elif [ -z "$from_file" ] && [ "$use_stdin" = 1 ]; then
             content_b64=$(b64)
+            b64_len=${#content_b64}
+            pad=0
+            case $content_b64 in
+                *==) pad=2 ;;
+                *=) pad=1 ;;
+            esac
+            src_bytes=$((b64_len / 4 * 3 - pad))
+            [ "$src_bytes" -gt "$max_write_bytes" ] && refuse_oversize_write "$src_bytes"
         else
             usage
         fi
@@ -176,7 +203,7 @@ case $op in
         ;;
     read)
         [ -z "$from_file" ] && [ "$use_stdin" = 0 ] && [ "$old_set" = 0 ] && [ "$new_set" = 0 ] && [ -z "$old_file" ] && [ -z "$new_file" ] && [ "$missing_ok" = 0 ] || usage
-        spec=$(printf '{"op":"read","path":"%s","offset":%s,"max_lines":%s}' "$path" "$read_offset" "$read_max_lines")
+        spec=$(printf '{"op":"read","path":"%s","offset":%s,"max_lines":%s,"max_bytes":%s}' "$path" "$read_offset" "$read_max_lines" "$read_max_bytes")
         ;;
 esac
 

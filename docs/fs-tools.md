@@ -1,4 +1,4 @@
-# fs tools — file edits on a Colab session
+# fs tools — file edits and bulk moves on a Colab session
 
 `bin/colab-fs` writes, patches, deletes, and reads individual files
 on a Colab session, with the same semantics as the agent file
@@ -17,6 +17,12 @@ targets existing sessions only and never creates one — session
 lifecycle belongs to the lease, and `bin/colab-sh` refuses a
 session its own read does not call alive. Caller attribution rides
 `$COLAB_CALLER` through the channel, as with every wrapper.
+
+Bulk movement is a different tool: `bin/colab-xfer` (below) moves
+one file in 32 MB parts with per-part hash resume. colab-fs is for
+file-sized edits; anything near the single-file channel ceiling
+belongs to the chunked verb, and the bounds below say so at the
+point of refusal.
 
 ## The four ops
 
@@ -37,7 +43,28 @@ session its own read does not call alive. Caller attribution rides
   `$COLAB_FS_READ_MAX_LINES` or 900; 0 means no cap), so a read
   never returns a monolith unasked. The verdict reports
   `total_lines`, `lines_returned`, and `truncated` — page forward
-  with `--offset` when `truncated` is true.
+  with `--offset` when `truncated` is true. In-session, the
+  payload streams the file in bounded chunks and splits lines as
+  it goes (the line definition is `bytes.splitlines`' own,
+  `\r\n` pairs included): the file's lines are never materialized,
+  however large the file is — only the returned window is held.
+
+## Bounds
+
+Single-file channel transfers are reliable to ~50 MB and
+unreliable above (the measured ceiling in AGENTS.md), so
+colab-fs payloads are bounded by it:
+
+- A **write** payload above the ceiling is refused by the driver
+  before the channel is touched — nothing is written — and the
+  refusal names `bin/colab-xfer`. The ceiling defaults to
+  52428800 bytes and is tunable via `$COLAB_FS_MAX_WRITE_BYTES`.
+- A **read** window is capped in bytes as well as lines: the
+  spec carries `max_bytes` (default 52428800, tunable via
+  `$COLAB_FS_MAX_READ_BYTES`; 0 lifts it deliberately) and the
+  payload refuses a window past the cap with an error naming
+  `bin/colab-xfer`. `--max-lines 0` lifts only the line cap,
+  never this one.
 
 ## The verdict
 
@@ -55,3 +82,41 @@ returned slice; the verdict adds the paging fields named above.
 Failures are verdicts with `ok: false`, never tracebacks. The
 driver's exit code is the payload's: 0 when the verdict is ok,
 1 when it is not, 2 for usage errors.
+
+## Bulk moves: bin/colab-xfer
+
+    colab-xfer up     -s SESSION LOCAL_PATH REMOTE_NAME [--caller TAG] [--id XFER_ID]
+    colab-xfer down   -s SESSION REMOTE_NAME LOCAL_PATH [--caller TAG] [--id XFER_ID]
+    colab-xfer status XFER_ID
+
+The verb over `sync/transfer.py`'s chunked machinery, for the
+moves that sit outside any job's declared outputs. REMOTE_NAME is
+a bare file name at `/content` (a leading `/content/` is accepted
+and stripped); the file moves in 32 MB parts, each retried
+individually and verified by its own SHA-256, and the assembled
+file is verified end to end. A part whose far-side (up) or local
+(down) copy already matches its hash is not re-moved, so a killed
+or failed move re-run later moves only what never landed
+verified. The caller claim resolves as every wrapper's does and
+is stamped on the record.
+
+Every move keeps a transfer record at `results/xfers/<id>.json`
+(the id is generated — `<direction>-<UTC timestamp>-<pid>` — or
+given with `--id`), written as the parts land and finished with
+the terminal state:
+
+    {"xfer_id": ..., "direction": "up"|"down", "session": ...,
+     "caller": ..., "local_path": ..., "remote_name": ...,
+     "state": "starting"|"running"|"complete"|"failed",
+     "started_at": ..., "finished_at": ...,
+     "bytes": ..., "sha256": ..., "remote_sha256": ...,
+     "parts": N, "parts_done": K, "resumed_parts": ...,
+     "moved_parts": ..., "retried_parts": ...,
+     "error": {"stage": ..., "attempts": ..., "stderr": ...}
+              (failed only)}
+
+The record makes a move pollable (`colab-xfer status <id>` prints
+it without touching a session) and continuable: re-invoking the
+move with the same `--id` updates the same record while the parts
+resume by hash. The verb prints the final record and exits 0 on
+complete, 1 on a failed move, 2 on usage errors.
