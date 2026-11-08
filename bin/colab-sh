@@ -2,8 +2,11 @@
 """Bare-shell channel to a leased Colab session, over real SSH.
 
 Usage:
-  colab-sh [-s SESSION] [--dir DIR] [--timeout SECONDS] [--env K=V ...]
-           ('inline command' | -f script.sh | -- args...) [< script]
+  colab-sh [-s SESSION] [--caller TAG] [--dir DIR] [--timeout SECONDS]
+           [--env K=V ...] ('inline command' | -f script.sh | -- args...)
+           [< script]
+  colab-sh --detach [same options] (command | -f script.sh) [< script]
+  colab-sh --poll ID [-s SESSION] [--caller TAG]
 
 The official CLI's `exec` runs Python inside the session's IPython
 kernel (sys.argv leaks, SystemExit non-fatal, kernel state shared).
@@ -24,6 +27,16 @@ Rules:
 - One SSH connection per runtime at a time (the server answers 429
   while another is connected). This wrapper is one-shot: it connects,
   runs, disconnects.
+- Synchronous use is claim-gated: before connecting, the lease
+  core's sync_rights verdict must allow this caller (a TTL'd claim
+  held by the session's sole active caller; attaches auto-claim).
+  A refusal exits 2 naming the holder, the evidence, and the
+  detached alternative. --detach and --poll are the async path —
+  seconds-long connects that launch or read in-session work — and
+  stay open to every caller; they never take the claim. Lease- and
+  runner-internal calls never pass through this gate by
+  construction: they use the CLI funnel (sync/cli.py), not this
+  wrapper.
 - Auth is the local ~/.ssh/id_ed25519 key (ed25519/ecdsa only; the
   server rejects RSA). The CLI derives the offered public key from
   the same key, so the pair always matches.
@@ -33,11 +46,15 @@ Rules:
 """
 
 import argparse
+import base64
 import json
 import os
+import re
+import secrets
 import shlex
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -162,6 +179,185 @@ def journal_claim(session: str, caller: str | None) -> None:
         pass
 
 
+# --- Synchronous claim gate -----------------------------------------------------
+# The gate binds this wrapper's synchronous mode only. sync_rights
+# (sync/lease/syncclaims.py) is the one implementation; a gate
+# error refuses — fail closed, like the liveness guard above —
+# because an unreadable claim state is exactly when an unrecorded
+# hold does its damage.
+
+DETACHED_REMOTE_DIR = "/content/sync-detached"
+_DETACH_ID = re.compile(r"[0-9A-Za-z-]{1,64}\Z")
+
+
+def sync_gate(session: str, caller: str | None) -> dict | None:
+    """The refusal verdict when the lease core denies this caller
+    the synchronous channel, else None. The verdict is the core's
+    own dict (blocked_by / holder / evidence / expires_at)."""
+    try:
+        verdict = _lease_module().sync_rights(REPO, session, caller)
+    except Exception as err:  # noqa: BLE001
+        return {"blocked_by": "error", "holder": None, "evidence": [], "expires_at": None, "error": str(err)}
+    return None if verdict.get("allowed") else verdict
+
+
+def _evidence_text(verdict: dict) -> str:
+    parts = []
+    for item in verdict.get("evidence") or []:
+        kind = item.get("kind")
+        if kind == "claim":
+            parts.append(f"claim claimed at {item.get('claimed_at')}")
+        elif kind == "run":
+            parts.append(f"run {item.get('run_id')} ({item.get('state')})")
+        elif kind == "job":
+            parts.append(f"job {item.get('run_id')} registered on the lease record")
+        elif kind == "attach":
+            parts.append(f"attach via {item.get('seam')} at {item.get('ts')}")
+    return "; ".join(parts) or "no detail"
+
+
+def detached_alternative(args, session: str, caller: str | None, script_args: list) -> str:
+    """The --detach form of the caller's own refused command: the
+    async route that stays open to every caller."""
+    parts = ["colab-sh", "--detach", "-s", session]
+    if caller:
+        parts += ["--caller", caller]
+    if args.dir != "/content":
+        parts += ["--dir", args.dir]
+    for kv in args.env:
+        parts += ["--env", kv]
+    if args.file:
+        parts += ["-f", args.file]
+        if script_args:
+            parts += ["--", *script_args]
+    elif args.command:
+        parts += ["--", *args.command]
+    else:
+        parts += ["<your-script-on-stdin>"]
+    return " ".join(shlex.quote(p) if any(c in p for c in " <>") else p for p in parts)
+
+
+def refusal_message(session: str, caller: str | None, verdict: dict, alternative: str) -> str:
+    who = f"caller {caller!r}" if caller else "an unattributed caller"
+    if verdict.get("blocked_by") == "error":
+        head = f"the sync-claim check failed ({verdict.get('error')}); refusing — fail closed"
+    elif verdict.get("blocked_by") == "claim":
+        head = f"the sync claim is held by {verdict.get('holder')!r} until {verdict.get('expires_at')}"
+    else:
+        head = f"caller {verdict.get('holder')!r} is active on this session and synchronous use is off while multiple threads are active"
+    return (
+        f"colab-sh: synchronous attach to session {session!r} refused for {who} — {head} "
+        f"(evidence: {_evidence_text(verdict)}).\n"
+        f"Detached alternative (open to all callers): {alternative}"
+    )
+
+
+# --- Detached mode ----------------------------------------------------------------
+# --detach launches the script in-session under nohup and returns
+# at once; --poll reads its state with one short call. The launch
+# and the poll are seconds-long connects — the sanctioned async
+# path, open to every caller, never claim-gated.
+
+
+def detach_id() -> str:
+    return f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(2)}"
+
+
+def run_remote(session: str, script_text: str, timeout: float) -> subprocess.CompletedProcess:
+    cmd = ssh_argv(session, "/content", [], DEFAULT_IDENTITY)
+    return subprocess.run(
+        cmd, input=script_text, text=True, capture_output=True,
+        timeout=timeout, env=proxy_env(os.environ),
+    )
+
+
+def detach_launch(session: str, args, script: str, env_pairs: list, caller: str | None) -> int:
+    did = detach_id()
+    body = build_stdin(script, env_pairs)
+    if args.dir != "/content":
+        body = f"cd {shlex.quote(args.dir)}\n" + body
+    payload_b64 = base64.b64encode(body.encode()).decode()
+    meta = {
+        "id": did, "session": session, "caller": caller,
+        "started_at": datetime.now(timezone.utc).isoformat(), "state": "running",
+    }
+    lines = [
+        "set -u",
+        f"D={DETACHED_REMOTE_DIR}",
+        'mkdir -p "$D"',
+        f"printf %s {shlex.quote(payload_b64)} | base64 -d > \"$D/{did}.sh\"",
+        f"cat > \"$D/{did}.json\" <<'META'",
+        json.dumps(meta),
+        "META",
+        f"nohup bash -c 'bash \"$0\"; echo $? > \"$0.exit\"' \"$D/{did}.sh\" > \"$D/{did}.log\" 2>&1 &",
+        f"echo $! > \"$D/{did}.pid\"",
+        "",
+    ]
+    try:
+        r = run_remote(session, "\n".join(lines), timeout=120)
+    except subprocess.TimeoutExpired:
+        print(f"colab-sh: detached launch timed out (session {session})", file=sys.stderr)
+        return 124
+    if r.returncode != 0:
+        print(f"colab-sh: detached launch failed (ssh rc {r.returncode})", file=sys.stderr)
+        return r.returncode
+    print(json.dumps({"id": did, "session": session, "state": "running", "log": f"{DETACHED_REMOTE_DIR}/{did}.log"}))
+    return 0
+
+
+def detach_poll(session: str, did: str) -> int:
+    if not _DETACH_ID.fullmatch(did):
+        print(f"colab-sh: bad detached id {did!r}", file=sys.stderr)
+        return 2
+    lines = [
+        "set -u",
+        f"D={DETACHED_REMOTE_DIR}",
+        f"ID={shlex.quote(did)}",
+        'if [ ! -f "$D/$ID.json" ]; then echo NOT-FOUND; exit 0; fi',
+        'cat "$D/$ID.json"',
+        'if [ -f "$D/$ID.exit" ]; then echo "STATE done"; echo "EXIT $(cat "$D/$ID.exit")";',
+        'elif [ -n "$(cat "$D/$ID.pid" 2>/dev/null)" ] && kill -0 "$(cat "$D/$ID.pid")" 2>/dev/null; then echo "STATE running"; echo "EXIT -";',
+        'else echo "STATE exited-unrecorded"; echo "EXIT -"; fi',
+        'echo ---LOG---',
+        'tail -n 40 "$D/$ID.log" 2>/dev/null || true',
+        "",
+    ]
+    try:
+        r = run_remote(session, "\n".join(lines), timeout=120)
+    except subprocess.TimeoutExpired:
+        print(f"colab-sh: detached poll timed out (session {session})", file=sys.stderr)
+        return 124
+    if r.returncode != 0:
+        print(f"colab-sh: detached poll failed (ssh rc {r.returncode})", file=sys.stderr)
+        return r.returncode
+    out = r.stdout
+    if out.startswith("NOT-FOUND"):
+        print(json.dumps({"id": did, "session": session, "state": "not-found"}))
+        return 2
+    meta_line, _, rest = out.partition("\n")
+    try:
+        meta = json.loads(meta_line)
+    except json.JSONDecodeError:
+        meta = {}
+    state, exit_code, log_tail = "exited-unrecorded", None, ""
+    for line in rest.splitlines():
+        if line.startswith("STATE "):
+            state = line.split(" ", 1)[1]
+        elif line.startswith("EXIT "):
+            raw = line.split(" ", 1)[1]
+            exit_code = int(raw) if raw.lstrip("-").isdigit() else None
+    if "---LOG---\n" in rest:
+        log_tail = rest.split("---LOG---\n", 1)[1]
+    print(json.dumps({"id": did, "session": session, "state": state, "exit_code": exit_code,
+                      "caller": meta.get("caller"), "started_at": meta.get("started_at"),
+                      "log_tail": log_tail}))
+    if state == "done":
+        return exit_code if exit_code is not None else 0
+    if state == "exited-unrecorded":
+        return 3
+    return 0
+
+
 def read_script(args) -> str | None:
     if args.file:
         return Path(args.file).read_text()
@@ -176,6 +372,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="colab-sh", description=__doc__.split("\n")[0])
     ap.add_argument("-s", "--session", help="session name (default: the active lease's)")
     ap.add_argument("--caller", help="caller claim: the thread doing this work (or $COLAB_CALLER); journaled per attach")
+    ap.add_argument("--detach", action="store_true", help="launch the script detached in-session (nohup + log under /content/sync-detached) and return its id at once; the async path, open to all callers")
+    ap.add_argument("--poll", metavar="ID", help="one short read of a detached launch's state + log tail; exits with the job's exit code once it is done")
     ap.add_argument("-f", "--file", help="shell script file to run")
     ap.add_argument("--dir", default="/content", help="remote working directory")
     ap.add_argument("--timeout", type=float, default=900, help="seconds (default 900)")
@@ -222,6 +420,12 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.poll is not None:
+        # A poll is a seconds-long read of in-session state — the
+        # async path, never claim-gated. The attach is journaled
+        # like any other: attribution is evidence.
+        journal_claim(session, caller)
+        return detach_poll(session, args.poll)
     script = read_script(args)
     if script is None or not script.strip():
         print("colab-sh: no script (pass a command, -f FILE, or pipe stdin)", file=sys.stderr)
@@ -242,9 +446,24 @@ def main(argv=None) -> int:
     except Exception:
         pass
 
-    # The attach is real from here: journal its caller claim (the
-    # claim never gates the attach — attribution is evidence, and
-    # the liveness guard above is the only refusal on this path).
+    if args.detach:
+        # The launch is a seconds-long connect that starts
+        # in-session work and disconnects — open to every caller,
+        # never claim-gated.
+        journal_claim(session, caller)
+        return detach_launch(session, args, script, env_pairs, caller)
+
+    # The synchronous gate: the lease core's verdict, evaluated
+    # after liveness and caller resolution, before connecting. A
+    # refusal names the holder, the evidence, and the detached
+    # form of this very command.
+    verdict = sync_gate(session, caller)
+    if verdict is not None:
+        print(refusal_message(session, caller, verdict,
+                              detached_alternative(args, session, caller, script_args)), file=sys.stderr)
+        return 2
+
+    # The attach is real from here: journal its caller claim.
     journal_claim(session, caller)
     cmd = ssh_argv(session, args.dir, script_args, identity)
     try:

@@ -250,3 +250,25 @@ def test_usage_errors_exit_2(tmp_path):
         r, _ = run_driver(driver, tmp_path, args, verdict)
         assert r.returncode == 2, args
         assert b"usage:" in r.stderr
+
+def test_channel_refusal_is_terminal_no_retry(tmp_path):
+    """A claim refusal from the channel (colab-sh exit 2) propagates
+    as the driver's own exit with exactly one channel invocation —
+    the driver never retries a refusal into a second hold."""
+    driver = make_fake_repo(tmp_path)
+    count = tmp_path / "sh-calls.txt"
+    stub = tmp_path / "bin" / "colab-sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo x >> {count}\n"
+        "cat > /dev/null\n"
+        "printf '%s\\n' 'colab-sh: synchronous attach refused' >&2\n"
+        "exit 2\n"
+    )
+    stub.chmod(0o755)
+    local = tmp_path / "local.txt"
+    local.write_bytes(b"x")
+    r, _ = run_driver(driver, tmp_path, ["write", "/content/a.txt", "--from", str(local)], None)
+    assert r.returncode == 2
+    assert len(count.read_text().splitlines()) == 1
+

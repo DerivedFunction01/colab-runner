@@ -187,3 +187,92 @@ def test_main_refuses_an_unregistered_caller_before_connecting(tmp_path, monkeyp
     fake = FakeRun()
     assert run_main(monkeypatch, fake, ["-s", "alpha", "--caller", "bogus-name-zzz", "echo hi"], tmp_path) == 2
     assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)
+
+# --- Sync claim gate + detached mode (sync-channel design) ---
+
+import json
+
+REFUSAL = {"blocked_by": "claim", "holder": "alpha",
+           "evidence": [{"kind": "claim", "claimed_at": "2026-11-08T15:00:00+00:00", "expires_at": "2026-11-08T16:00:00+00:00"}],
+           "expires_at": "2026-11-08T16:00:00+00:00"}
+
+
+def test_main_refused_by_the_sync_gate_before_connecting(tmp_path, monkeypatch, capsys):
+    """The gate runs before any ssh invocation: a refusal exits 2,
+    names the holder and the expiry, and prints the detached form
+    of the refused command."""
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    fake = FakeRun()
+    monkeypatch.setattr(sh, "sync_gate", lambda session, caller: REFUSAL)
+    rc = run_main(monkeypatch, fake, ["-s", "alpha", "--caller", "lease", "echo", "hi"], tmp_path)
+    assert rc == 2
+    assert all(cmd[0] != "ssh" for cmd, _ in fake.calls)
+    err = capsys.readouterr().err
+    assert "'alpha'" in err and "2026-11-08T16:00:00+00:00" in err
+    assert "--detach" in err and "echo" in err
+
+
+def test_detached_alternative_renders_the_callers_own_command():
+    import argparse as _ap
+
+    args = _ap.Namespace(dir="/content", env=[], file=None, command=["echo", "hi there"])
+    out = sh.detached_alternative(args, "alpha", "lease", [])
+    assert out.startswith("colab-sh --detach -s alpha --caller lease")
+    assert "echo" in out and "'hi there'" in out
+
+
+def test_detach_launch_returns_an_id_and_plants_the_script(tmp_path, monkeypatch, capsys):
+    """The fake-world detach round trip, launch half: one ssh call
+    whose stdin is the launcher (nohup, the sync-detached dir, the
+    caller's script base64-planted), and a JSON receipt with the
+    new id on stdout."""
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    fake = FakeRun(rc=0)
+    rc = run_main(monkeypatch, fake, ["-s", "alpha", "--detach", "echo hi"], tmp_path)
+    assert rc == 0
+    receipt = json.loads(capsys.readouterr().out.strip())
+    assert receipt["state"] == "running" and receipt["id"]
+    cmd, kw = fake.calls[-1]
+    assert cmd[0] == "ssh"
+    launcher = kw["input"]
+    assert "sync-detached" in launcher and "nohup" in launcher
+    import base64 as _b64
+
+    assert _b64.b64encode(b"echo hi\n").decode() in launcher
+
+
+class StdoutRun(FakeRun):
+    def __init__(self, stdout, rc=0):
+        super().__init__(rc=rc)
+        self.stdout = stdout
+
+    def __call__(self, cmd, **kw):
+        self.calls.append((cmd, kw))
+        return subprocess.CompletedProcess(cmd, self.rc, stdout=self.stdout)
+
+
+def test_poll_round_trip_states(tmp_path, monkeypatch, capsys):
+    """The poll half: the probe's framed output parses into the
+    verdict JSON — running exits 0, done exits with the job's own
+    exit code, an unknown id is a not-found 2."""
+    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path))
+    monkeypatch.delenv("COLAB_CALLER", raising=False)
+    meta = '{"id": "x1", "session": "alpha", "caller": "lease", "started_at": "2026-11-08T15:00:00+00:00", "state": "running"}'
+    running = StdoutRun(meta + "\nSTATE running\nEXIT -\n---LOG---\nworking\n")
+    rc = run_main(monkeypatch, running, ["-s", "alpha", "--poll", "x1"], tmp_path)
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out.strip())
+    assert out["state"] == "running" and out["log_tail"] == "working\n"
+    done = StdoutRun(meta + "\nSTATE done\nEXIT 7\n---LOG---\nfinished\n")
+    rc = run_main(monkeypatch, done, ["-s", "alpha", "--poll", "x1"], tmp_path)
+    assert rc == 7
+    out = json.loads(capsys.readouterr().out.strip())
+    assert out["state"] == "done" and out["exit_code"] == 7
+    missing = StdoutRun("NOT-FOUND\n")
+    rc = run_main(monkeypatch, missing, ["-s", "alpha", "--poll", "nope"], tmp_path)
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out.strip())
+    assert out["state"] == "not-found"
+
