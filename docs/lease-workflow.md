@@ -287,6 +287,34 @@ window alive across the sessions it outlives.
   so a writer mid-append is never half-read). The notify hook
   announces each event to the main chat.
 
+### Shortening
+
+Findings first: shorten is extend's mirror, not a soft release —
+the session keeps running, only the deadline moves.
+
+`bin/colab-lease shorten SESSION (--deadline ISO | --hours H)`
+pulls a lease's deadline earlier; the panel action rides the
+same verb. The target must be strictly earlier than the current
+deadline and strictly in the future: a target at or beyond the
+deadline is extend's case (`shorten-not-earlier`), and a target
+at or before now refuses (`shorten-deadline-past`) — ending a
+session now is release's job. Standing-managed leases refuse, as
+they do for extend: the duty owns those deadlines. Shortening
+prices nothing — it only reduces the committed projection. The
+session classification is re-checked immediately before the
+save, under the same absent/unknown discipline as extend. When
+the record carries a renewal kit, the kit is reinstalled for
+the new deadline; a kit failure is reported in the verdict and
+the move stands.
+
+A successful shorten stamps the record (`shortened_at`,
+`shortened_by`, `shortened_from`). While the stamp stands, the
+extend guard skips the lease (`skipped-shortened`) — the guard
+never silently undoes a deliberate shorten. An operator
+extension clears the stamp in its own save: the operator's
+latest action wins, so shorten-then-extend is an ordinary
+sequence, and the guard resumes its policy afterwards.
+
 ## The two-tier envelope
 
 Findings first: the grant is the only tap. Everything inside its
@@ -448,6 +476,58 @@ recorded.
   attempts) and resumable in both directions. Tunnel throughput
   is ~1.6 MB/s — split or shrink the payload when the window
   matters.
+
+## Orphaned sessions and adoption
+
+Findings first: adoption restores a record from evidence; it
+never invents one. A live session with no record — a torn or
+lost `var/lease-<session>.json` — is an orphan: it bills, but
+no deadline is enforced, no jobs list protects it, and its burn
+is unattributed. The census is served as the `orphans` portion
+of `state`: live sessions minus recorded ones, bridge-prefixed
+sessions excluded, a handover child flagged rather than
+offered.
+
+The derivation reads the strongest evidence first: (1)
+`var/renewal-config-<session>.json`, a verbatim copy of the
+record written when the renewal kit was installed — deadline,
+acquired_at, shape, and spec; (2) any later `lease-extended`
+event in the UI outbox applied over it, since extension does
+not rewrite the config. When the last extension event carries
+no usable new deadline, the derived value is served flagged
+stale-possible. Caller claims, liveness state, and run records
+carry caller and timing evidence only — never a deadline. The
+record's caller is the evidenced creator, not the earliest
+claim: a claim is a ride, and the operator's own differing
+caller is journaled as an `adopt` claim. Shape is evidenced by
+the config's spec where present, else resolved from the live
+list's shape class against the catalog; when that leaves
+several candidates the operator picks one (`--shape`, chosen
+in the panel from the served specs) — derivation never guesses,
+and a `--shape` that contradicts the evidenced shape refuses
+with the conflict shown.
+
+`bin/colab-lease adopt SESSION` plants the derived deadline
+verbatim, or the operator's `--deadline`/`--hours` target.
+Restoring the evidenced window is exempt from budget pricing —
+it creates no new commitment; only the excess beyond the
+evidenced deadline prices, as an extension delta does.
+Planting earlier than the evidenced deadline refuses
+(`adopt-deadline-shortens`): adoption is a restore, not an
+edit — the operator adopts at the evidenced deadline and
+shortens explicitly afterwards if that is the intent. A
+derived or planted deadline at or before now refuses rather
+than writing a record the next reap pass would release. The
+session's classification is re-checked immediately before the
+save (absent and unknown both refuse), as is the record's
+continued absence. The restored record carries the evidenced
+`acquired_at`, so attributed spend counts the real elapsed
+burn; the jobs list seeded from non-terminal run records bound
+to the session; and the provenance keys `adopted`,
+`adopted_at`, and `deadline_source`. The panel's orphan
+section renders only this served state — derived value,
+source, and conflicts — and its adopt action posts to the
+same verb.
 
 ## Edge cases
 
