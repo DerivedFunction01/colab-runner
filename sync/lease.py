@@ -30,6 +30,8 @@ for its endpoint on the release fallback path, and for its tunnel
 host when a session is born (acquire / renewal swap / adoption).
 """
 
+import contextlib
+import fcntl
 import importlib.util as _ilu
 import json
 import math
@@ -709,8 +711,17 @@ def parse_balance(usage_text: str) -> float | None:
 _SESSION_READ_ATTEMPTS = 3
 _SESSION_READ_BACKOFF_S = (2, 5)
 
+# The reap pass runs on the hook's fixed budget (420 s) and repeats
+# every couple of minutes, so its classifications take a smaller
+# read budget than the interactive paths: a stall classifies
+# unknown sooner — unknown is never read as dead — and the next
+# pass retries. Two attempts at 45 s keeps one record's worst case
+# near 90 s instead of the standard ~370 s.
+_REAP_READ_ATTEMPTS = 2
+_REAP_READ_TIMEOUT_S = 45
 
-def session_state(colab, session: str, diag: dict | None = None) -> str:
+
+def session_state(colab, session: str, diag: dict | None = None, attempts: int | None = None, timeout: int = 120) -> str:
     """Tri-state: "alive" (listed), "absent" (list obtained, name not in
     it), "unknown" (the CLI call failed or returned nothing). Unknown must
     never be treated as dead: on 2026-10-29 the lease record vanished
@@ -727,11 +738,12 @@ def session_state(colab, session: str, diag: dict | None = None) -> str:
     count and the last failure's shape, so an unknown is never
     silent again. The auth prompt is definitive, never retried."""
     last_error = "no-attempt"
-    for attempt in range(_SESSION_READ_ATTEMPTS):
+    tries = attempts if attempts is not None else _SESSION_READ_ATTEMPTS
+    for attempt in range(tries):
         if attempt:
             time.sleep(_SESSION_READ_BACKOFF_S[min(attempt - 1, len(_SESSION_READ_BACKOFF_S) - 1)])
         try:
-            out = colab("sessions", timeout=120).stdout
+            out = colab("sessions", timeout=timeout).stdout
         except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {exc}"[:120] if str(exc) else type(exc).__name__
             continue
@@ -749,7 +761,7 @@ def session_state(colab, session: str, diag: dict | None = None) -> str:
             continue
         return "alive" if session in out else "absent"
     if diag is not None:
-        diag.update({"attempts": _SESSION_READ_ATTEMPTS, "read_error": last_error})
+        diag.update({"attempts": tries, "read_error": last_error})
     return "unknown"
 
 
@@ -2032,7 +2044,7 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
     lease whose grant has lapsed (or vanished) is released even before
     its own deadline."""
     diag: dict = {}
-    state = session_state(colab, rec["session"], diag)
+    state = session_state(colab, rec["session"], diag, attempts=_REAP_READ_ATTEMPTS, timeout=_REAP_READ_TIMEOUT_S)
     if state == "unknown":
         return {"action": "kept-unknown", "session": rec["session"], "read_error": diag.get("read_error"), "attempts": diag.get("attempts")}
     if state == "absent":
@@ -2097,7 +2109,38 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
 _REAP_PRIORITY = ("released-deadline", "cleared-dead", "released-standing-expired", "released-idle", "renewed", "renewal-failed", "kept-unknown", "kept")
 
 
+@contextlib.contextmanager
+def _reap_lock(repo: Path):
+    """One reap pass at a time. The hook fires reap on a fixed
+    poll and kills its wait at a timeout, but the reap process
+    itself used to run on — the next poll then started a second
+    pass over the same records, and two passes renewing the same
+    lease in parallel minted duplicate successor leases
+    (2026-11-08). The lock is an flock on a var/ file: held only
+    while a pass runs, released by the OS when the holder dies
+    (a kill included), so it can never go stale."""
+    path = var_dir(repo) / "reap.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
 def reap(colab, repo: Path, now_dt: datetime | None = None) -> dict:
+    with _reap_lock(repo) as held:
+        if not held:
+            return {"action": "already-running", "records": []}
+        return _reap_pass(colab, repo, now_dt)
+
+
+def _reap_pass(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     """Hook duty: reap every lease record. The top-level
     action/fields are the most consequential per-record result —
     or the sole record's, in a one-lease world — so the hook's

@@ -401,6 +401,56 @@ def test_budget_daily_check_clips_other_windows_to_today(tmp_path, monkeypatch):
     assert out["committed_full"] == 6.82
 
 
+def test_reap_passes_never_overlap(tmp_path, monkeypatch):
+    """One reap pass at a time: while the pass lock is held, a
+    second reap returns already-running and touches nothing —
+    overlapping passes renewing the same lease in parallel
+    minted duplicate successor leases (2026-11-08). The lock is
+    an flock, so a dead holder releases it: once the fd closes,
+    reap proceeds normally."""
+    import fcntl
+    import os
+
+    repo = scratch_repo(tmp_path, monkeypatch)
+    fake = FakeColab(alive={"one"})
+    lease_mod.save_record(repo, {"shape": "cpu", "session": "one", "caller": "alpha", "rate_cu_per_hour": 0.08, "acquired_at": PNOW.isoformat(), "deadline": (PNOW + timedelta(hours=8)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
+    lockpath = repo / "var" / "reap.lock"
+    fd = os.open(lockpath, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        out = lease_mod.reap(fake, repo, now_dt=PNOW)
+        assert out["action"] == "already-running"
+        assert out["records"] == []
+    finally:
+        os.close(fd)
+    out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    assert out["action"] != "already-running"
+    assert lease_mod.load_record(repo, "one") is not None
+
+
+def test_reap_classification_uses_the_reap_budget(tmp_path, monkeypatch):
+    """A stalling sessions read inside reap classifies unknown
+    after the reap budget (2 attempts), not the interactive one
+    (3): the pass repeats in minutes, so it buys back its time
+    budget and lets the next pass retry — unknown is kept, never
+    cleared."""
+    import subprocess as sp
+
+    repo = scratch_repo(tmp_path, monkeypatch)
+    lease_mod.save_record(repo, {"shape": "cpu", "session": "one", "caller": "alpha", "rate_cu_per_hour": 0.08, "acquired_at": PNOW.isoformat(), "deadline": (PNOW + timedelta(hours=8)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
+
+    class StallColab(FakeColab):
+        def __call__(self, *a, **k):
+            if a and a[0] == "sessions":
+                raise sp.TimeoutExpired("colab", k.get("timeout", 0))
+            return super().__call__(*a, **k)
+
+    out = lease_mod.reap(StallColab(), repo, now_dt=PNOW)
+    assert out["records"][0]["action"] == "kept-unknown"
+    assert out["records"][0]["attempts"] == 2
+    assert lease_mod.load_record(repo, "one") is not None
+
+
 def test_state_portions_and_composition(tmp_path, monkeypatch):
     """Progressive loading: each portion of the composed state read
     stands alone with its own keys, and state() composes them into
