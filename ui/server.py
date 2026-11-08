@@ -347,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_lease_extend(body)
         if parsed.path == "/api/lease/adopt":
             return self.api_lease_adopt(body)
+        if parsed.path == "/api/lease/shorten":
+            return self.api_lease_shorten(body)
         if parsed.path == "/api/access/release":
             return self.api_access_release(body)
         if parsed.path == "/api/grant":
@@ -508,6 +510,48 @@ class Handler(BaseHTTPRequestHandler):
             OUTBOX.append("lease-adopted", {"session": session, "result": result})
             return self.send_json(200, result)
         OUTBOX.append("lease-adopt-failed", {"session": session, "result": result})
+        return self.send_json(409, result)
+
+    def api_lease_shorten(self, body: dict) -> None:
+        """Shorten one lease from the panel: the core shorten
+        verb with the panel caller. The body names the session
+        and exactly one target — an ISO deadline or a positive
+        hours count to pull in by. The outcome mapping mirrors
+        the adopt endpoint beside it: 200 shortened, 409 core
+        refusal, 502 core unreachable, with exactly one outbox
+        event per call (lease-shortened / lease-shorten-failed)."""
+        session = body.get("session")
+        if not session or not isinstance(session, str):
+            return self.send_json(400, {"error": "session is required"})
+        deadline = body.get("deadline")
+        hours = body.get("hours")
+        if (deadline is None) == (hours is None):
+            return self.send_json(400, {"error": "deadline or hours is required — give one"})
+        args = ["shorten", session]
+        if deadline is not None:
+            if not isinstance(deadline, str):
+                return self.send_json(400, {"error": "deadline must be an ISO timestamp"})
+            try:
+                datetime.fromisoformat(deadline)
+            except ValueError:
+                return self.send_json(400, {"error": "deadline must be an ISO timestamp"})
+            args += ["--deadline", deadline]
+        else:
+            try:
+                if float(hours) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self.send_json(400, {"error": "hours must be a positive number"})
+            args += ["--hours", fmt_hours(hours)]
+        args += ["--caller", "panel"]
+        rc, result, err = run_core(*args)
+        if result is None:
+            OUTBOX.append("lease-shorten-failed", {"session": session, "error": err, "rc": rc})
+            return self.send_json(502, {"error": "lease core failed", "detail": err, "rc": rc})
+        if result.get("action") == "shortened":
+            OUTBOX.append("lease-shortened", {"session": session, "result": result})
+            return self.send_json(200, result)
+        OUTBOX.append("lease-shorten-failed", {"session": session, "result": result})
         return self.send_json(409, result)
 
     def api_grant_extend(self, body: dict) -> None:

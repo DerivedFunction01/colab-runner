@@ -159,3 +159,41 @@ def test_guard_does_not_re_extend_an_idle_lease_it_already_extended(tmp_path, mo
     code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW + timedelta(hours=8))
     assert code == 0 and lines == [{"session": "idle-lease-1", "action": "skipped-idle", "decision": True}]
     assert lease_mod.load_record(repo, "idle-lease-1")["deadline"] == deadline_after_first
+
+
+def test_guard_skips_a_shortened_lease(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    a = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
+    assert a["action"] == "created"
+    session = a["record"]["session"]
+    out = lease_mod.shorten(fake, repo, session, hours=2, caller="alpha", now_dt=PNOW)
+    assert out["action"] == "shortened"
+    # Inside the threshold (one hour left on the pulled-in
+    # deadline) the guard would normally extend; the shorten
+    # stamp makes it skip instead, deadline untouched.
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW + timedelta(hours=5))
+    assert code == 0
+    mine = [line for line in lines if line["session"] == session]
+    assert len(mine) == 1 and mine[0]["action"] == "skipped-shortened"
+    assert lease_mod.load_record(repo, session)["deadline"] == out["new_deadline"]
+
+
+def test_guard_treats_lease_normally_after_operator_extend(tmp_path, monkeypatch):
+    repo = scratch_repo(tmp_path, monkeypatch)
+    fake = FakeColab()
+    a = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
+    assert a["action"] == "created"
+    session = a["record"]["session"]
+    assert lease_mod.shorten(fake, repo, session, hours=2, caller="alpha", now_dt=PNOW)["action"] == "shortened"
+    # The operator extends the lease they shortened: the stamp
+    # clears as part of the extension, and the guard returns
+    # to its normal policy for the lease.
+    ext = lease_mod.extend(fake, repo, session, 1, caller="alpha", now_dt=PNOW + timedelta(hours=5))
+    assert ext["action"] == "extended"
+    rec = lease_mod.load_record(repo, session)
+    assert "shortened_at" not in rec and "shortened_from" not in rec
+    code, lines = guard_mod.run_guard(lease_mod, fake, repo, now_dt=PNOW + timedelta(hours=6, minutes=30))
+    assert code == 0
+    mine = [line for line in lines if line["session"] == session]
+    assert len(mine) == 1 and mine[0]["action"] == "extended"

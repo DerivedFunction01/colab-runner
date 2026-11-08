@@ -212,7 +212,14 @@ def run_guard(lease_mod, colab, repo: Path, now_dt: datetime | None = None, poli
         idle_pool: list[dict] = []
         for rec in recs:
             mode, source = resolve_mode(policy, shape, rec.get("caller"))
-            if mode == "never":
+            if rec.get("shortened_at"):
+                # Operator-shrunk lease: the guard never
+                # re-extends what the operator deliberately
+                # pulled in. The stamp is not a cap — an
+                # operator extend clears it, and the guard
+                # treats the lease normally again.
+                skip(rec, "skipped-shortened")
+            elif mode == "never":
                 skip(rec, "skipped-caller" if source == "caller" else "skipped-shape")
             elif mode == "always":
                 extend_one(rec)

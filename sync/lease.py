@@ -1567,6 +1567,13 @@ def extend(colab, repo: Path, session: str, hours: float, now_dt: datetime | Non
         # fills a pre-attribution record's caller; an attributed
         # record keeps its creator's caller (as on adopt).
         rec["caller"] = caller
+    # An operator extension is the latest action on the
+    # deadline: it clears any operator shorten stamp, so the
+    # extend guard stops skipping the lease (the stamp means
+    # the operator pulled the deadline in on purpose;
+    # extending says otherwise). The stamp is never a cap.
+    for key in ("shortened_at", "shortened_by", "shortened_from"):
+        rec.pop(key, None)
     save_record(repo, rec)
     out = {"action": "extended", "session": session, "shape": rec.get("shape"), "hours": float(hours), "old_deadline": old_deadline, "new_deadline": new_deadline, "record": rec, "budget": budget}
     if caller:
@@ -1755,6 +1762,69 @@ def adopt_orphan(colab, repo: Path, session: str, deadline=None, hours: float | 
         if kit.get("kit") == "installed":
             rec["kit"] = "installed"
             save_record(repo, rec)
+    return out
+
+
+def shorten(colab, repo: Path, session: str, deadline=None, hours: float | None = None, caller: str | None = None, now_dt: datetime | None = None) -> dict:
+    """Move one lease's deadline earlier: the operator's
+    explicit edit, extend's mirror. The target is an absolute
+    --deadline or the current deadline minus --hours; it must
+    land strictly earlier than the current deadline (a later
+    target is extend's job, refused here by name) and strictly
+    in the future (a past target is a release wearing a
+    deadline's clothes). No budget price-check: shortening
+    only reduces the committed projection. On success the
+    record is stamped (shortened_at, shortened_by,
+    shortened_from): while the stamp stands, the extend guard
+    skips the lease — it never re-extends what the operator
+    deliberately pulled in. The stamp is not a cap: a later
+    operator extend clears it (extend's save deletes the
+    stamp), and the operator's latest action wins. The
+    renewal kit is reinstalled when the record carries one,
+    so the kit's planted config learns the new deadline; a
+    kit failure is reported in the verdict and the move
+    stands, as with extend."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    cfg = load_config(repo)
+    if not cfg.get("enabled"):
+        return {"action": "lease-disabled"}
+    rec = load_record(repo, session)
+    if rec is None:
+        return {"action": "shorten-no-lease", "session": session}
+    if rec.get("standing") and grant_active(load_grant(repo), now_dt):
+        return {"action": "shorten-standing-managed", "session": session}
+    diag: dict = {}
+    state = session_state(colab, session, diag)
+    if state == "unknown":
+        return {"action": "shorten-unknown", "session": session, "read_error": diag.get("read_error"), "attempts": diag.get("attempts")}
+    if state == "absent" and not rec.get("renew"):
+        return {"action": "shorten-no-lease", "session": session}
+    if (deadline is None) == (hours is None):
+        return {"action": "shorten-no-target", "session": session}
+    current = parse_dt(rec["deadline"])
+    if deadline is not None:
+        target = _dt_or_none(deadline) if isinstance(deadline, str) else deadline
+        if target is not None and target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+    else:
+        target = current - timedelta(hours=float(hours))
+    if target is None or target >= current:
+        return {"action": "shorten-not-earlier", "session": session, "deadline": rec["deadline"], "target": target.isoformat() if target else None}
+    if target <= now_dt:
+        return {"action": "shorten-deadline-past", "session": session, "deadline": rec["deadline"], "target": target.isoformat()}
+    old_deadline = rec["deadline"]
+    rec["deadline"] = target.isoformat()
+    rec["shortened_at"] = now_dt.isoformat()
+    rec["shortened_by"] = caller
+    rec["shortened_from"] = old_deadline
+    save_record(repo, rec)
+    out: dict = {"action": "shortened", "session": session, "shape": rec.get("shape"), "old_deadline": old_deadline, "new_deadline": rec["deadline"], "record": rec}
+    if hours is not None:
+        out["hours"] = float(hours)
+    if caller:
+        out["caller"] = caller
+    if state == "alive" and rec.get("kit") == "installed":
+        out["kit"] = install_renewal_kit(colab, repo, rec, now_dt)
     return out
 
 

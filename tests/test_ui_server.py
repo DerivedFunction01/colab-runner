@@ -600,3 +600,45 @@ def test_adopt_endpoint_validation(ui):
     status, _ = ui.post("/api/lease/adopt", {"session": "stray-fox-7", "deadline": "2026-11-09T00:00:00+00:00", "hours": 3})
     assert status == 400
     assert not any(line.startswith("adopt ") for line in ui.invocations())
+
+
+def test_shorten_endpoint_invokes_core_and_appends_event(ui):
+    status, data = ui.post("/api/lease/shorten", {"session": "amber-otter-42", "hours": 2})
+    assert status == 200 and data["action"] == "shortened"
+    assert "shorten amber-otter-42 --hours 2 --caller panel" in ui.invocations()
+    events = [e for e in ui.outbox_events() if e["kind"] == "lease-shortened"]
+    assert len(events) == 1 and events[0]["detail"]["session"] == "amber-otter-42"
+
+
+def test_shorten_endpoint_refusal_is_409_with_event(tmp_path):
+    server = UiServer(tmp_path, extra_env={"STUB_SHORTEN_REFUSE": "1"})
+    try:
+        status, data = server.post("/api/lease/shorten", {"session": "amber-otter-42", "hours": 2})
+        assert status == 409 and data["action"] == "shorten-not-earlier"
+        events = [e for e in server.outbox_events() if e["kind"] == "lease-shorten-failed"]
+        assert len(events) == 1 and events[0]["detail"]["session"] == "amber-otter-42"
+    finally:
+        server.close()
+
+
+def test_shorten_endpoint_core_failure_is_502(tmp_path):
+    server = UiServer(tmp_path, extra_env={"STUB_LEASE_FAIL": "shorten"})
+    try:
+        status, _ = server.post("/api/lease/shorten", {"session": "amber-otter-42", "hours": 2})
+        assert status == 502
+    finally:
+        server.close()
+
+
+def test_shorten_endpoint_validation(ui):
+    status, _ = ui.post("/api/lease/shorten", {})
+    assert status == 400
+    status, _ = ui.post("/api/lease/shorten", {"session": "amber-otter-42"})
+    assert status == 400
+    status, _ = ui.post("/api/lease/shorten", {"session": "amber-otter-42", "deadline": "2026-11-09T00:00:00+00:00", "hours": 2})
+    assert status == 400
+    status, _ = ui.post("/api/lease/shorten", {"session": "amber-otter-42", "hours": -1})
+    assert status == 400
+    status, _ = ui.post("/api/lease/shorten", {"session": "amber-otter-42", "deadline": "not-a-date"})
+    assert status == 400
+    assert not any(line.startswith("shorten ") for line in ui.invocations())

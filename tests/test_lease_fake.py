@@ -1069,3 +1069,34 @@ def test_adopt_shape_ambiguity_via_cli(tmp_path):
     out = run_lease(env, "adopt", "stray-cli-5", "--deadline", deadline, "--caller", "alpha", "--shape", "t4-highram")
     assert out["action"] == "adopted"
     assert record(env)["shape"] == "t4-highram"
+
+
+def test_shorten_via_cli(tmp_path):
+    env = lease_env(tmp_path)
+    run_lease(env, "acquire", "--shape", "cpu", "--hours", "4")
+    before = record(env)
+    out = run_lease(env, "shorten", before["session"], "--hours", "2", "--caller", "alpha")
+    assert out["action"] == "shortened"
+    after = record(env)
+    delta = datetime.fromisoformat(before["deadline"]) - datetime.fromisoformat(after["deadline"])
+    assert delta == timedelta(hours=2)
+    assert after["shortened_from"] == before["deadline"]
+    assert after["shortened_by"] == "alpha" and "shortened_at" in after
+
+
+def test_shorten_refusals_via_cli(tmp_path):
+    env = lease_env(tmp_path)
+    run_lease(env, "acquire", "--shape", "cpu", "--hours", "4")
+    before = record(env)
+    session = before["session"]
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    rc, out = run_lease_rc(env, "shorten", session, "--deadline", past)
+    assert rc == 1 and out["action"] == "shorten-deadline-past"
+    later = (datetime.fromisoformat(before["deadline"]) + timedelta(hours=1)).isoformat()
+    rc, out = run_lease_rc(env, "shorten", session, "--deadline", later)
+    assert rc == 1 and out["action"] == "shorten-not-earlier"
+    rc, _ = run_lease_rc(env, "shorten", session)
+    assert rc == 2  # exactly one target is required
+    rc, _ = run_lease_rc(env, "shorten", session, "--deadline", later, "--hours", "1")
+    assert rc == 2
+    assert record(env)["deadline"] == before["deadline"]
