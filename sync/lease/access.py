@@ -25,15 +25,23 @@ def clear_unattributed(repo: Path, session: str) -> None:
         save_unattributed(repo, stamps)
 
 
-def access_list(colab, repo: Path) -> list[dict]:
+def access_list(colab, repo: Path, now_dt: datetime | None = None) -> list[dict]:
     """Every live session with its attribution, served ready for
     the panel: record-backed sessions carry their record's caller
     and acquired_at and their shape's declared shape class;
     claim-only sessions carry the latest claim and its time; the
     rest are unattributed (caller None, first_seen from the
     detection stamp). An unreadable live list serves an empty
-    list — no access section rather than a fabricated one."""
-    live = sessions.live_sessions(colab, repo)
+    list — no access section rather than a fabricated one. The
+    live list rides the shared state dial cache (E14): a fresh
+    state-cache-live.json serves without a dial; a stale or
+    missing cache dials and refreshes it."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    live = foundation.dial_cache_read(repo, "state-cache-live.json", now_dt)
+    if live is None:
+        live = sessions.live_sessions(colab, repo)
+        if live is not None:
+            foundation.dial_cache_write(repo, "state-cache-live.json", live, now_dt)
     if live is None:
         return []
     records = {rec.get("session"): rec for rec in _mod_records.all_records(repo)}

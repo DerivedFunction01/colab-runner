@@ -1984,6 +1984,30 @@ def test_state_dials_cache_within_ttl_and_redial_past_it(repo):
     assert calls["sessions"] == 2
 
 
+def test_access_list_rides_the_live_list_dial_cache(repo):
+    """E14 residual: the records portion's access list dialed
+    the live list on every read even when the orphans portion
+    had just cached it. access_list now consults the same
+    state-cache-live.json — one dial inside the TTL, shared
+    with the census, and a re-dial past it."""
+    calls = {"sessions": 0}
+
+    def stub(*a, **k):
+        if a and a[0] == "sessions":
+            calls["sessions"] += 1
+            return cp(json.dumps(["stray-1"]))
+        return cp("")
+
+    first = lease.access_list(stub, repo, now_dt=NOW)
+    assert [e["session"] for e in first] == ["stray-1"] and calls["sessions"] == 1
+    again = lease.access_list(stub, repo, now_dt=NOW + timedelta(seconds=10))
+    assert [e["session"] for e in again] == ["stray-1"] and calls["sessions"] == 1
+    census = lease.state_orphans(stub, repo, now_dt=NOW + timedelta(seconds=10))
+    assert [o["session"] for o in census["orphans"]] == ["stray-1"] and calls["sessions"] == 1
+    lease.access_list(stub, repo, now_dt=NOW + timedelta(seconds=_state_mod.STATE_DIAL_CACHE_TTL_S + 60))
+    assert calls["sessions"] == 2
+
+
 def test_orphan_census_counts_live_detached_work(repo):
     """E8's census half: a live detached record for the
     session counts in jobs_in_flight under its detached:<id>
