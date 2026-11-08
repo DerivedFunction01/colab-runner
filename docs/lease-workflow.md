@@ -381,7 +381,7 @@ scope afterwards is script-level machinery and served state.
 
 The budget guard prices every window before it is promised —
 acquire, extend, and the standing duty all pass through it
-(`budget_check` in `sync/lease.py`). Caps live in
+(`budget_check` in `sync/lease/spend.py`). Caps live in
 `config/lease.json` (daily, monthly, and the standing daily
 sub-cap); a grant in scope replaces them with its snapshot caps
 for the check.

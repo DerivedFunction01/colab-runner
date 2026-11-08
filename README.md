@@ -4,7 +4,7 @@ Runs compute-bound work from this 2-vCPU machine on a Colab Pro high-RAM CPU run
 
 ## How a job runs
 
-1. `bin/colab-run <job>` (or `bin/colab-check <paths>` for a gate job) restores transient state from the repo mirror and acquires-or-adopts the shared lease session for the manifest's shape (`bin/colab-lease`; `sync/lease.py`) — a generated session name per lease, treated as a VM, 8 h hard cap, budget-guarded. Code syncs in as a git bundle on top of a base HTTPS clone.
+1. `bin/colab-run <job>` (or `bin/colab-check <paths>` for a gate job) restores transient state from the repo mirror and acquires-or-adopts the shared lease session for the manifest's shape (`bin/colab-lease`; `sync/lease/`) — a generated session name per lease, treated as a VM, 8 h hard cap, budget-guarded. Code syncs in as a git bundle on top of a base HTTPS clone.
 2. A remote bootstrap snippet prepares the VM (clone, dependencies, resource probe, Python-version assertion).
 3. The job executes detached on the VM (never as a kernel cell — the kill matrix measured that cells die with the local CLI); the wrapper polls and pushes checkpoints off the VM at the job's cadence.
 4. Results return as artifacts plus a hash manifest. The session stays up for the next job; a script-level reaper hook (2-minute poll) enforces the lease deadline. Colab is compute-only: code is authored on this machine, never on the VM.

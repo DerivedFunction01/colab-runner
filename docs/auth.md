@@ -68,7 +68,7 @@ client type. The panel's re-auth cadence is read from it.
   auth-required result (rc 3, empty stdout) and drops a marker at
   `var/auth-required.json`, cleared by the next healthy call. Inert
   under `COLAB_BIN` (test fakes are not credential flows).
-- `sync/lease.py`: `session_state` treats a prompt-carrying list as
+- `sync/lease/sessions.py`: `session_state` treats a prompt-carrying list as
   unknown, never absent; `acquire` branches on the tri-state and
   never stops/deletes/recreates on unknown (`acquire-unknown`);
   `budget_check` maps the guard's signal to reason `auth-required`;

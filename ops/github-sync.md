@@ -6,14 +6,13 @@ travel with the push. The connector snapshot flow is the fallback only —
 it carries none of those (a snapshot restore needs `chmod +x` on the
 executables before anything runs).
 
-Route preference (standing rule, 2026-11-03, away-scoped): when the
-operator is away — stated explicitly, or late night / early morning
-with him inactive — pushes and snapshot syncs use the Colab route
-(Route B mechanics, riding an already-active session first per the
-shared-session etiquette), because the connector's approval cards
-cannot be tapped while he is away and unattended VM git writes are
-unreliable. When he is present, route choice is free: VM-direct SSH,
-Colab, or the connector.
+Route preference (standing rule, 2026-11-08): pushes and syncs run
+from this machine — directly when shell writes are healthy, or
+through the scheduler ops route (`bin/sched exec`, whose server
+process the write-denial flap cannot reach) while the flap is up.
+Route B below is the last resort, not a standing route: it stays
+available per use case when the work already exists inside a Colab
+session or the local routes genuinely cannot do the job.
 
 ## Key and host pinning
 
@@ -31,13 +30,14 @@ Colab, or the connector.
   verified known-hosts file by absolute path. Bare `git push` then
   works from any shell.
 
-## Route A — push from this machine
+## Route A — push from this machine (the standing route)
 
 1. Commit locally as usual.
-2. `git push origin main`
+2. `git push origin main` — directly, or via `bin/sched exec` while
+   the write-denial flap is up.
 3. Verify with `git ls-remote origin main` when the push matters.
 
-## Route B — push from inside an active Colab session
+## Route B — push from inside an active Colab session (last resort)
 
 Rides a session that is already active (check status first and yield to
 its work, per the shared-session etiquette); spends no lease of its own.
