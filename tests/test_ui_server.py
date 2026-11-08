@@ -684,6 +684,21 @@ def test_frontend_shorten_picker_beside_extend():
         assert action in js, action
 
 
+def test_frontend_busy_labels_are_keyed_per_picker():
+    """An in-flight extend or shorten paints its busy label only
+    on the picker it was submitted from: the label map is keyed
+    by the extend key / the shorten session key, each picker
+    renders the label only for its own key, and each apply
+    handler sets and clears its own key around the call — one
+    session's action never shows progress on another's card."""
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    assert "const actBusy = {}" in js
+    assert "actBusy[extKey(kind, key)]" in js
+    assert "actBusy[`shorten:${session}`]" in js
+    assert 'actBusy[k] = "Extending…"' in js
+    assert 'actBusy[k] = "Shortening…"' in js
+
+
 def test_deploy_syncs_the_orphans_module():
     """deploy.sh's client file list is the artifact's source set:
     a static file it does not name never reaches the published

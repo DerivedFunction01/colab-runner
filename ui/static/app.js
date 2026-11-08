@@ -30,6 +30,16 @@ const shortOpen = new Set(); // sessions whose shorten picker is open
 const shortHours = {}; // session -> hours
 const shortDeadline = {}; // session -> datetime-local string
 
+/* In-flight action labels, keyed exactly per picker — the
+ * extend key for extend, `shorten:<session>` for shorten. A
+ * picker renders its busy label only when its own key is
+ * present, so one session's extend or shorten never paints
+ * progress onto another session's card. The map lives outside
+ * the render for the same reason the picker state does: a poll
+ * re-render must neither lose the label nor resurrect the
+ * apply button mid-flight. */
+const actBusy = {}; // picker key -> busy label
+
 /* Budget cap editor: open state and the typed drafts live outside
  * the render (same rule as the extend pickers), so a poll re-render
  * never loses them. A draft is the input's string; "" means no cap. */
@@ -263,14 +273,15 @@ function leaseChip(entry) {
  * toggle is open. kind is "lease" (key = session) or "grant". */
 function extendPickerHTML(kind, key) {
   const hours = extHours[extKey(kind, key)] ?? 8;
+  const busy = actBusy[extKey(kind, key)];
   const chips = EXT_DURATIONS.map((h) =>
-    `<button type="button" data-xhours="${h}" class="${h === hours ? "selected" : ""}">${h === 24 ? "24h" : fmtDur(h)}</button>`).join("");
+    `<button type="button" data-xhours="${h}" ${busy ? "disabled" : ""} class="${h === hours ? "selected" : ""}">${h === 24 ? "24h" : fmtDur(h)}</button>`).join("");
   return `<div class="extend-box">
     <div class="chips" data-extpicker="${esc(kind)}:${esc(key)}">
       ${chips}
       <input class="custom" data-xcustom type="number" min="0.25" step="0.25" placeholder="Custom (hours)">
     </div>
-    <button type="button" class="primary block" data-xapply="${esc(kind)}:${esc(key)}" style="margin-top:10px">Extend by ${esc(fmtDur(hours))}</button>
+    <button type="button" class="primary block" data-xapply="${esc(kind)}:${esc(key)}" ${busy ? "disabled" : ""} style="margin-top:10px">${busy || `Extend by ${esc(fmtDur(hours))}`}</button>
   </div>`;
 }
 
@@ -315,8 +326,9 @@ function reportExtend(res, kind, key) {
 function shortenPickerHTML(session) {
   const hours = shortHours[session] ?? 8;
   const deadline = shortDeadline[session] || "";
+  const busy = actBusy[`shorten:${session}`];
   const chips = EXT_DURATIONS.map((h) =>
-    `<button type="button" data-shours="${h}" class="${h === hours && !deadline ? "selected" : ""}">${h === 24 ? "24h" : fmtDur(h)}</button>`).join("");
+    `<button type="button" data-shours="${h}" ${busy ? "disabled" : ""} class="${h === hours && !deadline ? "selected" : ""}">${h === 24 ? "24h" : fmtDur(h)}</button>`).join("");
   return `<div class="extend-box shorten-box">
     <div class="chips" data-shortpicker="${esc(session)}">
       ${chips}
@@ -326,7 +338,7 @@ function shortenPickerHTML(session) {
       <span class="lab">or end at</span>
       <input class="deadline-input" data-sdeadline type="datetime-local" value="${esc(deadline)}">
     </div>
-    <button type="button" class="primary block" data-sapply="${esc(session)}" style="margin-top:10px">${deadline ? "Shorten to the chosen time" : `Shorten by ${esc(fmtDur(hours))}`}</button>
+    <button type="button" class="primary block" data-sapply="${esc(session)}" ${busy ? "disabled" : ""} style="margin-top:10px">${busy || (deadline ? "Shorten to the chosen time" : `Shorten by ${esc(fmtDur(hours))}`)}</button>
   </div>`;
 }
 
@@ -417,7 +429,16 @@ function wireShortenPickers(container) {
       } else {
         body.hours = shortHours[session] ?? 8;
       }
-      act(btn, async () => reportShorten(await apiResult("/api/lease/shorten", body), session));
+      act(btn, async () => {
+        const k = `shorten:${session}`;
+        actBusy[k] = "Shortening…";
+        renderLeases();
+        try {
+          reportShorten(await apiResult("/api/lease/shorten", body), session);
+        } finally {
+          delete actBusy[k];
+        }
+      });
     });
   });
 }
@@ -449,11 +470,20 @@ function wireExtendPickers(container) {
     btn.addEventListener("click", () => {
       const [kind, key] = btn.getAttribute("data-xapply").split(":");
       const hours = extHours[extKey(kind, key)] ?? 8;
-      if (kind === "grant") {
-        act(btn, async () => reportExtend(await api("/api/grant/extend", { hours }), "grant", ""));
-      } else {
-        act(btn, async () => reportExtend(await api("/api/lease/extend", { session: key, hours }), "lease", key));
-      }
+      act(btn, async () => {
+        const k = extKey(kind, key);
+        actBusy[k] = "Extending…";
+        if (kind === "grant") renderGrant(); else renderLeases();
+        try {
+          if (kind === "grant") {
+            reportExtend(await api("/api/grant/extend", { hours }), "grant", "");
+          } else {
+            reportExtend(await api("/api/lease/extend", { session: key, hours }), "lease", key);
+          }
+        } finally {
+          delete actBusy[k];
+        }
+      });
     });
   });
 }
