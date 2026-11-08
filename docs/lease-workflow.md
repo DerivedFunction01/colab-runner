@@ -66,6 +66,29 @@ is on any computer.
    divergence is a finding to report, not a verdict to smooth
    over.
 
+The runner's own lifecycle verbs ride the same record:
+
+- `bin/colab-run <job> --detach` launches and returns at once;
+  `--poll RUN_ID` performs one bounded reconcile (sweep-for-self,
+  one reader pass, pull, record update) — exits 0 complete /
+  1 failed-or-orphaned / 2 no record / 3 still running;
+  `--wait RUN_ID [--max S]` waits on the local record only.
+  When a launched run reaches a terminal state, exactly one
+  `run-terminal` event is appended to `var/ui-outbox.jsonl` in
+  the UI events' shape — the runner core is the outbox's one
+  writer besides the UI.
+- The orphan sweep is not on the launch path: it runs under
+  `--poll` and an explicit `--sweep`, matching live sessions by
+  exact name.
+- Three consecutive poll failures classify the session at the
+  reduced read budget (2 × 45 s): confirmed-absent fails the
+  run fast with a `--resume` note; unknown never fails the run.
+- Pulls are change-detected: the reader payload reports each
+  declared output's size/mtime and unchanged outputs are
+  skipped; outputs over the 50 MB single-file ceiling move via
+  the chunked transfer. Every output a run lands is recorded
+  in the record's `pulled` list with its route.
+
 Two launch rules bind every job:
 
 - Jobs are detached processes, never kernel cells — cells die with
@@ -88,6 +111,28 @@ snippet jobs:
   with real exit codes. One SSH connection per runtime at a time;
   the wrapper is one-shot, checks the session is live through the
   lease machinery before connecting, and never creates a session.
+- A session name resolves as: the `-s` flag, then
+  `$COLAB_SH_SESSION`, then the most recently used lease record —
+  there is no other default.
+- `--detach` launches register a record at
+  `results/detached/<id>.json` and a `detached:<id>` job on the
+  lease record; `--poll` closes the record out when the launch
+  finishes. `bin/colab-sh --wait ID [--max S]` waits on that
+  local record only (0 complete / 1 failed-or-missing /
+  3 still running).
+- On the sync path the wrapper validates the script, checks the
+  duration cap and the claim gate BEFORE any dial — a refusal
+  makes zero dials. Liveness verdicts cache for 60 s
+  (`var/liveness-<session>.json`), the async path reads at the
+  reduced budget (2 × 45 s), and the transient mirror restore is
+  skipped while its stamp is fresh (< 300 s).
+- A channel-busy answer (HTTP 429) is retried briefly on the
+  async path and translated on every path into a named verdict —
+  holder and claim expiry when a claim exists — never a bare
+  ssh failure.
+- Attaching to a live session with no lease record prints an
+  advisory naming the orphan state and the adopt command; the
+  attach proceeds.
 - **Job zero, shell edition**: `snippets/env_build.sh` is the one
   canonical env build (the Python twin is retired). Run it via
   `bin/colab-sh -f snippets/env_build.sh -- --repo <id>` — or with
@@ -161,6 +206,25 @@ duration. Synchronous use is therefore a claim, not a default
   one short call) stay open to every caller. The records
   state serves each lease's live claim as `sync_claim` (or
   null), and the panel card renders holder + expiry from it.
+- Duration is capped as well as admission:
+  `sync_claim.max_sync_seconds` (default 300) bounds a sync
+  call, and the wrapper's default timeout resolves to the cap.
+  A longer sync call refuses pre-connect, printing the detached
+  form — or runs under `--long`, which journals the hold on
+  the claim: the hold counts as live claim evidence until its
+  stated end, so the claim cannot lapse mid-hold.
+- A claim refresh whose store write fails degrades instead of
+  refusing: the attach proceeds on the stored claim and the
+  degradation is journaled. Grants stay strict — a claim that
+  cannot be stored is not granted.
+- Claim evidence reads a bounded tail of the caller-claims
+  journal (256 KiB); the evidence window is minutes, the tail
+  covers days.
+- State reads cache their two account dials (the usage call
+  and the live list) for 30 s in `var/state-cache-*.json`; the
+  access list rides the same live-list cache. A failed dial is
+  never cached, and a session's tri-state classification is
+  never served from cache.
 
 ## Reaper and auto-lease
 
@@ -533,7 +597,12 @@ acquired_at, shape, and spec; (2) any later `lease-extended`
 event in the UI outbox applied over it, since extension does
 not rewrite the config. When the last extension event carries
 no usable new deadline, the derived value is served flagged
-stale-possible. Caller claims, liveness state, and run records
+stale-possible. A third source rides under both:
+`var/session-evidence-<session>.json`, the record's own
+{deadline, acquired_at, shape, spec, caller} projected at
+every deadline-moving lifecycle write — it is the derivation's
+base when no renewal config exists, and its deadline joins the
+conflict values otherwise. Caller claims, liveness state, and run records
 carry caller and timing evidence only — never a deadline. The
 record's caller is the evidenced creator, not the earliest
 claim: a claim is a ride, and the operator's own differing
@@ -544,6 +613,13 @@ several candidates the operator picks one (`--shape`, chosen
 in the panel from the served specs) — derivation never guesses,
 and a `--shape` that contradicts the evidenced shape refuses
 with the conflict shown.
+
+A record file that cannot be read at all is a torn record:
+`state` serves it under `torn_records` by its filename-derived
+session, readers never rename it, and the first writer that
+needs the path quarantines it to `<name>.torn-<timestamp>`
+with its bytes preserved — the write then proceeds onto a
+clean path, and adoption over a torn file stays possible.
 
 `bin/colab-lease adopt SESSION` plants the derived deadline
 verbatim, or the operator's `--deadline`/`--hours` target.
@@ -560,8 +636,9 @@ session's classification is re-checked immediately before the
 save (absent and unknown both refuse), as is the record's
 continued absence. The restored record carries the evidenced
 `acquired_at`, so attributed spend counts the real elapsed
-burn; the jobs list seeded from non-terminal run records bound
-to the session; and the provenance keys `adopted`,
+burn; the jobs list seeded from non-terminal run records and
+live detached-launch records (`detached:<id>`) bound to the
+session; and the provenance keys `adopted`,
 `adopted_at`, and `deadline_source`. The panel's orphan
 section renders only this served state — derived value,
 source, and conflicts — and its adopt action posts to the
