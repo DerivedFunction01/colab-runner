@@ -47,10 +47,79 @@ def colab_env() -> dict:
 
 
 def colab(*args: str, timeout: int = 18000, check: bool = False) -> subprocess.CompletedProcess:
+    _sync_gate(args)
     return subprocess.run(
         [colab_bin(), "--auth", "oauth2", *args],
         capture_output=True, text=True, timeout=timeout, check=check, env=colab_env(),
     )
+
+
+# --- Synchronous claim gate (sync-channel design, option 3) -------------------
+# The probes' session-targeted work calls (exec / install / upload /
+# download) are the long synchronous consumers this module exists
+# to run, so they pass the lease core's sync_rights verdict first —
+# the same gate bin/colab-sh applies, with the same refusal shape
+# (holder, evidence, expiry, exit 2). Short reads (list / status /
+# usage), lifecycle (new / stop), and everything without a session
+# target are not gated.
+#
+# Exemption, by construction rather than by flag: lease-internal
+# and runner-internal calls never pass through this module — they
+# dial through sync/cli.py's funnel and bin/colab-run — so the
+# machinery's own calls are never gated and need no bypass.
+
+_GATED_VERBS = ("exec", "install", "upload", "download")
+
+
+def _gate_session(args) -> str | None:
+    for i, a in enumerate(args):
+        if a in ("-s", "--session") and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--session="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _sync_gate(args) -> None:
+    if not args or args[0] not in _GATED_VERBS:
+        return
+    session = _gate_session(args)
+    if not session:
+        return
+    import os
+
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    from sync import lease
+
+    env = os.environ.get(lease.CALLER_ENV)
+    err = lease.caller_claim_error(REPO, env=env)
+    if err:
+        print(f"probes: {err}", file=sys.stderr)
+        raise SystemExit(2)
+    caller = lease.resolve_caller(REPO, env=env)
+    verdict = lease.sync_rights(REPO, session, caller)
+    if verdict.get("allowed"):
+        return
+    parts = []
+    for item in verdict.get("evidence") or []:
+        kind = item.get("kind")
+        if kind == "claim":
+            parts.append(f"claim claimed at {item.get('claimed_at')}")
+        elif kind == "run":
+            parts.append(f"run {item.get('run_id')} ({item.get('state')})")
+        elif kind == "job":
+            parts.append(f"job {item.get('run_id')} registered on the lease record")
+        elif kind == "attach":
+            parts.append(f"attach via {item.get('seam')} at {item.get('ts')}")
+    print(
+        f"probes: synchronous {args[0]} on session {session!r} refused — "
+        f"blocked by {verdict.get('blocked_by')}: {verdict.get('holder')!r} "
+        f"(evidence: {'; '.join(parts) or 'no detail'}; claim expiry: {verdict.get('expires_at')}). "
+        "Run it detached (a colab-run job, or bin/colab-sh --detach) instead.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def record(probe: str, data: dict) -> Path:
