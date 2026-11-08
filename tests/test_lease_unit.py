@@ -1856,3 +1856,147 @@ def test_shorten_extend_shorten_restamps(repo):
     assert saved["deadline"] == "2026-10-29T23:00:00+00:00"
     assert saved["shortened_from"] == "2026-10-30T00:00:00+00:00"
     assert saved["shortened_by"] == "beta" and saved["shortened_at"] == NOW.isoformat()
+
+
+# --- Record damage, session evidence, detached census, state dials -------------
+#
+# The sync-coupling plan's Step 5 (E1, E2) plus the owner
+# review's E14 and the census half of E8: a torn record is a
+# served finding, quarantined by the first writer that needs
+# its path with its bytes preserved; the session-evidence
+# projection carries an evidenced deadline through total
+# record + journal + kit-config loss; a live detached record
+# counts as a job in flight; and state's two account dials
+# (usage, the live list) cache on a short TTL.
+
+_records_mod = sys.modules["lease.records"]
+_state_mod = sys.modules["lease.state"]
+
+
+def test_state_torn_records_portion_serves_findings(repo):
+    seed_record(repo)  # a healthy record coexists and is not a finding
+    torn_payload = b'{"session": "tor'
+    (repo / "var" / "lease-torn-1.json").write_bytes(b"")
+    (repo / "var" / "lease-torn-2.json").write_bytes(torn_payload)
+    # The handover marker shares the lease- prefix and is
+    # never a record, torn or otherwise.
+    (repo / "var" / "lease-handover.json").write_text(json.dumps({"child_session": "kid-1", "minted_at": NOW.isoformat()}))
+    portion = _state_mod.state_torn_records(repo)
+    assert portion == {"torn_records": [
+        {"session": "torn-1", "file": "lease-torn-1.json", "bytes": 0},
+        {"session": "torn-2", "file": "lease-torn-2.json", "bytes": len(torn_payload)},
+    ]}
+
+
+def test_save_record_quarantines_torn_file_preserving_bytes(repo):
+    torn = b'{"session": "standard", "deadli'
+    lease.session_record_path(repo, "standard").write_bytes(torn)
+    seed_record(repo)  # save_record is the writer that needs the path
+    quarantined = sorted((repo / "var").glob("lease-standard.json.torn-*"))
+    assert len(quarantined) == 1 and quarantined[0].read_bytes() == torn
+    assert lease.load_record(repo, "standard")["session"] == "standard"
+    assert _records_mod.torn_records(repo) == []
+
+
+def test_adopt_orphan_quarantines_torn_record_and_preserves_bytes(repo):
+    plant_kit_config(repo, "reborn-torn", deadline=NOW + timedelta(hours=5), acquired_at=NOW - timedelta(hours=1))
+    torn = b'{"session": "reborn-torn", "shape": "cpu-hi'
+    lease.session_record_path(repo, "reborn-torn").write_bytes(torn)
+    out = lease.adopt_orphan(orphan_stub(["reborn-torn"]), repo, "reborn-torn", now_dt=NOW)
+    assert out["action"] == "adopted"
+    quarantined = sorted((repo / "var").glob("lease-reborn-torn.json.torn-*"))
+    assert len(quarantined) == 1 and quarantined[0].read_bytes() == torn
+    assert lease.load_record(repo, "reborn-torn")["adopted"] is True
+
+
+def test_orphan_derivation_falls_back_to_session_evidence(repo, tmp_path, monkeypatch):
+    """E2's proof: acquire + extend write the evidence file as
+    a side effect of the lifecycle itself (no renewal kit —
+    the window never crosses the session cap at acquire, and
+    the extend's kit install fails on the missing token
+    without planting a config). Delete the record, every
+    journal, and any renewal-config: derivation still returns
+    the evidenced (extended) deadline, from the evidence file
+    alone."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # no token: kit installs report token-missing, non-fatally
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW, caller="alpha")
+    assert out["action"] == "created"
+    rec = out["record"]
+    session = rec["session"]
+    ext = lease.extend(make_extend_stub([session]), repo, session, 2, now_dt=NOW)
+    assert ext["action"] == "extended"
+    var = repo / "var"
+    evidence = json.loads((var / f"session-evidence-{session}.json").read_text())
+    assert evidence["deadline"] == ext["new_deadline"]
+    assert evidence["acquired_at"] == rec["acquired_at"] and evidence["caller"] == "alpha"
+    assert evidence["shape"] == "cpu" and evidence["spec"] == {"gpu": None, "tpu": None, "high_mem": False}
+    lease.session_record_path(repo, session).unlink()
+    (var / f"renewal-config-{session}.json").unlink(missing_ok=True)
+    for name in ("ui-outbox.jsonl", "reaper-events.jsonl"):
+        (var / name).unlink(missing_ok=True)
+    lease.caller_claims_path(repo).unlink(missing_ok=True)
+    entry = lease.derive_orphan(repo, {"session": session, "endpoint": None, "shape_class": "standard"})
+    assert entry["derived_deadline"] == ext["new_deadline"]
+    assert entry["deadline_source"] == "session-evidence"
+    assert entry["acquired_at"] == rec["acquired_at"]
+    assert entry["creator_caller"] == "alpha"
+    assert entry["shape"] == "cpu" and entry["shape_evidenced"] is True
+    assert entry["kit_installed"] is False
+
+
+def test_mirror_manifest_lists_the_session_evidence_class():
+    spec = importlib.util.spec_from_loader("mirror_transient", SourceFileLoader("mirror_transient", str(REPO / "ops" / "mirror_transient.py")))
+    mirror = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mirror)
+    assert mirror.var_file_class("session-evidence-lost-1.json") == "session-evidence"
+    assert "session-evidence" in {name for _prefix, _suffix, name in mirror.VAR_FILE_CLASSES}
+    assert mirror.var_file_class("ui-outbox.jsonl") is None
+
+
+def test_state_dials_cache_within_ttl_and_redial_past_it(repo):
+    """E14's proof: inside the TTL, two budget reads make one
+    usage call and two census reads make one list call against
+    a counting stub; past the TTL both re-dial."""
+    calls = {"usage": 0, "sessions": 0}
+
+    def stub(*a, **k):
+        if a and a[0] == "usage":
+            calls["usage"] += 1
+            return cp("balance: 500 CU (stub)")
+        if a and a[0] == "sessions":
+            calls["sessions"] += 1
+            return cp(json.dumps(["stray-1"]))
+        return cp("")
+
+    ttl = _state_mod.STATE_DIAL_CACHE_TTL_S
+    first = lease.budget_snapshot(stub, repo, now_dt=NOW)
+    assert first["balance"] == 500
+    again = lease.budget_snapshot(stub, repo, now_dt=NOW + timedelta(seconds=10))
+    assert again["balance"] == 500 and calls["usage"] == 1
+    past = lease.budget_snapshot(stub, repo, now_dt=NOW + timedelta(seconds=ttl + 60))
+    assert past["balance"] == 500 and calls["usage"] == 2
+
+    census = lease.state_orphans(stub, repo, now_dt=NOW)
+    assert [o["session"] for o in census["orphans"]] == ["stray-1"]
+    census2 = lease.state_orphans(stub, repo, now_dt=NOW + timedelta(seconds=10))
+    assert [o["session"] for o in census2["orphans"]] == ["stray-1"] and calls["sessions"] == 1
+    lease.state_orphans(stub, repo, now_dt=NOW + timedelta(seconds=ttl + 60))
+    assert calls["sessions"] == 2
+
+
+def test_orphan_census_counts_live_detached_work(repo):
+    """E8's census half: a live detached record for the
+    session counts in jobs_in_flight under its detached:<id>
+    entry and seeds the adopted record's jobs list; a
+    finished one and another session's do not."""
+    plant_kit_config(repo, "busy-det", deadline=NOW + timedelta(hours=5), acquired_at=NOW - timedelta(hours=1))
+    det_dir = repo / "results" / "detached"
+    det_dir.mkdir(parents=True)
+    (det_dir / "det-1.json").write_text(json.dumps({"id": "det-1", "session": "busy-det", "caller": "alpha", "state": "running", "exit_code": None, "started_at": NOW.isoformat(), "finished_at": None}))
+    (det_dir / "det-2.json").write_text(json.dumps({"id": "det-2", "session": "busy-det", "caller": "alpha", "state": "complete", "exit_code": 0, "started_at": NOW.isoformat(), "finished_at": NOW.isoformat()}))
+    (det_dir / "det-3.json").write_text(json.dumps({"id": "det-3", "session": "other-1", "caller": "beta", "state": "running", "exit_code": None, "started_at": NOW.isoformat(), "finished_at": None}))
+    entry = lease.derive_orphan(repo, {"session": "busy-det", "endpoint": None, "shape_class": "high_ram"})
+    assert entry["jobs_in_flight"] == ["detached:det-1"]
+    out = lease.adopt_orphan(orphan_stub(["busy-det"]), repo, "busy-det", now_dt=NOW)
+    assert out["action"] == "adopted"
+    assert out["record"]["jobs"] == ["detached:det-1"]

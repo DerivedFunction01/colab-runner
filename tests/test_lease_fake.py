@@ -504,7 +504,7 @@ def test_state_portions_and_composition(tmp_path, monkeypatch):
     # The fake's help output parses as no catalog, so the specs
     # portion's catalog_error rides the composed payload exactly as
     # it did before the split.
-    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access", "extend_guard", "orphans"}
+    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access", "extend_guard", "orphans", "torn_records"}
     assert composed["orphans"] == orphans["orphans"]
     assert composed["catalog_error"] == specs["catalog_error"]
     assert composed["records"] == records["records"]

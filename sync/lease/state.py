@@ -51,15 +51,77 @@ def specs(repo: Path, colab=None) -> list[dict]:
     return out
 
 
-def budget_snapshot(colab, repo: Path) -> dict:
+# --- State dial cache (E14) ---------------------------------------------------
+# State composition dialed the account on every read: the
+# budget portion's usage call and the orphan census's live
+# list. Under account load those reads took 41-63 s, so the
+# panel's data plane went stale-slow exactly when the account
+# was busiest. Both dials now cache in var/ on a short TTL —
+# the liveness files' freshness model: a stamp beside the
+# value; a missing, unreadable, or stale cache falls back to
+# the dial; only a successful dial refreshes the stamp (a
+# failed dial is never cached, so recovery is never masked).
+# Only these two dials cache — a session's tri-state
+# classification is never served from cache.
+
+STATE_DIAL_CACHE_TTL_S = 30
+
+
+def _dial_cache_read(repo: Path, name: str, now_dt: datetime):
+    """One state dial's cached value, or None when the cache
+    is missing, unreadable, or older than the TTL. A cached
+    value is never itself None (failures are not cached), so
+    None unambiguously means: dial."""
+    data = foundation.load_json(foundation.var_dir(repo) / name, None)
+    if not isinstance(data, dict) or "value" not in data:
+        return None
+    try:
+        fetched = foundation.parse_dt(data.get("fetched_at"))
+    except (TypeError, ValueError):
+        return None
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
+    age = (now_dt - fetched).total_seconds()
+    if age < 0 or age > STATE_DIAL_CACHE_TTL_S:
+        return None
+    return data["value"]
+
+
+def _dial_cache_write(repo: Path, name: str, value, now_dt: datetime) -> None:
+    """Refresh one dial cache (staged sibling + rename, the
+    record discipline). Best-effort by design: a failed cache
+    write costs a re-dial on the next read, never a failed
+    read."""
+    p = foundation.var_dir(repo) / name
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps({"fetched_at": now_dt.isoformat(), "value": value}))
+            os.replace(tmp, p)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+    except OSError:
+        pass
+
+
+def budget_snapshot(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     """Read-only budget numbers for `state`: the live balance and
     spend from the attributed accounting (segment journal + live
-    records), never from balance deltas."""
+    records), never from balance deltas. The balance dial is
+    TTL-cached (E14, above); the spend figures are local reads
+    and are composed fresh on every call."""
     cfg = foundation.load_config(repo)
-    try:
-        balance = foundation.parse_balance(colab("usage", timeout=120).stdout)
-    except Exception:  # noqa: BLE001
-        balance = None
+    now_dt = now_dt or datetime.now(timezone.utc)
+    balance = _dial_cache_read(repo, "state-cache-usage.json", now_dt)
+    if balance is None:
+        try:
+            balance = foundation.parse_balance(colab("usage", timeout=120).stdout)
+        except Exception:  # noqa: BLE001
+            balance = None
+        if balance is not None:
+            _dial_cache_write(repo, "state-cache-usage.json", balance, now_dt)
     day_spent = month_spent = standing_day_spent = None
     if balance is not None:
         spend = _mod_spend.attributed_spend(repo)
@@ -281,7 +343,7 @@ def state_extend_guard(repo: Path) -> dict:
     return {"extend_guard": {"policy": policy, "verdicts": verdicts}}
 
 
-def state_orphans(colab, repo: Path) -> dict:
+def state_orphans(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     """Portion: the orphan census — live sessions with no lease
     record, each entry derive_orphan's composition (the derived
     deadline and its evidence), ready for the panel to offer an
@@ -290,8 +352,17 @@ def state_orphans(colab, repo: Path) -> dict:
     flagged, because its refusal reason is exactly what the
     operator needs to see. An unreadable live list serves an
     empty census flagged unreadable — no orphans rather than
-    invented ones."""
-    live = sessions.live_sessions(colab, repo)
+    invented ones. The live list itself is TTL-cached (E14):
+    inside the TTL the census composes from the cached list;
+    a stale cache re-dials, and an unreadable dial still
+    serves the flagged empty census (a cached list is only
+    ever a successful dial's result)."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    live = _dial_cache_read(repo, "state-cache-live.json", now_dt)
+    if live is None:
+        live = sessions.live_sessions(colab, repo)
+        if live is not None:
+            _dial_cache_write(repo, "state-cache-live.json", live, now_dt)
     if live is None:
         return {"orphans": [], "unreadable": True}
     recorded = {rec.get("session") for rec in _mod_records.all_records(repo)}
@@ -302,6 +373,16 @@ def state_orphans(colab, repo: Path) -> dict:
             continue
         out.append(orphans.derive_orphan(repo, entry))
     return {"orphans": out}
+
+
+def state_torn_records(repo: Path) -> dict:
+    """Portion: the torn-record findings (E1) — lease-record
+    files whose contents cannot yield a record, served by
+    filename-derived session instead of vanishing from every
+    reader. A pure local read: the census never renames;
+    quarantine is a writer's act (records.quarantine_torn,
+    fired by save_record and the adoption path)."""
+    return {"torn_records": _mod_records.torn_records(repo)}
 
 
 def state(colab, repo: Path) -> dict:
@@ -317,5 +398,6 @@ def state(colab, repo: Path) -> dict:
     out.update(state_grant(colab, repo, budget))
     out.update(state_meta(colab, repo))
     out.update(state_orphans(colab, repo))
+    out.update(state_torn_records(repo))
     out.update(state_extend_guard(repo))
     return out

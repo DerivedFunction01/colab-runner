@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, callers, access
+from . import foundation, catalog, callers, access, records
 
 # --- Orphaned sessions: evidence and adoption ----------------------------------
 #
@@ -56,11 +56,15 @@ def orphan_evidence(repo: Path, session: str) -> dict:
     where the source carries nothing). Reads are local-only and
     tolerant: a missing or unparseable source contributes
     nothing, never an exception (the load_json pattern).
-    Deadline evidence exists in exactly two places — the
-    renewal kit's config (a verbatim copy of the record at
-    install) and the panel outbox's lease-extended chain —
-    and nowhere else: claims, liveness state, and run records
-    carry caller/shape/first-seen evidence only."""
+    Deadline evidence lives in three places — the renewal
+    kit's config and the session-evidence file (both verbatim
+    copies of the record: the kit's at install, the evidence
+    file's at every record save) and the panel outbox's
+    lease-extended chain — and nowhere else: claims, liveness
+    state, and run records carry caller/shape/first-seen
+    evidence only. Detached shell records (results/detached/,
+    the shell channel's async path) carry job evidence the
+    same way run records do."""
     var = foundation.var_dir(repo)
     sources: list[dict] = []
     kit = foundation.load_json(var / f"renewal-config-{session}.json", None)
@@ -68,6 +72,9 @@ def orphan_evidence(repo: Path, session: str) -> dict:
     if kit_installed:
         spec = {"gpu": kit.get("gpu"), "tpu": kit.get("tpu"), "high_mem": bool(kit.get("high_mem"))}
         sources.append(_orphan_contribution("renewal-config", deadline=kit.get("deadline"), acquired_at=kit.get("acquired_at"), shape=kit.get("shape"), spec=spec))
+    evidence_file = foundation.load_json(records.session_evidence_path(repo, session), None)
+    if isinstance(evidence_file, dict):
+        sources.append(_orphan_contribution("session-evidence", deadline=evidence_file.get("deadline"), acquired_at=evidence_file.get("acquired_at"), shape=evidence_file.get("shape"), spec=evidence_file.get("spec"), caller=evidence_file.get("caller")))
     for event in _jsonl_events(var / "ui-outbox.jsonl"):
         detail = event.get("detail")
         if event.get("kind") != "lease-extended" or not isinstance(detail, dict) or detail.get("session") != session:
@@ -95,6 +102,17 @@ def orphan_evidence(repo: Path, session: str) -> dict:
             contribution["run_id"] = run.get("run_id") or path.stem
             contribution["state"] = run.get("state")
             sources.append(contribution)
+    detached_dir = repo / "results" / "detached"
+    if detached_dir.is_dir():
+        for path in sorted(detached_dir.glob("*.json")):
+            det = foundation.load_json(path, None)
+            if not isinstance(det, dict) or det.get("session") != session:
+                continue
+            contribution = _orphan_contribution("detached-record", caller=det.get("caller"), at=det.get("started_at"))
+            contribution["run_id"] = f"detached:{det.get('id') or path.stem}"
+            contribution["state"] = det.get("state")
+            contribution["finished_at"] = det.get("finished_at")
+            sources.append(contribution)
     handover = foundation.load_json(var / "lease-handover.json", None)
     handover_pending = isinstance(handover, dict) and handover.get("child_session") == session
     return {"session": session, "sources": sources, "kit_installed": kit_installed, "handover_pending": handover_pending}
@@ -104,9 +122,10 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
     """One orphan census entry, composed from the session's
     evidence by the priority ruling: the renewal-config's
     deadline/acquired_at/shape first (a verbatim copy of the
-    record at kit install), any later lease-extended outbox
-    event applied over it, and nothing else carrying a
-    deadline. The record's creator is the renewal-origin
+    record at kit install), the session-evidence projection
+    ranked with it (the same record's copy at every save;
+    E2), any later lease-extended outbox event applied over
+    the base, and nothing else carrying a deadline. The record's creator is the renewal-origin
     caller in the reaper events, never the earliest claim — a
     claim is a ride, and a rider may predate nothing but their
     own attach. Every conflicting value is served with its
@@ -131,18 +150,28 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
     shape = None
     shape_spec = None
     shape_evidenced = False
+    # The base is a verbatim copy of the record: the renewal
+    # kit's config first, the session-evidence projection
+    # ranked with it (E2) — the two are copies of the same
+    # record, so either serves when the other is gone, and a
+    # disagreement between them is served as a conflict below.
     kit_cfg = (by_source.get("renewal-config") or [None])[0]
-    if kit_cfg is not None:
-        acquired_at = kit_cfg.get("acquired_at")
-        if kit_cfg.get("deadline"):
-            derived_deadline = kit_cfg["deadline"]
-            deadline_source = "renewal-config"
-        if kit_cfg.get("spec"):
-            shape_spec = kit_cfg["spec"]
+    base_cfg = kit_cfg
+    base_source = "renewal-config"
+    if base_cfg is None:
+        base_cfg = (by_source.get("session-evidence") or [None])[0]
+        base_source = "session-evidence"
+    if base_cfg is not None:
+        acquired_at = base_cfg.get("acquired_at")
+        if base_cfg.get("deadline"):
+            derived_deadline = base_cfg["deadline"]
+            deadline_source = base_source
+        if base_cfg.get("spec"):
+            shape_spec = base_cfg["spec"]
             shape = catalog.shape_id_for(shape_spec.get("gpu"), shape_spec.get("tpu"), shape_spec.get("high_mem"))
             shape_evidenced = True
-        elif kit_cfg.get("shape"):
-            shape = kit_cfg["shape"]
+        elif base_cfg.get("shape"):
+            shape = base_cfg["shape"]
             shape_evidenced = True
     extensions = by_source.get("ui-outbox") or []
     if extensions:
@@ -161,6 +190,9 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
     deadline_values = []
     if kit_cfg is not None and kit_cfg.get("deadline"):
         deadline_values.append({"source": "renewal-config", "value": kit_cfg["deadline"]})
+    evidence_cfg = (by_source.get("session-evidence") or [None])[0]
+    if evidence_cfg is not None and evidence_cfg.get("deadline"):
+        deadline_values.append({"source": "session-evidence", "value": evidence_cfg["deadline"]})
     for contribution in extensions:
         if contribution.get("deadline"):
             deadline_values.append({"source": "ui-outbox", "value": contribution["deadline"]})
@@ -168,16 +200,26 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
         conflicts.append({"field": "deadline", "values": deadline_values})
 
     creator_caller = None
+    creator_source = None
     for contribution in by_source.get("reaper-events") or []:
         if contribution.get("caller"):
             creator_caller = contribution["caller"]
+            creator_source = "reaper-events"
             break
+    if creator_caller is None and evidence_cfg is not None and evidence_cfg.get("caller"):
+        # The session-evidence file is the record's own
+        # projection, so its caller is the record's creator
+        # stamp — not a claim. It ranks below the reaper
+        # events' renewal-origin caller, which stays the
+        # authority when both speak.
+        creator_caller = evidence_cfg["caller"]
+        creator_source = "session-evidence"
     first_claim = None
     claim = (by_source.get("caller-claims") or [None])[0]
     if claim is not None:
         first_claim = claim.get("caller")
     if creator_caller and first_claim and creator_caller != first_claim:
-        conflicts.append({"field": "caller", "values": [{"source": "reaper-events", "value": creator_caller}, {"source": "caller-claims", "value": first_claim}]})
+        conflicts.append({"field": "caller", "values": [{"source": creator_source, "value": creator_caller}, {"source": "caller-claims", "value": first_claim}]})
 
     shape_candidates: list[str] = []
     if not shape_evidenced:
@@ -191,6 +233,17 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
             shape = shape_candidates[0]
 
     jobs_in_flight = [c["run_id"] for c in by_source.get("run-record") or [] if c.get("state") in ("starting", "running", "polling") and c.get("run_id")]
+    # Detached shell work (E8): a detached record with no
+    # finish stamp and a non-terminal state is a job in
+    # flight exactly as a run is; it seeds the adopted
+    # record's jobs list under its detached:<id> entry, the
+    # name the shell lane registers it by.
+    for contribution in by_source.get("detached-record") or []:
+        if not contribution.get("run_id") or contribution.get("finished_at"):
+            continue
+        if contribution.get("state") in ("complete", "completed", "failed", "error", "stopped", "done"):
+            continue
+        jobs_in_flight.append(contribution["run_id"])
     seen = [c["at"] for c in evidence["sources"] if c.get("at")]
     stamp = access.load_unattributed(repo).get(session) or {}
     if stamp.get("first_seen"):

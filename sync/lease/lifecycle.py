@@ -332,6 +332,12 @@ def adopt_orphan(colab, repo: Path, session: str, deadline=None, hours: float | 
         return {"action": "lease-disabled"}
     if records.load_record(repo, session) is not None:
         return {"action": "adopt-has-record", "session": session}
+    # A torn record file for this session read as no record
+    # above (its contents cannot yield one). Quarantine it
+    # now (E1) — renamed aside, bytes preserved — so the
+    # adoption and its save never reason about the torn file
+    # in place.
+    records.quarantine_torn(repo, session=session)
     if session.startswith("bridge-"):
         return {"action": "adopt-bridge-managed", "session": session}
     handover = foundation.load_json(foundation.var_dir(repo) / "lease-handover.json", None)

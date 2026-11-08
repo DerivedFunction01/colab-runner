@@ -27,6 +27,34 @@ def load_registry() -> list[dict]:
     return json.loads(REGISTRY.read_text())["items"]
 
 
+# The registry above mirrors fixed home-dir files one by one.
+# Repo var/ holds a second transient population: per-session
+# file CLASSES (a name pattern, not a fixed path), which ride
+# the transient set as classes — they are restored with var/
+# as a whole rather than item by item, so no registry item
+# can name them. This manifest names the classes so the set
+# stays enumerable: (prefix, suffix, class). The
+# session-evidence class joins with the E2 evidence
+# projection: a verbatim copy of each lease record's
+# deadline fields, refreshed on every record save, kept so
+# orphan derivation survives the record's own loss.
+VAR_FILE_CLASSES = (
+    ("lease-", ".json", "lease-record"),
+    ("renewal-config-", ".json", "renewal-config"),
+    ("liveness-", ".json", "liveness"),
+    ("session-evidence-", ".json", "session-evidence"),
+)
+
+
+def var_file_class(filename: str) -> str | None:
+    """The transient var class a var/ filename belongs to, or
+    None when the file is not part of the transient set."""
+    for prefix, suffix, name in VAR_FILE_CLASSES:
+        if filename.startswith(prefix) and filename.endswith(suffix):
+            return name
+    return None
+
+
 def resolve(item: dict) -> tuple[Path, Path]:
     canonical = Path(str(item["canonical"]).replace("~", str(home()), 1))
     return canonical, REPO / item["mirror"]
