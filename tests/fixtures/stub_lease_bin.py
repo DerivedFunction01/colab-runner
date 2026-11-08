@@ -26,6 +26,27 @@ DEADLINE = "2099-01-01T00:00:00+00:00"
 SESSION = "amber-otter-42"
 SHAPE_SPEC = {"gpu": None, "tpu": None, "high_mem": True}
 
+ORPHAN = {
+    "session": "stray-fox-7",
+    "endpoint": "https://m-hm-fake.prod.r.colab.dev",
+    "shape_class": "high_ram",
+    "shape": "cpu-highram",
+    "shape_spec": dict(SHAPE_SPEC),
+    "shape_evidenced": True,
+    "shape_candidates": [],
+    "creator_caller": "alpha",
+    "first_claim": "alpha",
+    "derived_deadline": "2026-11-09T00:00:00+00:00",
+    "deadline_source": "renewal-config",
+    "deadline_stale_possible": False,
+    "conflicts": [],
+    "acquired_at": "2026-11-01T00:00:00+00:00",
+    "jobs_in_flight": [],
+    "first_seen": "2026-11-01T01:00:00+00:00",
+    "kit_installed": True,
+    "handover_pending": False,
+}
+
 
 def record(session, shape="cpu-highram"):
     return {
@@ -111,6 +132,7 @@ def main(argv):
             ],
             "session_gate": {"enabled": True, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"},
             "bridge": None,
+            "orphans": [dict(ORPHAN)],
         }
         if part is not None:
             slices = {
@@ -119,6 +141,7 @@ def main(argv):
                 "budget": {"budget": out["budget"]},
                 "grant": {"grant": out["grant"], "envelope": out["envelope"]},
                 "meta": {"bridge": out["bridge"]},
+                "orphans": {"orphans": out["orphans"]},
             }
             out = slices[part]
     elif cmd == "acquire":

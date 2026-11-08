@@ -1704,3 +1704,23 @@ def test_adopt_orphan_lease_disabled(repo):
     (repo / "config" / "lease.json").write_text(json.dumps({"enabled": False}))
     out = lease.adopt_orphan(orphan_stub(["off-1"]), repo, "off-1", deadline=NOW + timedelta(hours=3), now_dt=NOW)
     assert out["action"] == "lease-disabled"
+
+
+def test_state_orphans_portion_lists_unrecorded_live_sessions(repo):
+    seed_record(repo)  # session "standard" holds a record
+    plant_kit_config(repo, "stray-1", deadline=NOW + timedelta(hours=5), acquired_at=NOW - timedelta(hours=1))
+    portion = lease.state_orphans(orphan_stub(["standard", "stray-1", "bridge-x-9", "bare-2"]), repo)
+    # Recorded and bridge-prefixed sessions stay out; the rest
+    # are served with their derived evidence.
+    assert [o["session"] for o in portion["orphans"]] == ["stray-1", "bare-2"]
+    stray = portion["orphans"][0]
+    assert stray["derived_deadline"] == (NOW + timedelta(hours=5)).isoformat()
+    assert stray["deadline_source"] == "renewal-config"
+    assert portion["orphans"][1]["derived_deadline"] is None
+
+
+def test_state_orphans_portion_unreadable(repo):
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired("colab", 120)
+
+    assert lease.state_orphans(boom, repo) == {"orphans": [], "unreadable": True}

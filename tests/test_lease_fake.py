@@ -968,3 +968,100 @@ def test_detect_unattributed_never_acts_on_an_unreadable_list(tmp_path, monkeypa
 
     assert lease_mod.detect_unattributed(boom, repo, PNOW) == {"detected": [], "cleared": []}
     assert lease_mod.load_unattributed(repo) == {}
+
+
+# --- Orphan adoption at the CLI -------------------------------------------------
+#
+# An orphan in the fake world: a session created by invoking the
+# fake colab CLI directly, so a live session and its binding
+# exist with no lease record. Deadlines are relative to the real
+# clock — the CLI path runs on real now, not PNOW.
+
+
+def run_lease_rc(env, *args):
+    r = subprocess.run([sys.executable, str(lease_bin(env)), *args], capture_output=True, text=True, env=env, timeout=300)
+    return r.returncode, json.loads(r.stdout) if r.stdout.strip() else {}
+
+
+def make_orphan(env, name, *, high_mem=True):
+    argv = [sys.executable, str(FAKE), "new", "-s", name]
+    if high_mem:
+        argv.append("--high-mem")
+    r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def plant_cli_kit_config(env, session, *, deadline, acquired_at):
+    cfg = {"shape": "cpu-highram", "session": session, "deadline": deadline.isoformat(), "acquired_at": acquired_at.isoformat(), "cap_seconds": 3600, "margin_seconds": 600, "high_mem": True, "gpu": None, "tpu": None}
+    (Path(env["COLAB_RUNNER_VAR"]) / f"renewal-config-{session}.json").write_text(json.dumps(cfg, indent=2))
+
+
+def test_adopt_orphan_via_cli_restores_record(tmp_path):
+    env = lease_env(tmp_path)
+    make_orphan(env, "stray-cli-1")
+    now = datetime.now(timezone.utc)
+    plant_cli_kit_config(env, "stray-cli-1", deadline=now + timedelta(hours=6), acquired_at=now - timedelta(hours=1))
+    census = run_lease(env, "state", "--part", "orphans")
+    assert [o["session"] for o in census["orphans"]] == ["stray-cli-1"]
+    assert census["orphans"][0]["deadline_source"] == "renewal-config"
+    out = run_lease(env, "adopt", "stray-cli-1", "--caller", "alpha")
+    assert out["action"] == "adopted"
+    rec = record(env)
+    assert rec["session"] == "stray-cli-1" and rec["shape"] == "cpu-highram"
+    assert rec["deadline"] == (now + timedelta(hours=6)).isoformat()
+    assert rec["acquired_at"] == (now - timedelta(hours=1)).isoformat()
+    assert rec["adopted"] is True and rec["deadline_source"] == "renewal-config"
+    # No creator evidence exists, so the operator's validated
+    # caller fills the record (the extend fill rule).
+    assert rec["caller"] == "alpha"
+    # The adopted session leaves the census. (The census may
+    # also list a "default" session: the fake CLI answers the
+    # catalog probe (new --help) by creating one — a fake-world
+    # artifact, not an adoption miss.)
+    remaining = [o["session"] for o in run_lease(env, "state", "--part", "orphans")["orphans"]]
+    assert "stray-cli-1" not in remaining
+
+
+def test_adopt_past_deadline_via_cli_exits_1(tmp_path):
+    env = lease_env(tmp_path)
+    make_orphan(env, "stray-cli-2")
+    now = datetime.now(timezone.utc)
+    plant_cli_kit_config(env, "stray-cli-2", deadline=now - timedelta(hours=1), acquired_at=now - timedelta(hours=9))
+    rc, out = run_lease_rc(env, "adopt", "stray-cli-2", "--caller", "alpha")
+    assert rc == 1 and out["action"] == "adopt-deadline-past"
+    assert record_files(env) == []
+
+
+def test_adopt_unregistered_caller_via_cli_exits_2(tmp_path):
+    env = lease_env(tmp_path)
+    make_orphan(env, "stray-cli-3")
+    now = datetime.now(timezone.utc)
+    plant_cli_kit_config(env, "stray-cli-3", deadline=now + timedelta(hours=6), acquired_at=now - timedelta(hours=1))
+    rc, _ = run_lease_rc(env, "adopt", "stray-cli-3", "--caller", "nobody")
+    assert rc == 2
+    assert record_files(env) == []
+
+
+def test_adopt_deadline_shortens_via_cli_exits_1(tmp_path):
+    env = lease_env(tmp_path)
+    make_orphan(env, "stray-cli-4")
+    now = datetime.now(timezone.utc)
+    plant_cli_kit_config(env, "stray-cli-4", deadline=now + timedelta(hours=10), acquired_at=now - timedelta(hours=1))
+    earlier = (now + timedelta(hours=9)).isoformat()
+    rc, out = run_lease_rc(env, "adopt", "stray-cli-4", "--deadline", earlier, "--caller", "alpha")
+    assert rc == 1 and out["action"] == "adopt-deadline-shortens"
+    assert record_files(env) == []
+
+
+def test_adopt_shape_ambiguity_via_cli(tmp_path):
+    env = lease_env(tmp_path)
+    make_orphan(env, "stray-cli-5")
+    (Path(env["COLAB_RUNNER_VAR"]) / "cli-catalog.json").write_text(json.dumps({"gpu": ["T4"], "tpu": ["v5e1"], "no_high_mem": [], "fetched_at": "2027-01-01T00:00:00+00:00"}))
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    rc, out = run_lease_rc(env, "adopt", "stray-cli-5", "--deadline", deadline, "--caller", "alpha")
+    assert rc == 1 and out["action"] == "adopt-shape-ambiguous"
+    assert "t4-highram" in out["shape_candidates"]
+    assert record_files(env) == []
+    out = run_lease(env, "adopt", "stray-cli-5", "--deadline", deadline, "--caller", "alpha", "--shape", "t4-highram")
+    assert out["action"] == "adopted"
+    assert record(env)["shape"] == "t4-highram"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin CLI over sync/lease.py — the shared-session lease.
 
-Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG] [--create]|extend SESSION --hours H [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
+Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG] [--create]|extend SESSION --hours H [--caller TAG]|adopt SESSION [--deadline ISO|--hours H] [--caller TAG] [--shape ID]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
 orphan reconciliation across all lease records); `auto` is the
 hook's auto-acquire duty (inert unless enabled in config/lease.json);
@@ -10,7 +10,9 @@ makes it a timed start the duty fires when due — data, not an agent
 job. `grant` opens
 a two-tier window whose standing lease the `standing` duty keeps up; `extend`
 moves a lease's deadline later (delta-priced, flags the lease as a
-renewable window) and `extend-grant` moves the grant's end the same
+renewable window); `adopt` plants a record for a live session that
+has none, from the deadline evidence its journals carry (the
+`orphans` state portion lists them); and `extend-grant` moves the grant's end the same
 way; `state` is the UI's single read (records + grant + specs +
 budget). `budget-caps` updates the budget caps in config/lease.json
 (the panel's editor rides it); each value is a non-negative number
@@ -113,7 +115,7 @@ def shape_arg(rest: list[str]) -> tuple[str | None, list[str], str | None]:
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args or args[0] not in ("status", "acquire", "extend", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "admission", "plan"):
+    if not args or args[0] not in ("status", "acquire", "extend", "adopt", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "admission", "plan"):
         print(__doc__.strip().split("\n")[2], file=sys.stderr)
         return 2
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
@@ -169,6 +171,36 @@ def main() -> int:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
         result = lease.extend(cr.colab, REPO, positional[0], hours, caller=caller)
+    elif cmd == "adopt":
+        hours, rest, err = parse_hours(args[1:])
+        deadline_raw = None
+        caller_flag = None
+        shape_flag = None
+        if err is None:
+            deadline_raw, rest, err = parse_flag(rest, "--deadline")
+        if err is None:
+            caller_flag, rest, err = parse_flag(rest, "--caller")
+        if err is None:
+            shape_flag, rest, err = parse_flag(rest, "--shape")
+        caller = None
+        if err is None:
+            caller, err = resolve_cli_caller(caller_flag)
+        deadline = None
+        if err is None and deadline_raw is not None:
+            if hours is not None:
+                err = "adopt takes --deadline or --hours, not both"
+            else:
+                try:
+                    deadline = datetime.fromisoformat(deadline_raw)
+                except ValueError:
+                    err = "--deadline needs an ISO timestamp"
+        positional = [t for t in rest if not t.startswith("--")]
+        if err is None and not positional:
+            err = "adopt requires a session name"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        result = lease.adopt_orphan(cr.colab, REPO, positional[0], deadline=deadline, hours=hours, caller=caller, shape=shape_flag)
     elif cmd == "release":
         session = args[1] if len(args) > 1 else None
         result = lease.release(cr.colab, REPO, session=session)
@@ -211,13 +243,14 @@ def main() -> int:
             "budget": lease.state_budget,
             "grant": lease.state_grant,
             "meta": lease.state_meta,
+            "orphans": lease.state_orphans,
         }
         if not rest:
             result = lease.state(cr.colab, REPO)
         elif len(rest) == 2 and rest[0] == "--part" and rest[1] in portions:
             result = portions[rest[1]](cr.colab, REPO)
         else:
-            print("colab-lease: state takes [--part records|specs|budget|grant|meta]", file=sys.stderr)
+            print("colab-lease: state takes [--part records|specs|budget|grant|meta|orphans]", file=sys.stderr)
             return 2
     elif cmd == "budget-caps":
         updates = {}
@@ -332,7 +365,7 @@ def main() -> int:
         result = lease.reap(cr.colab, REPO)
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
-    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed") else 1
+    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed", "adopt-has-record", "adopt-absent", "adopt-unknown", "adopt-deadline-past", "adopt-deadline-shortens", "adopt-no-deadline", "adopt-shape-ambiguous", "adopt-shape-unknown", "adopt-shape-conflict", "adopt-bridge-managed", "adopt-handover-pending") else 1
 
 
 if __name__ == "__main__":

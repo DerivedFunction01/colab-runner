@@ -3435,6 +3435,29 @@ def state_extend_guard(repo: Path) -> dict:
     return {"extend_guard": {"policy": policy, "verdicts": verdicts}}
 
 
+def state_orphans(colab, repo: Path) -> dict:
+    """Portion: the orphan census — live sessions with no lease
+    record, each entry derive_orphan's composition (the derived
+    deadline and its evidence), ready for the panel to offer an
+    adoption. Bridge-prefixed sessions are the bridge's, never
+    the lease system's, and stay out; a handover child stays in,
+    flagged, because its refusal reason is exactly what the
+    operator needs to see. An unreadable live list serves an
+    empty census flagged unreadable — no orphans rather than
+    invented ones."""
+    live = live_sessions(colab, repo)
+    if live is None:
+        return {"orphans": [], "unreadable": True}
+    recorded = {rec.get("session") for rec in all_records(repo)}
+    out = []
+    for entry in live:
+        name = entry.get("session")
+        if not name or name in recorded or name.startswith("bridge-"):
+            continue
+        out.append(derive_orphan(repo, entry))
+    return {"orphans": out}
+
+
 def state(colab, repo: Path) -> dict:
     """The UI's composed read: every lease record's status, the
     two-tier grant, the spec catalog, and the budget snapshot,
@@ -3447,6 +3470,7 @@ def state(colab, repo: Path) -> dict:
     out["budget"] = budget
     out.update(state_grant(colab, repo, budget))
     out.update(state_meta(colab, repo))
+    out.update(state_orphans(colab, repo))
     out.update(state_extend_guard(repo))
     return out
 

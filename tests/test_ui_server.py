@@ -532,3 +532,25 @@ def test_frontend_renders_access_list():
     assert 'id="access-list"' in html
     assert "renderAccess" in js and "/api/access/release" in js
     assert "data-access-release" in js
+
+
+def test_state_orphans_part_served(ui):
+    data = ui.get_json("/api/state/orphans")
+    assert [o["session"] for o in data["orphans"]] == ["stray-fox-7"]
+    assert data["orphans"][0]["derived_deadline"] == "2026-11-09T00:00:00+00:00"
+    assert data["orphans"][0]["deadline_source"] == "renewal-config"
+    assert "state --part orphans" in ui.invocations()
+
+
+def test_state_orphans_failure_is_isolated(tmp_path):
+    server = UiServer(tmp_path, extra_env={"STUB_LEASE_FAIL": "state:orphans"})
+    try:
+        try:
+            server.get("/api/state/orphans")
+            raise AssertionError("orphans endpoint should have failed")
+        except urllib.error.HTTPError as err:
+            assert err.code == 502
+        budget = server.get_json("/api/state/budget")
+        assert budget["budget"]["balance"] == 571.7
+    finally:
+        server.close()
