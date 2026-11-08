@@ -5,7 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, gate as _mod_gate, sessions, records as _mod_records, spend as _mod_spend, access, keepalive, grants, orphans, bridge
+from . import foundation, catalog, gate as _mod_gate, sessions, records as _mod_records, spend as _mod_spend, access, keepalive, grants, orphans, bridge, syncclaims
 
 _extend_guard_spec = _ilu.spec_from_file_location("colab_extend_guard", Path(__file__).resolve().parent.parent / "extend_guard.py")
 extend_guard = _ilu.module_from_spec(_extend_guard_spec)
@@ -17,6 +17,10 @@ def status(colab, repo: Path, session: str | None = None) -> dict:
     if not rec:
         return {"action": "no-lease"}
     out = {"action": "active" if sessions.session_alive(colab, rec["session"]) else "recorded-but-dead", "record": rec}
+    # The session's live sync claim rides the status read (the
+    # panel renders holder + expiry from here); a lapsed claim
+    # serves as None — honest absence, never a stale holder.
+    out["sync_claim"] = syncclaims.read_sync_claim(repo, rec["session"])
     if out["action"] == "active" and foundation.load_config(repo).get("keepalive", {}).get("enabled"):
         age = keepalive.heartbeat_age(colab, repo, rec["session"])
         out["keepalive_heartbeat_age_s"] = round(age, 1) if age is not None else None

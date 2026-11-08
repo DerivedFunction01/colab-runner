@@ -248,3 +248,87 @@ def test_config_knobs_resize_ttl_and_window(tmp_path, monkeypatch):
     write_attach(root2, "beta", T0 - timedelta(minutes=10))
     verdict = lease_mod.sync_rights(root2, SESSION, "alpha", now_dt=T0)
     assert verdict["allowed"] is True
+
+
+# --- State serving + CLI verbs (step B) ---------------------------------------
+
+
+class _FakeColab:
+    """A colab callable whose list reads empty: every recorded
+    session reads recorded-but-dead, which is all the status
+    shape needs — the sync claim rides independent of liveness."""
+
+    def __call__(self, *args, timeout=None):
+        import subprocess as _sp
+
+        return _sp.CompletedProcess(args, 0, stdout="", stderr="")
+
+
+def test_state_status_serves_the_live_claim(tmp_path, monkeypatch):
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    now = datetime.now(timezone.utc)
+    lease_mod.claim_sync(root, SESSION, "alpha", now_dt=now)
+    out = lease_mod.status(_FakeColab(), root, SESSION)
+    assert out["sync_claim"]["caller"] == "alpha"
+    assert out["sync_claim"]["expires_at"] == iso(now + timedelta(minutes=60))
+    lease_mod.release_sync_claim(root, SESSION, caller="alpha")
+    out = lease_mod.status(_FakeColab(), root, SESSION)
+    assert out["sync_claim"] is None
+
+
+def _cli_env(tmp_path):
+    import os as _os
+
+    home = tmp_path / "home"
+    token = home / ".config" / "colab-cli" / "token.json"
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text('{"refresh_token": "fake-test-token"}')
+    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
+    root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
+    env = dict(
+        _os.environ,
+        HOME=str(home),
+        COLAB_BIN=str(REPO / "tests" / "fixtures" / "fake_colab.py"),
+        FAKE_COLAB_STATE=str(tmp_path / "fake"),
+        COLAB_RUNNER_VAR=str(tmp_path / "var"),
+        COLAB_LEASE_ACTOR="test",
+    )
+    env.pop("COLAB_CALLER", None)
+    return env, root
+
+
+def _run_lease(env, root, *args):
+    import subprocess as _sp
+    import sys as _sys
+
+    r = _sp.run([_sys.executable, str(root / "bin" / "colab-lease"), *args],
+                capture_output=True, text=True, env=env, timeout=120)
+    return r.returncode, (json.loads(r.stdout) if r.stdout.strip() else {})
+
+
+def test_claim_sync_verbs_round_trip(tmp_path, monkeypatch):
+    monkeypatch.delenv("COLAB_RUNNER_VAR", raising=False)
+    env, root = _cli_env(tmp_path)
+    var = tmp_path / "var"
+    var.mkdir(parents=True, exist_ok=True)
+    (var / f"lease-{SESSION}.json").write_text(json.dumps(
+        {"session": SESSION, "caller": "alpha", "shape": "cpu-highram",
+         "acquired_at": iso(T0), "deadline": iso(T0 + timedelta(hours=8)), "jobs": []}))
+    rc, out = _run_lease(env, root, "claim-sync", SESSION, "--caller", "alpha")
+    assert rc == 0 and out["action"] == "sync-claimed"
+    # A foreign claim refuses with exit 1 and names the holder.
+    rc, out = _run_lease(env, root, "claim-sync", SESSION, "--caller", "beta")
+    assert rc == 1 and out["action"] == "sync-claim-refused-claim" and out["holder"] == "alpha"
+    # The records state portion serves the claim on the record.
+    rc, out = _run_lease(env, root, "state", "--part", "records")
+    assert rc == 0
+    entry = next(e for e in out["records"] if e["session"] == SESSION)
+    assert entry["sync_claim"]["caller"] == "alpha"
+    # Only the holder releases by name; then the claim is gone.
+    rc, out = _run_lease(env, root, "release-sync", SESSION, "--caller", "beta")
+    assert rc == 1 and out["action"] == "sync-release-refused"
+    rc, out = _run_lease(env, root, "release-sync", SESSION, "--caller", "alpha")
+    assert rc == 0 and out["action"] == "sync-released"
+    rc, out = _run_lease(env, root, "release-sync", SESSION, "--caller", "alpha")
+    assert rc == 0 and out["action"] == "sync-no-claim"

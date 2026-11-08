@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin CLI over sync/lease/ — the shared-session lease.
 
-Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG] [--create]|extend SESSION --hours H [--caller TAG]|adopt SESSION [--deadline ISO|--hours H] [--caller TAG] [--shape ID]|shorten SESSION (--deadline ISO|--hours H) [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
+Usage: colab-lease status [session]|acquire --shape ID [--hours H] [--via TAG] [--caller TAG] [--create]|extend SESSION --hours H [--caller TAG]|adopt SESSION [--deadline ISO|--hours H] [--caller TAG] [--shape ID]|shorten SESSION (--deadline ISO|--hours H) [--caller TAG]|claim-sync SESSION [--caller TAG]|release-sync SESSION [--caller TAG]|release [session]|release-session SESSION|reap|keepalive|auto|request [--shape ID] [--reason TEXT] [--caller TAG] [--at ISO-TIME]|unrequest|grant --hours H [--burst SHAPE]|extend-grant --hours H|ungrant|standing|state|budget-caps [--daily V] [--monthly V] [--standing-daily V]|admission --shape ID [--via TAG] [--caller TAG]|plan --shape ID
 Prints one JSON result. `reap` is the reaper-hook duty (deadline +
 orphan reconciliation across all lease records); `auto` is the
 hook's auto-acquire duty (inert unless enabled in config/lease.json);
@@ -119,7 +119,7 @@ def shape_arg(rest: list[str]) -> tuple[str | None, list[str], str | None]:
 
 def main() -> int:
     args = sys.argv[1:]
-    if not args or args[0] not in ("status", "acquire", "extend", "adopt", "shorten", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "admission", "plan"):
+    if not args or args[0] not in ("status", "acquire", "extend", "adopt", "shorten", "claim-sync", "release-sync", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "admission", "plan"):
         print(__doc__.strip().split("\n")[2], file=sys.stderr)
         return 2
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
@@ -232,6 +232,30 @@ def main() -> int:
             print(f"colab-lease: {err}", file=sys.stderr)
             return 2
         result = lease.shorten(cr.colab, REPO, positional[0], deadline=deadline, hours=hours, caller=caller)
+    elif cmd == "claim-sync":
+        caller_flag, rest, err = parse_flag(args[1:], "--caller")
+        caller = None
+        if err is None:
+            caller, err = resolve_cli_caller(caller_flag)
+        positional = [t for t in rest if not t.startswith("--")]
+        if err is None and not positional:
+            err = "claim-sync requires a session name"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        result = lease.claim_sync(REPO, positional[0], caller=caller)
+    elif cmd == "release-sync":
+        caller_flag, rest, err = parse_flag(args[1:], "--caller")
+        caller = None
+        if err is None:
+            caller, err = resolve_cli_caller(caller_flag)
+        positional = [t for t in rest if not t.startswith("--")]
+        if err is None and not positional:
+            err = "release-sync requires a session name"
+        if err:
+            print(f"colab-lease: {err}", file=sys.stderr)
+            return 2
+        result = lease.release_sync_claim(REPO, positional[0], caller=caller)
     elif cmd == "release":
         session = args[1] if len(args) > 1 else None
         result = lease.release(cr.colab, REPO, session=session)
@@ -396,7 +420,7 @@ def main() -> int:
         result = lease.reap(cr.colab, REPO)
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
-    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed", "adopt-has-record", "adopt-absent", "adopt-unknown", "adopt-deadline-past", "adopt-deadline-shortens", "adopt-no-deadline", "adopt-shape-ambiguous", "adopt-shape-unknown", "adopt-shape-conflict", "adopt-bridge-managed", "adopt-handover-pending", "shorten-no-lease", "shorten-unknown", "shorten-standing-managed", "shorten-not-earlier", "shorten-deadline-past", "shorten-no-target") else 1
+    return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed", "adopt-has-record", "adopt-absent", "adopt-unknown", "adopt-deadline-past", "adopt-deadline-shortens", "adopt-no-deadline", "adopt-shape-ambiguous", "adopt-shape-unknown", "adopt-shape-conflict", "adopt-bridge-managed", "adopt-handover-pending", "shorten-no-lease", "shorten-unknown", "shorten-standing-managed", "shorten-not-earlier", "shorten-deadline-past", "shorten-no-target", "sync-claim-refused-claim", "sync-claim-refused-activity", "sync-claim-unattributed", "sync-release-refused") else 1
 
 
 if __name__ == "__main__":
