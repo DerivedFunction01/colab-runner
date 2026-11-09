@@ -28,8 +28,21 @@ SNAPSHOT="$(git -C "$SRC" -c user.name="DL" -c user.email="" commit-tree "$TREE"
 # needs a ref. Create a scratch ref, bundle it, then drop the ref.
 REF="refs/colab-snapshot/$TS"
 git -C "$SRC" update-ref "$REF" "$SNAPSHOT"
-git -C "$SRC" bundle create "$OUT" "$REF" >/dev/null
+# Bundle through a scratch repo so the bundle carries a HEAD
+# naming the snapshot commit: a plain `git clone` of the bundle
+# then materializes the snapshot tree instead of checking out
+# nothing (the bundle's only ref is not a HEAD symref), while
+# the manifest's fetch-the-commit apply route is unchanged.
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"; git -C "$SRC" update-ref -d "$REF"' EXIT
+git init -q "$SCRATCH/repo"
+git -C "$SCRATCH/repo" fetch -q "$SRC" "$REF"
+git -C "$SCRATCH/repo" update-ref "$REF" FETCH_HEAD
+git -C "$SCRATCH/repo" symbolic-ref HEAD "$REF"
+git -C "$SCRATCH/repo" bundle create "$OUT" HEAD "$REF" >/dev/null
 git -C "$SRC" update-ref -d "$REF"
+trap - EXIT
+rm -rf "$SCRATCH"
 BYTES="$(stat -c %s "$OUT")"
 SHA="$(sha256sum "$OUT" | cut -d' ' -f1)"
 python3 - "$OUT" "$BYTES" "$SHA" "$SNAPSHOT" "$ORIGIN_TIP" "$TREE" <<'EOF'
