@@ -121,8 +121,11 @@ def test_refusal_names_foreign_activity_without_a_claim(tmp_path, monkeypatch):
 
 def test_job_registered_on_the_record_is_activity(tmp_path, monkeypatch):
     root = repo(tmp_path, monkeypatch)
-    save_lease_record(root, caller="alpha", jobs=["run-b1"])
+    # The backing record precedes the registration (the runner's
+    # own order — and the pruned projection's premise): plant
+    # the run first, then save the record that registers it.
     write_run(root, "run-b1", "beta", state="running")
+    save_lease_record(root, caller="alpha", jobs=["run-b1"])
     verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
     assert verdict["allowed"] is False and verdict["blocked_by"] == "activity"
     kinds = {e["kind"] for e in verdict["evidence"]}

@@ -114,8 +114,12 @@ def _inflight_sessions(repo: Path) -> set:
     return out
 
 
-def _is_active(lease_mod, rec: dict, inflight: set, now_dt: datetime, idle_after_s: int) -> bool:
-    if rec.get("jobs"):
+def _is_active(lease_mod, repo: Path, rec: dict, inflight: set, now_dt: datetime, idle_after_s: int) -> bool:
+    # Registered jobs count as activity through the pruned
+    # projection (records.live_jobs): a registration whose
+    # backing record ended is not activity, however long the
+    # raw list still names it.
+    if lease_mod.live_jobs(repo, rec):
         return True
     if rec.get("session") in inflight:
         return True
@@ -203,7 +207,7 @@ def run_guard(lease_mod, colab, repo: Path, now_dt: datetime | None = None, poli
         action = out.get("action")
         if action == "extended":
             episodes.pop(session, None)
-            verdicts[session] = {"action": "extended", "at": now_dt.isoformat(), "idle": not _is_active(lease_mod, rec, inflight, now_dt, idle_after_s), "last_used_at": rec.get("last_used_at")}
+            verdicts[session] = {"action": "extended", "at": now_dt.isoformat(), "idle": not _is_active(lease_mod, repo, rec, inflight, now_dt, idle_after_s), "last_used_at": rec.get("last_used_at")}
             lines.append({"session": session, "action": "extended", "old_deadline": out.get("old_deadline"), "new_deadline": out.get("new_deadline")})
             return
         failed = True
@@ -236,12 +240,12 @@ def run_guard(lease_mod, colab, repo: Path, now_dt: datetime | None = None, poli
             elif mode == "always":
                 extend_one(rec)
             elif mode == "active-only":
-                if _is_active(lease_mod, rec, inflight, now_dt, idle_after_s):
+                if _is_active(lease_mod, repo, rec, inflight, now_dt, idle_after_s):
                     extend_one(rec)
                 else:
                     skip(rec, "skipped-idle")
             else:  # active-or-first
-                if _is_active(lease_mod, rec, inflight, now_dt, idle_after_s):
+                if _is_active(lease_mod, repo, rec, inflight, now_dt, idle_after_s):
                     extend_one(rec)
                 else:
                     idle_pool.append(rec)

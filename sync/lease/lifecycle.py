@@ -426,7 +426,10 @@ def adopt_orphan(colab, repo: Path, session: str, deadline=None, hours: float | 
         "acquired_at": acquired_at,
         "deadline": target.isoformat(),
         "last_used_at": now_dt.isoformat(),
-        "jobs": list(census.get("jobs_in_flight") or []),
+        # Seed from the census's pruned entries only: adoption
+        # restores live work, it does not import registrations
+        # whose runs already ended.
+        "jobs": [entry["id"] for entry in census.get("jobs_in_flight_entries") or []],
         "adopted": True,
         "adopted_at": now_dt.isoformat(),
         "deadline_source": source,

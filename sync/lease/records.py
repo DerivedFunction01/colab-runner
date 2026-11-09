@@ -171,10 +171,101 @@ def load_record(repo: Path, session: str | None = None) -> dict | None:
     return max(recs, key=lambda r: (r.get("last_used_at") or "", r.get("acquired_at") or ""))
 
 
+# --- Pruned-jobs projection ----------------------------------------------------
+# Local why: job registrations were append-only — touch_job adds,
+# finish_job removes, and a registration whose backing record
+# ended without a finish (a killed runner, a detached call nobody
+# polled to its end) stayed on the record forever: one live
+# record carried 63 registrations, 23 of them backed by terminal
+# or missing records, and every consumer that read the raw list
+# (the state document, the reap's idle test, the sync-claim
+# evidence) inherited the lie. The projection is the one truth:
+# a registration counts only while its backing run record
+# (results/runs/<id>.json) or detached record
+# (results/detached/<id>.json) exists and is non-terminal.
+# The state vocabularies are the consumers' own: the runner's
+# terminal states for runs, and a detached record is live only
+# in its running state with no finish stamp.
+
+RUN_NONTERMINAL_STATES = ("starting", "running", "polling")
+DETACHED_LIVE_STATES = ("running",)
+
+
+def run_backing(repo: Path, run_id: str) -> tuple[dict | None, bool]:
+    """One run record by id: (record, file_exists). The record
+    is None when the file cannot yield one — missing, or torn
+    mid-write; the flag separates the two, because a torn
+    record is unknown, never dead."""
+    path = repo / "results" / "runs" / f"{run_id}.json"
+    rec = foundation.load_json(path, None)
+    return (rec if isinstance(rec, dict) else None), path.exists()
+
+
+def detached_backing(repo: Path, det_id: str) -> tuple[dict | None, bool]:
+    """One detached record by id (the part after `detached:`),
+    under the same contract as run_backing."""
+    path = repo / "results" / "detached" / f"{det_id}.json"
+    rec = foundation.load_json(path, None)
+    return (rec if isinstance(rec, dict) else None), path.exists()
+
+
+def job_entry(repo: Path, job_id: str) -> dict | None:
+    """One registration resolved against its backing record:
+    {id, kind, state, started_at} while the backing record
+    exists and is non-terminal, else None (pruned). A backing
+    file that exists but cannot be read is torn — unknown,
+    never dead — and the registration stands with state
+    "unknown". A registration with no backing-record kind (a
+    bare name that is neither a run id nor `detached:<id>`)
+    resolves against the runs directory like any run id."""
+    if not isinstance(job_id, str):
+        return None
+    if job_id.startswith("detached:"):
+        det_id = job_id.split(":", 1)[1]
+        det, exists = detached_backing(repo, det_id)
+        if det is None:
+            return {"id": job_id, "kind": "detached", "state": "unknown", "started_at": None} if exists else None
+        if det.get("finished_at"):
+            return None
+        state = det.get("state", "running")
+        if state not in DETACHED_LIVE_STATES:
+            return None
+        return {"id": job_id, "kind": "detached", "state": state, "started_at": det.get("started_at")}
+    run, exists = run_backing(repo, job_id)
+    if run is None:
+        return {"id": job_id, "kind": "run", "state": "unknown", "started_at": None} if exists else None
+    state = run.get("state")
+    if state not in RUN_NONTERMINAL_STATES:
+        return None
+    return {"id": job_id, "kind": "run", "state": state, "started_at": run.get("started_at")}
+
+
+def live_jobs(repo: Path, rec: dict) -> list[dict]:
+    """The record's pruned jobs projection: the kinded entries
+    of the registrations that are still backed by a live
+    record, in registration order. Every consumer of a record's
+    jobs — the state document, the census, adoption seeding,
+    the reap's idle test — reads this, never the raw list."""
+    out = []
+    for job_id in rec.get("jobs") or []:
+        entry = job_entry(repo, job_id)
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
 def save_record(repo: Path, rec: dict) -> None:
     """Write one lease's record at its session path. Any other
     file holding a record for the same session is removed, so a
     stale copy can never resurrect the lease's old shape."""
+    # The jobs list persists pruned (the projection above):
+    # registrations whose backing records are gone or terminal
+    # are dropped at the write, so the store self-heals with no
+    # migration. The caller's dict is pruned too — a save is the
+    # moment the record's jobs become the projection everywhere,
+    # including in the hands of the code that just saved it.
+    if isinstance(rec.get("jobs"), list):
+        rec["jobs"] = [entry["id"] for entry in live_jobs(repo, rec)]
     session = rec["session"]
     p = session_record_path(repo, session)
     p.parent.mkdir(parents=True, exist_ok=True)

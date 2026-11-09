@@ -144,6 +144,38 @@ body { margin: 0; }
 .chip.warn { border-color: var(--wb-status-warn); color: var(--wb-status-warn-text); }
 .chip.bad { border-color: var(--wb-status-bad); color: var(--wb-status-bad-text); }
 
+.big .chip { vertical-align: middle; margin-left: var(--wb-space-8); }
+
+/* ---- orphan jobs expander ---- */
+
+details.jobs { margin: 0 0 var(--wb-space-8); }
+
+details.jobs summary {
+  font-size: var(--wb-font-size-sm);
+  line-height: var(--wb-line-height-sm);
+  color: var(--wb-content-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+
+details.jobs summary::-webkit-details-marker { display: none; }
+details.jobs summary::before { content: "▸ "; color: var(--wb-content-muted); }
+details.jobs[open ] summary::before { content: "▾ "; }
+details.jobs summary b { color: var(--wb-content-primary); font-weight: 600; }
+
+.jobrows { margin: var(--wb-space-8) 0 0; display: flex; flex-direction: column; gap: 3px; }
+
+.jobrow {
+  font-size: var(--wb-font-size-xs);
+  color: var(--wb-content-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin: 0;
+}
+
+.jobrow .jid { font-family: var(--wb-font-mono, monospace); color: var(--wb-content-primary); }
+
 /* ---- buttons ---- */
 
 button {

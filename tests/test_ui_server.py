@@ -684,9 +684,27 @@ def test_frontend_renders_orphans_and_posts_adoptions():
     js = (REPO / "ui" / "static" / "orphans.js").read_text()
     assert "renderOrphans" in js
     assert "/api/lease/adopt" in js
-    for field in ("derived_deadline", "deadline_source", "deadline_stale_possible", "conflicts", "shape_candidates", "shape_evidenced", "creator_caller", "jobs_in_flight", "handover_pending"):
+    for field in ("derived_deadline", "deadline_source", "deadline_stale_possible", "conflicts", "shape_candidates", "shape_evidenced", "creator_caller", "jobs_in_flight", "jobs_in_flight_entries", "handover_pending"):
         assert field in js, field
     assert "adopt-shape-ambiguous" in js  # refusal text reads the verdict
+
+
+def test_frontend_orphan_jobs_expander_and_headline():
+    """The orphan card's jobs truth: the count renders as a
+    number from the served field, the kinded entries render
+    only inside the keyed-state expander (never interpolated
+    as a raw list), and a past-deadline headline is the
+    deadline time with a past-deadline chip — carrying no
+    data-countdown attribute for the ticker to overwrite."""
+    js = (REPO / "ui" / "static" / "orphans.js").read_text()
+    assert "orphanJobsOpen" in js  # open state keyed per session, outside the render
+    assert "orphanJobsHTML" in js and "jobRowsHTML" in js
+    assert "jobs_in_flight_entries" in js
+    assert "past deadline" in js
+    # The past branch builds the big line without data-countdown;
+    # the future branch keeps it for the ticker.
+    assert 'past\n      ? `<p class="big num">${esc(fmtTime(dl))}<span class="chip warn">past deadline</span></p>`' in js
+    assert '`<p class="big num" data-countdown="${esc(dl)}">${esc(countdownText(dl))}</p>`' in js
 
 
 def test_frontend_shorten_picker_beside_extend():

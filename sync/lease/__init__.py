@@ -37,7 +37,7 @@ from .callers import CALLER_ENV, MACHINERY_CALLERS, _CALLER_PART, callers_path, 
 from .syncclaims import sync_claim_policy, active_callers, read_sync_claim, sync_rights, claim_sync, release_sync_claim
 from .gate import shape_class, session_gate_policy, gate_journal_path, append_gate_journal, check_session_admission, enforce_session_admission, _actor_privileged, renewal_admission
 from .sessions import _taken_session_names, generate_session_name, _SESSION_READ_ATTEMPTS, _SESSION_READ_BACKOFF_S, _REAP_READ_ATTEMPTS, _REAP_READ_TIMEOUT_S, session_state, session_alive, local_sessions_path, session_host, created_shape_mismatch, UNASSIGN_FALLBACK_SCRIPT, stop_session_safe, session_endpoint, _endpoint_shape, live_sessions
-from .records import _naming_spec, naming, _liveness_spec, liveness_entry, session_record_path, _valid_record, _record_files, all_records, load_record, save_record, delete_record
+from .records import _naming_spec, naming, _liveness_spec, liveness_entry, session_record_path, _valid_record, _record_files, all_records, load_record, save_record, delete_record, run_backing, detached_backing, job_entry, live_jobs
 from .spend import append_spend_segment, _journal_segments, _overlap_cu, attributed_spend, budget_check, _committed_projection
 from .access import unattributed_path, load_unattributed, save_unattributed, clear_unattributed, access_list, release_session, detect_unattributed
 from .keepalive import HEARTBEAT_READ_TIMEOUT_S, heartbeat_age, prime_session_host, KEEPALIVE_UPLOAD_TIMEOUT_S, KEEPALIVE_LAUNCH_TIMEOUT_S, ensure_keepalive, keepalive_fresh, kernel_pulse, _capture_session_host

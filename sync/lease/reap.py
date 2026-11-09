@@ -37,7 +37,11 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
         rel = lifecycle.release(colab, repo, reason="deadline", session=rec["session"], now_dt=now_dt)
         return {"action": "released-deadline", "stop": rel.get("stop"), "was": rel.get("was")}
     idle = cfg.get("idle_shutdown_minutes")
-    if idle is not None and not rec.get("jobs"):
+    # The idle test reads the pruned projection, not the raw
+    # registrations: a record whose jobs all ended without a
+    # finish_job is idle-eligible, not pinned forever by ghosts.
+    live = records.live_jobs(repo, rec)
+    if idle is not None and not live:
         if now_dt - foundation.parse_dt(rec["last_used_at"]) > timedelta(minutes=float(idle)):
             rel = lifecycle.release(colab, repo, reason="idle", session=rec["session"], now_dt=now_dt)
             return {"action": "released-idle", "stop": rel.get("stop"), "was": rel.get("was")}
@@ -50,7 +54,7 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
             if renewed is not None:
                 return {"action": "renewed", "session": rec["session"], **renewed}
             renewal_failed = True  # the session still lives; the kept path below maintains it
-    out = {"action": "kept", "session": rec["session"], "deadline": rec["deadline"], "jobs": rec.get("jobs", [])}
+    out = {"action": "kept", "session": rec["session"], "deadline": rec["deadline"], "jobs": [entry["id"] for entry in live]}
     if renewal_failed:
         out["renewal"] = "failed"
     if cfg.get("keepalive", {}).get("enabled"):

@@ -114,6 +114,12 @@ def test_policy_unknown_mode_fails_closed(tmp_path, monkeypatch):
 def _craft(repo, session, *, last_used_h, deadline_m=30, jobs=None, caller="alpha"):
     rec = {"session": session, "shape": "cpu", "caller": caller, "deadline": (PNOW + timedelta(minutes=deadline_m)).isoformat(), "acquired_at": (PNOW - timedelta(hours=8)).isoformat(), "last_used_at": (PNOW - timedelta(hours=last_used_h)).isoformat(), "jobs": jobs or []}
     (repo / "var" / f"lease-{session}.json").write_text(json.dumps(rec))
+    # A registration is activity only while backed (the pruned
+    # projection): plant a live run record per crafted job.
+    runs = repo / "results" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    for rid in jobs or []:
+        (runs / f"{rid}.json").write_text(json.dumps({"run_id": rid, "session": session, "state": "running", "started_at": PNOW.isoformat()}))
     return rec
 
 

@@ -324,8 +324,17 @@ def test_reap_idle_guard_respects_registered_jobs(tmp_path, monkeypatch):
     fake = FakeColab()
     a = lease_mod.acquire(fake, repo, "cpu", now_dt=PNOW, caller="alpha")
     assert a["action"] == "created"
+    # Registrations hold through their backing records (the
+    # pruned-jobs projection): plant a live record per held
+    # run, and a terminal one for the ghost — the ghost's
+    # registration must neither hold nor report.
+    runs_dir = repo / "results" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    for rid, st in (("run-held-1", "running"), ("run-held-2", "running"), ("run-ghost", "complete")):
+        (runs_dir / f"{rid}.json").write_text(json.dumps({"run_id": rid, "session": a["record"]["session"], "state": st, "started_at": PNOW.isoformat()}))
     lease_mod.touch_job(repo, "run-held-1", now_dt=PNOW)
     lease_mod.touch_job(repo, "run-held-2", now_dt=PNOW)
+    lease_mod.touch_job(repo, "run-ghost", now_dt=PNOW)
     later = PNOW + timedelta(minutes=31)
     out = lease_mod.reap(fake, repo, now_dt=later)
     assert out["action"] == "kept" and sorted(out["jobs"]) == ["run-held-1", "run-held-2"]

@@ -232,18 +232,25 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
         if len(shape_candidates) == 1:
             shape = shape_candidates[0]
 
-    jobs_in_flight = [c["run_id"] for c in by_source.get("run-record") or [] if c.get("state") in ("starting", "running", "polling") and c.get("run_id")]
-    # Detached shell work (E8): a detached record with no
-    # finish stamp and a non-terminal state is a job in
-    # flight exactly as a run is; it seeds the adopted
-    # record's jobs list under its detached:<id> entry, the
-    # name the shell lane registers it by.
-    for contribution in by_source.get("detached-record") or []:
-        if not contribution.get("run_id") or contribution.get("finished_at"):
+    # In-flight jobs: the pruned-jobs projection (records)
+    # resolved over the census's own contributions — a run or
+    # detached record counts only while it exists and is
+    # non-terminal. The count is served as a count; the entries
+    # ride under their own name, each kinded with its backing
+    # record's state and start. Detached work (E8) enters under
+    # its detached:<id> name, the name the shell lane registers
+    # it by.
+    jobs_entries: list[dict] = []
+    seen_job_ids: set[str] = set()
+    contributions = (by_source.get("run-record") or []) + (by_source.get("detached-record") or [])
+    for contribution in contributions:
+        run_id = contribution.get("run_id")
+        if not run_id or run_id in seen_job_ids:
             continue
-        if contribution.get("state") in ("complete", "completed", "failed", "error", "stopped", "done"):
-            continue
-        jobs_in_flight.append(contribution["run_id"])
+        entry = records.job_entry(repo, run_id)
+        if entry is not None:
+            jobs_entries.append(entry)
+            seen_job_ids.add(run_id)
     seen = [c["at"] for c in evidence["sources"] if c.get("at")]
     stamp = access.load_unattributed(repo).get(session) or {}
     if stamp.get("first_seen"):
@@ -263,7 +270,8 @@ def derive_orphan(repo: Path, live_entry: dict) -> dict:
         "deadline_stale_possible": deadline_stale_possible,
         "conflicts": conflicts,
         "acquired_at": acquired_at,
-        "jobs_in_flight": jobs_in_flight,
+        "jobs_in_flight": len(jobs_entries),
+        "jobs_in_flight_entries": jobs_entries,
         "first_seen": min(seen) if seen else None,
         "kit_installed": evidence["kit_installed"],
         "handover_pending": evidence["handover_pending"],

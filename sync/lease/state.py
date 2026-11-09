@@ -16,7 +16,14 @@ def status(colab, repo: Path, session: str | None = None) -> dict:
     rec = _mod_records.load_record(repo, session)
     if not rec:
         return {"action": "no-lease"}
-    out = {"action": "active" if sessions.session_alive(colab, rec["session"]) else "recorded-but-dead", "record": rec}
+    # The served record carries the pruned jobs projection:
+    # consumers of the state document never see a registration
+    # whose backing record is gone or terminal. The on-disk
+    # record is untouched by the read (save_record prunes at
+    # the write); the projection rides a copy.
+    served = dict(rec)
+    served["jobs"] = [entry["id"] for entry in _mod_records.live_jobs(repo, rec)]
+    out = {"action": "active" if sessions.session_alive(colab, rec["session"]) else "recorded-but-dead", "record": served}
     # The session's live sync claim rides the status read (the
     # panel renders holder + expiry from here); a lapsed claim
     # serves as None — honest absence, never a stale holder.

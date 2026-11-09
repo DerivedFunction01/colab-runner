@@ -393,6 +393,12 @@ def seed_window_record(repo, **over):
         "renew": True,
     }
     rec.update(over)
+    # run-1's registration holds through its backing record
+    # (the pruned projection): plant it live BEFORE the save,
+    # or the save's own pruning drops the registration.
+    runs = repo / "results" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "run-1.json").write_text(json.dumps({"run_id": "run-1", "session": "standard", "state": "running", "started_at": "2026-10-29T06:00:00+00:00"}))
     lease.save_record(repo, rec)
     return rec
 
@@ -1521,7 +1527,8 @@ def test_orphan_derivation_no_sources(repo):
     assert entry["derived_deadline"] is None and entry["deadline_source"] is None
     assert entry["shape"] == "cpu-highram" and entry["shape_evidenced"] is False
     assert entry["shape_candidates"] == ["cpu-highram"]
-    assert entry["conflicts"] == [] and entry["jobs_in_flight"] == []
+    assert entry["conflicts"] == [] and entry["jobs_in_flight"] == 0
+    assert entry["jobs_in_flight_entries"] == []
 
 
 def test_adopt_orphan_restores_evidenced_window(repo):
@@ -2025,7 +2032,47 @@ def test_orphan_census_counts_live_detached_work(repo):
     (det_dir / "det-2.json").write_text(json.dumps({"id": "det-2", "session": "busy-det", "caller": "alpha", "state": "complete", "exit_code": 0, "started_at": NOW.isoformat(), "finished_at": NOW.isoformat()}))
     (det_dir / "det-3.json").write_text(json.dumps({"id": "det-3", "session": "other-1", "caller": "beta", "state": "running", "exit_code": None, "started_at": NOW.isoformat(), "finished_at": None}))
     entry = lease.derive_orphan(repo, {"session": "busy-det", "endpoint": None, "shape_class": "high_ram"})
-    assert entry["jobs_in_flight"] == ["detached:det-1"]
+    assert entry["jobs_in_flight"] == 1
+    assert entry["jobs_in_flight_entries"] == [{"id": "detached:det-1", "kind": "detached", "state": "running", "started_at": NOW.isoformat()}]
     out = lease.adopt_orphan(orphan_stub(["busy-det"]), repo, "busy-det", now_dt=NOW)
     assert out["action"] == "adopted"
     assert out["record"]["jobs"] == ["detached:det-1"]
+
+
+def test_orphan_census_run_entries_kinded(repo):
+    """The census serves run work the same way: a run record
+    in a non-terminal state counts with its kind, state, and
+    start; a terminal one does not count at all."""
+    runs_dir = repo / "results" / "runs"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run-live.json").write_text(json.dumps({"run_id": "run-live", "session": "busy-run", "caller": "alpha", "state": "polling", "started_at": NOW.isoformat()}))
+    (runs_dir / "run-done.json").write_text(json.dumps({"run_id": "run-done", "session": "busy-run", "caller": "alpha", "state": "complete", "started_at": NOW.isoformat()}))
+    entry = lease.derive_orphan(repo, {"session": "busy-run", "endpoint": None, "shape_class": "high_ram"})
+    assert entry["jobs_in_flight"] == 1
+    assert entry["jobs_in_flight_entries"] == [{"id": "run-live", "kind": "run", "state": "polling", "started_at": NOW.isoformat()}]
+
+
+def test_pruned_jobs_projection_and_save_record(repo):
+    """One projection: a registration counts only while its
+    backing record exists and is non-terminal. save_record
+    persists the pruned list, so the store self-heals; the
+    state document serves the projection, not the raw list."""
+    runs_dir = repo / "results" / "runs"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run-live.json").write_text(json.dumps({"run_id": "run-live", "session": "s-prune", "state": "running", "started_at": NOW.isoformat()}))
+    (runs_dir / "run-done.json").write_text(json.dumps({"run_id": "run-done", "session": "s-prune", "state": "failed", "started_at": NOW.isoformat()}))
+    (runs_dir / "run-torn.json").write_text("{torn")
+    det_dir = repo / "results" / "detached"
+    det_dir.mkdir(parents=True)
+    (det_dir / "det-live.json").write_text(json.dumps({"id": "det-live", "session": "s-prune", "state": "running", "started_at": NOW.isoformat(), "finished_at": None}))
+    rec = {"session": "s-prune", "caller": "alpha", "jobs": ["run-live", "run-done", "run-missing", "run-torn", "detached:det-live", "detached:det-gone", "bare-name"]}
+    live = lease.live_jobs(repo, rec)
+    assert [e["id"] for e in live] == ["run-live", "run-torn", "detached:det-live"]
+    assert live[0]["kind"] == "run" and live[2]["kind"] == "detached"
+    assert live[1]["state"] == "unknown"  # torn backing: unknown, never dead
+    lease.save_record(repo, rec)
+    assert rec["jobs"] == ["run-live", "run-torn", "detached:det-live"]
+    on_disk = json.loads((repo / "var" / "lease-s-prune.json").read_text())
+    assert on_disk["jobs"] == ["run-live", "run-torn", "detached:det-live"]
+    served = lease.status(lambda *a, **k: cp(""), repo, session="s-prune")
+    assert served["record"]["jobs"] == ["run-live", "run-torn", "detached:det-live"]

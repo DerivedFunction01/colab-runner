@@ -18,8 +18,11 @@ from . import foundation, records, callers
 # Mechanics: docs/lease-workflow.md.
 
 CLAIM_KEY = "sync_claim"
-NONTERMINAL_RUN_STATES = ("starting", "running", "polling")
-NONTERMINAL_DETACHED_STATES = ("running",)
+# The non-terminal vocabularies live with the pruned-jobs
+# projection (records): a registration and a claim agree on
+# what "still running" means because both read the one place.
+NONTERMINAL_RUN_STATES = records.RUN_NONTERMINAL_STATES
+NONTERMINAL_DETACHED_STATES = records.DETACHED_LIVE_STATES
 DEFAULT_TTL_MINUTES = 60
 DEFAULT_ATTACH_WINDOW_MINUTES = 15
 DEFAULT_MAX_SYNC_SECONDS = 300
