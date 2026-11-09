@@ -89,6 +89,13 @@ The runner's own lifecycle verbs ride the same record:
   the chunked transfer. Every output a run lands is recorded
   in the record's `pulled` list with its route.
 
+Jobs are shape-addressed, not session-pinned: acquire picks
+the shape's shared session, whichever one is live. A job whose
+inputs already live on one session's filesystem (a prior job's
+outputs, a hand-built venv) must stage them as manifest
+`uploads` or a seed bundle — or run as `bin/colab-sh --detach`
+work on that session, which is the session-pinned route.
+
 Two launch rules bind every job:
 
 - Jobs are detached processes, never kernel cells — cells die with
