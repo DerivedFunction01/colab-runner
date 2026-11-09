@@ -708,3 +708,47 @@ def test_job_scripts_upload_to_run_scoped_remote_names(tmp_path):
     assert "scopeone" in script_dests[0] and "scopetwo" in script_dests[1]
     assert script_dests[0] != script_dests[1]
     assert all(d != "/content/payload.py" for d in script_dests)
+
+
+def test_shrinking_repull_rotates_the_held_copy(tmp_path):
+    """A remote output that restarts smaller must not erase the
+    history already pulled: the re-pull rotates the held copy
+    aside under a stamped sibling name, the live file takes the
+    new content, and the rotation is noted on the pull entry and
+    the run record. (Live defect 2026-11-08: after a wrapper
+    resume, the venue keeper's pulled log shrank to its first
+    line and the accumulated record was gone.)"""
+    wrapper = tmp_path / "shrink_wrapper.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_COLAB_STATE'])\n"
+        "args = sys.argv[1:]\n"
+        "if 'download' in args and any(a.endswith('/checkpoint.json') for a in args):\n"
+        "    marker = state / 'checkpoint-downloads'\n"
+        "    count = int(marker.read_text()) + 1 if marker.exists() else 1\n"
+        "    marker.write_text(str(count))\n"
+        "    if count >= 2:\n"
+        "        for remote in state.glob('sessions/*/**/unit-0.bin'):\n"
+        "            remote.write_bytes(b'shrunk\\n')\n"
+        "sys.exit(subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode)\n"
+    )
+    wrapper.chmod(0o755)
+    env = runner_env(tmp_path)
+    env.update(COLAB_BIN=str(wrapper), FAKE_COLAB_REAL=str(FAKE))
+    r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
+    assert (results / "unit-0.bin").read_bytes() == b"shrunk\n", "the live file does not hold the new, smaller content"
+    rotated = sorted(results.glob("unit-0.bin.rotated-*"))
+    assert len(rotated) == 1, [p.name for p in results.iterdir()]
+    payload = hashlib.sha256(b"smoke:0").hexdigest().encode() * 64
+    assert rotated[0].read_bytes() == payload, "the rotated sibling lost the previously pulled content"
+    assert not list(results.glob("*.pulling")), "a staging file was left behind"
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert "unit-0.bin" in (rec.get("last_pull_rotation") or ""), "the rotation is not noted on the run record"
+    entry = next(e for e in rec["pulled"] if e["path"] == "unit-0.bin")
+    assert entry["rotated"]["bytes"] == len(payload), "the rotation is not noted on the pull entry"

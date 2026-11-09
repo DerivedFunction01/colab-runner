@@ -335,7 +335,20 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     path, latest pull winning) and the accumulated list is what
     this returns: with the skip above, a per-call list would
     leave the terminal record reporting only the outputs the
-    final call happened to move — usually none."""
+    final call happened to move — usually none.
+
+    Shrink guard: every pull lands on a staging sibling first,
+    and when the new content would replace a non-empty held
+    file with FEWER bytes, the held copy is rotated aside under
+    a stamped sibling name before the staging file moves in,
+    with the rotation noted on the pull entry and the record.
+    A remote output that restarts smaller must not silently
+    erase the history already pulled (2026-11-08: after a
+    wrapper resume, the venue keeper's pulled log shrank to its
+    first line and the accumulated record was gone — the
+    forensic read had to fall back to the venue-side lease
+    log). Equal-or-growing pulls keep the single-file behavior.
+    """
     pulled_now = []
     stats = (reader_state or {}).get("outputs") or {}
     stored = rec.setdefault("output_stats", {})
@@ -345,23 +358,40 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
         if stat is not None and stored.get(name) == stat and dest.exists():
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = dest.with_name(dest.name + ".pulling")
+        entry = None
         if stat is not None and stat["size"] > SINGLE_FILE_CEILING_BYTES:
-            res = transfer.chunked_download(session, f"{remote_out}/{name}", dest)
+            res = transfer.chunked_download(session, f"{remote_out}/{name}", staging)
             if not res.get("ok"):
                 rec["last_pull_error"] = f"chunked pull of {name} failed at {now()}: {res.get('stage', 'unknown stage')}"
+                staging.unlink(missing_ok=True)
                 continue
-            pulled_now.append({"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "chunked"})
+            entry = {"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "chunked"}
+        else:
+            try:
+                colab("download", "-s", session, f"/content/{remote_out}/{name}", str(staging), timeout=600)
+            except subprocess.TimeoutExpired:
+                rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
+                staging.unlink(missing_ok=True)
+                continue
+            if staging.exists():
+                entry = {"path": name, "bytes": staging.stat().st_size, "sha256": hashlib.sha256(staging.read_bytes()).hexdigest(), "route": "single"}
+        if entry is None:
+            continue
+        if dest.exists() and 0 < dest.stat().st_size > entry["bytes"]:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            rotated = dest.with_name(f"{name}.rotated-{stamp}")
+            suffix = 2
+            while rotated.exists():
+                rotated = dest.with_name(f"{name}.rotated-{stamp}-{suffix}")
+                suffix += 1
+            dest.rename(rotated)
+            entry["rotated"] = {"to": rotated.name, "bytes": rotated.stat().st_size}
+            rec["last_pull_rotation"] = f"{name} rotated to {rotated.name} at {now()}"
+        staging.replace(dest)
+        pulled_now.append(entry)
+        if stat is not None:
             stored[name] = stat
-            continue
-        try:
-            colab("download", "-s", session, f"/content/{remote_out}/{name}", str(dest), timeout=600)
-        except subprocess.TimeoutExpired:
-            rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
-            continue
-        if dest.exists():
-            pulled_now.append({"path": name, "bytes": dest.stat().st_size, "sha256": hashlib.sha256(dest.read_bytes()).hexdigest(), "route": "single"})
-            if stat is not None:
-                stored[name] = stat
     if pulled_now:
         rec["last_checkpoint_pull_at"] = now()
         # Accumulate into the record's pulled list, one entry
