@@ -42,6 +42,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -50,6 +51,7 @@ import urllib.request
 from pathlib import Path
 
 SERVICE_URL = "http://127.0.0.1:8796"
+_ENVELOPE_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 # The scheduler repo is the sibling deployment this module's
 # driver mints tokens from and ships the client out of: resolved
 # from the home dir (never a literal path — tracked files are
@@ -70,11 +72,20 @@ def execute_request(envelope: dict, service_url: str = SERVICE_URL) -> dict:
     """Perform one ferried request against the connector service
     and shape the ferry response {"status", "body"}. Only /tools
     paths are relayed; anything else is refused here and never
-    reaches the service."""
+    reaches the service. A body dict gains the ferry envelope id
+    as a sibling of its args (the connector's dedupe contract):
+    the connector stores it on the bridge record and answers a
+    repeat performance of the same envelope — a transport retry,
+    an at-least-once re-serve — with the existing request_id
+    instead of queueing a twin."""
     path = str(envelope.get("path") or "")
     if not path.startswith("/tools"):
         return {"status": 403, "body": {"ok": False, "error": "relay_refused"}}
     body = envelope.get("body")
+    envelope_id = envelope.get("id")
+    if isinstance(body, dict) and isinstance(envelope_id, str) \
+            and _ENVELOPE_ID_RE.fullmatch(envelope_id):
+        body = {**body, "envelope_id": envelope_id}
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(service_url.rstrip("/") + path, data=data, method=str(envelope.get("method") or "GET"))
     req.add_header("Authorization", f"Bearer {envelope.get('token') or ''}")

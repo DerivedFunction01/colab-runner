@@ -20,7 +20,13 @@ the `Authorization: Bearer` credential and lands
 `/content/harness-ferry/in`. Only `/tools` paths are relayed —
 the relay refuses anything else locally, and the service never
 sees it. The relay deletes each request file once served; the
-client deletes each response once read.
+client deletes each response once read. The relay also
+carries the ferry envelope id into the POST body
+(`envelope_id`, a sibling of `args`): the connector stores it
+on the bridge record and dedupes on it, so a repeat
+performance of the same envelope — a transport retry, an
+at-least-once re-serve — returns the existing request instead
+of queueing a twin.
 
 The relay is runner-internal channel use, like the bridge
 duty: its exec calls ride the funnel directly and take no sync

@@ -93,6 +93,30 @@ def test_execute_request_performs_with_bearer(stub_service):
     assert seen[0]["body"] == {"args": {}}
 
 
+def test_execute_request_carries_the_envelope_id_for_dedupe(stub_service):
+    """The connector's dedupe contract: the ferry envelope id
+    (the request-file stem) rides as a sibling of args, so a
+    repeat performance of the same envelope returns the
+    existing bridge request instead of queueing a twin."""
+    url, seen = stub_service
+    resp = harness.execute_request(
+        {"id": "cafe0123abcd", "method": "POST", "path": "/tools/chat_list",
+         "token": "tok-abc", "body": {"args": {}}}, url)
+    assert resp["status"] == 200
+    assert seen[0]["body"] == {"args": {}, "envelope_id": "cafe0123abcd"}
+
+
+def test_execute_request_omits_an_out_of_shape_envelope_id(stub_service):
+    """An id outside the connector's validation shape is
+    omitted rather than risking a bad_args refusal of the
+    whole call."""
+    url, seen = stub_service
+    harness.execute_request(
+        {"id": "bad id/with spaces", "method": "POST", "path": "/tools/chat_list",
+         "token": "tok-abc", "body": {"args": {}}}, url)
+    assert seen[0]["body"] == {"args": {}}
+
+
 def test_execute_request_refuses_non_tools_paths_locally(stub_service):
     url, seen = stub_service
     resp = harness.execute_request(
