@@ -48,7 +48,13 @@ import urllib.request
 from pathlib import Path
 
 SERVICE_URL = "http://127.0.0.1:8796"
-SCHEDULER_REPO = Path("/home/hatch/workspace/scheduler")
+# The scheduler repo is the sibling deployment this module's
+# driver mints tokens from and ships the client out of: resolved
+# from the home dir (never a literal path — tracked files are
+# portable), overridable for another deployment's layout.
+SCHEDULER_REPO = Path(
+    os.environ.get("HARNESS_SCHEDULER_REPO") or (Path.home() / "workspace" / "scheduler")
+)
 FERRY_OUT_REMOTE = "/content/harness-ferry/out"
 FERRY_IN_REMOTE = "/content/harness-ferry/in"
 CLIENT_DIR_REMOTE = "/content/harness-client"
