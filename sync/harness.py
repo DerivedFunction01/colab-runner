@@ -167,15 +167,30 @@ def relay_cycle(colab, repo: Path, session: str, service_url: str = SERVICE_URL)
     return {"requests": len(requests), "served": sorted(responses)}
 
 
-def relay_until(colab, repo: Path, session: str, done, service_url: str = SERVICE_URL, interval_s: float = 5.0, max_s: float = 1800.0) -> dict:
+def relay_until(colab, repo: Path, session: str, done, service_url: str = SERVICE_URL, interval_s: float = 5.0, max_s: float = 1800.0, reconcile=None) -> dict:
     """Cycle the relay until done() reports true (checked between
-    cycles) or the bound passes. Returns the totals."""
-    totals = {"cycles": 0, "served": 0}
+    cycles) or the bound passes. When reconcile is given it runs
+    once per cycle before the check — the bootstrap passes the
+    run's --poll reconcile, because a detached run's record
+    advances only when something reconciles it; reading the
+    record alone would wait forever on a run that finished
+    in-session long ago. Returns the totals."""
+    totals = {"cycles": 0, "served": 0, "errors": 0}
     deadline = time.time() + max_s
     while True:
-        cycle = relay_cycle(colab, repo, session, service_url)
+        try:
+            cycle = relay_cycle(colab, repo, session, service_url)
+            totals["served"] += len(cycle["served"])
+        except Exception:  # noqa: BLE001 - a failed cycle is a skipped cycle
+            # Channel execs fail under load (429s, liveness
+            # blips); the requests persist in ferry-out and the
+            # next cycle re-reads them. A relay that dies on the
+            # first failed cycle strands every later request —
+            # the first live proof's smoke died exactly that way.
+            totals["errors"] += 1
         totals["cycles"] += 1
-        totals["served"] += len(cycle["served"])
+        if reconcile is not None:
+            reconcile()
         if done():
             return totals
         if time.time() > deadline:
@@ -255,27 +270,50 @@ def bootstrap(repo: Path, consumer: str = "sweeper-venue", scopes: str = "read,w
         stage_client(repo, scheduler_repo)
     except Exception as exc:  # noqa: BLE001 - staged as a verdict, not a traceback
         return {"ok": False, "stage": "staging", "error": f"{type(exc).__name__}: {exc}"}
-    launch = subprocess.run(
-        [str(repo / "bin" / "colab-run"), "harness-bootstrap", "--detach", "--caller", "panel"],
-        capture_output=True, text=True, timeout=600,
-    )
+    # The launch and the wait redirect to files, never captured
+    # pipes: the runner's detached launch leaves a background
+    # poller in its process tree, and a descendant holding a
+    # captured stdout pipe open keeps subprocess.run waiting for
+    # an EOF that only the descendant's exit would bring — the
+    # driver hung exactly that way on its first live run. A file
+    # has no such coupling: the child exits, the driver reads.
+    launch_out = stage_dir(repo) / "launch-output.json"
+    with open(launch_out, "w") as fh:
+        launch = subprocess.run(
+            [str(repo / "bin" / "colab-run"), "harness-bootstrap", "--detach", "--caller", "panel"],
+            stdout=fh, stderr=subprocess.STDOUT, timeout=1200,
+        )
     if launch.returncode != 0:
-        return {"ok": False, "stage": "launch", "error": (launch.stderr or launch.stdout or "")[-300:]}
+        return {"ok": False, "stage": "launch", "error": launch_out.read_text()[-300:]}
     try:
-        started = json.loads(launch.stdout.strip().splitlines()[-1])
+        started = json.loads(launch_out.read_text().strip().splitlines()[-1])
     except (ValueError, IndexError):
-        return {"ok": False, "stage": "launch", "error": f"unparsable launch output: {launch.stdout[-200:]}"}
+        return {"ok": False, "stage": "launch", "error": f"unparsable launch output: {launch_out.read_text()[-200:]}"}
     run_id, session = started["run_id"], started["session"]
 
     def _terminal() -> bool:
         rec = run_mod.load_run_record(run_id)
         return bool(rec and rec.get("state") in run_mod.TERMINAL_STATES)
 
-    totals = relay_until(colab, repo, session, _terminal)
-    wait = subprocess.run(
-        [str(repo / "bin" / "colab-run"), "--wait", run_id],
-        capture_output=True, text=True, timeout=300,
-    )
+    def _reconcile() -> None:
+        # One bounded --poll per relay cycle: it performs the
+        # reader exec + output pull + record update the detached
+        # run waits on. File-redirected like the launch (the
+        # reconcile's own channel children inherit its stdio).
+        poll_out = stage_dir(repo) / "poll-output.log"
+        with open(poll_out, "w") as fh:
+            subprocess.run(
+                [str(repo / "bin" / "colab-run"), "--poll", run_id],
+                stdout=fh, stderr=subprocess.STDOUT, timeout=900,
+            )
+
+    totals = relay_until(colab, repo, session, _terminal, reconcile=_reconcile)
+    wait_out = stage_dir(repo) / "wait-output.log"
+    with open(wait_out, "w") as fh:
+        wait = subprocess.run(
+            [str(repo / "bin" / "colab-run"), "--wait", run_id],
+            stdout=fh, stderr=subprocess.STDOUT, timeout=300,
+        )
     rec = run_mod.load_run_record(run_id) or {}
     smoke = None
     smoke_path = repo / "results" / run_id / "smoke-result.json"

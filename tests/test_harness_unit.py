@@ -233,3 +233,86 @@ def test_mint_token_never_prints_and_stages_0600(tmp_path, monkeypatch):
     dest = harness.mint_token(tmp_path, "sweeper-venue", "read", tmp_path / "scheduler")
     assert dest.read_text().strip() == "tok-minted-123"
     assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+
+
+def test_relay_until_survives_failed_cycles(stub_service, tmp_path):
+    """A channel exec failure is a skipped cycle, never the
+    relay's death: the first live proof's smoke starved when
+    the relay exited on its first failed cycle."""
+    url, _seen = stub_service
+    out_dir = tmp_path / "out"
+    in_dir = tmp_path / "in"
+    out_dir.mkdir()
+    (out_dir / "cafe02.json").write_text(json.dumps(
+        {"id": "cafe02", "method": "GET", "path": "/tools", "token": "t", "body": None}))
+    calls = {"n": 0}
+
+    def flaky_colab(*argv, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("channel busy (429)")
+        script = Path(argv[-1])
+        text = script.read_text().replace(harness.FERRY_OUT_REMOTE, str(out_dir)).replace(
+            harness.FERRY_IN_REMOTE, str(in_dir))
+        proc = subprocess.run([sys.executable, "-c", text], capture_output=True, text=True)
+        return subprocess.CompletedProcess(argv, proc.returncode, proc.stdout, proc.stderr)
+
+    checks = {"n": 0}
+
+    def done():
+        checks["n"] += 1
+        return checks["n"] >= 2
+
+    totals = harness.relay_until(flaky_colab, tmp_path, "any-session", done, url, interval_s=0)
+    assert totals["errors"] == 1
+    assert totals["served"] == 1
+
+
+def test_bootstrap_launch_survives_pipe_holding_descendants(tmp_path):
+    """The runner's detached launch leaves a background poller
+    holding the launch's stdout; a captured pipe would keep the
+    driver waiting for that descendant's EOF (the first live
+    bootstrap hung exactly so). The driver reads a file instead
+    and must return promptly."""
+    import time
+    import types
+
+    repo = tmp_path / "repo"
+    (repo / "bin").mkdir(parents=True)
+    (repo / "var" / "harness").mkdir(parents=True)
+    (repo / "var" / "harness" / "sweeper-venue.token").write_text("tok-staged\n")
+    (repo / "results" / "r1").mkdir(parents=True)
+    fake_run = repo / "bin" / "colab-run"
+    fake_run.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--wait\" ]; then\n"
+        f"  echo '{{\"ok\": true}}' > {repo}/results/r1/smoke-result.json\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"--poll\" ]; then\n"
+        "  exit 0\n"
+        "fi\n"
+        "(sleep 20) &\n"
+        "echo '{\"run_id\": \"r1\", \"session\": \"s1\", \"state\": \"polling\"}'\n"
+        "exit 0\n")
+    fake_run.chmod(0o755)
+    sched_bin = tmp_path / "scheduler" / "bin"
+    sched_bin.mkdir(parents=True)
+    (sched_bin / "harness").write_text("#!/bin/sh\n")
+
+    class _RunMod:
+        TERMINAL_STATES = ("complete", "failed", "orphaned")
+
+        @staticmethod
+        def load_run_record(_rid):
+            return {"state": "complete"}
+
+    def fake_colab(*argv, **_kw):
+        return subprocess.CompletedProcess(argv, 0, '{"requests": {}}', "")
+
+    started = time.time()
+    verdict = harness.bootstrap(
+        repo, scheduler_repo=tmp_path / "scheduler",
+        run_mod=_RunMod, colab=fake_colab)
+    assert time.time() - started < 15  # not the grandchild's 20s
+    assert verdict["ok"] and verdict["run_id"] == "r1"

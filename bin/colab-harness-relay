@@ -33,14 +33,18 @@ def main() -> int:
     ap.add_argument("--cycles", type=int, default=0, help="0 = until interrupted")
     ap.add_argument("--url", default=harness.SERVICE_URL)
     a = ap.parse_args()
-    totals = {"cycles": 0, "served": 0}
+    totals = {"cycles": 0, "served": 0, "errors": 0}
     try:
         while True:
-            cycle = harness.relay_cycle(cli.colab, _load.REPO, a.session, a.url)
+            try:
+                cycle = harness.relay_cycle(cli.colab, _load.REPO, a.session, a.url)
+                totals["served"] += len(cycle["served"])
+                if cycle["served"]:
+                    print(f"relay: served {cycle['served']}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - a failed cycle is a skipped cycle
+                totals["errors"] += 1
+                print(f"relay: cycle failed ({type(exc).__name__}: {exc}); continuing", flush=True)
             totals["cycles"] += 1
-            totals["served"] += len(cycle["served"])
-            if cycle["served"]:
-                print(f"relay: served {cycle['served']}", flush=True)
             if a.cycles and totals["cycles"] >= a.cycles:
                 break
             import time
