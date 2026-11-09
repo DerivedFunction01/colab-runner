@@ -142,3 +142,96 @@ def test_watchdog_healthy_reinstalls_missing_unit_quietly(tmp_path):
         assert "start" not in calls
     finally:
         server.shutdown()
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def ok_server():
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Ok(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = HTTPServer(("127.0.0.1", port), Ok)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}/"
+    finally:
+        server.shutdown()
+
+
+def test_install_unit_check_reports_missing_current_stale(tmp_path):
+    stub, log = stub_systemctl(tmp_path)
+    env = env_for(tmp_path, stub)
+    assert run(UI / "install-unit.sh", "--check", env=env).stdout.strip() == "missing"
+    assert run(UI / "install-unit.sh", env=env).returncode == 0
+    assert run(UI / "install-unit.sh", "--check", env=env).stdout.strip() == "current"
+    unit = tmp_path / "units" / UNIT_NAME
+    unit.write_text(unit.read_text() + "# hand edit\n")
+    assert run(UI / "install-unit.sh", "--check", env=env).stdout.strip() == "stale"
+
+
+def test_watchdog_healthy_rerenders_a_stale_unit(tmp_path):
+    """Contract rung 4 (render-when-invalid): the server
+    answers and the unit is present but not byte-equal to the
+    current render — the watchdog re-renders it quietly,
+    without a start."""
+    with ok_server() as url:
+        stub, log = stub_systemctl(tmp_path)
+        env = env_for(tmp_path, stub, COLAB_UI_URL=url, COLAB_UI_POLL_SECS="5")
+        assert run(UI / "install-unit.sh", env=env).returncode == 0
+        unit = tmp_path / "units" / UNIT_NAME
+        rendered = unit.read_text()
+        unit.write_text(rendered + "# hand edit\n")
+        log.write_text("")
+        result = run(UI / "watchdog.sh", env=env)
+        assert result.returncode == 0, result.stderr
+        assert "re-rendered" in result.stdout
+        assert unit.read_text() == rendered
+        assert "start" not in log.read_text()
+
+
+def test_watchdog_healthy_stale_repair_failure_is_a_warning(tmp_path):
+    """A stale render whose repair fails while the server
+    answers does not escalate: exit 0, the unit is rechecked
+    on the next pass."""
+    with ok_server() as url:
+        stub, _log = stub_systemctl(tmp_path)
+        assert run(UI / "install-unit.sh", env=env_for(tmp_path, stub)).returncode == 0
+        unit = tmp_path / "units" / UNIT_NAME
+        unit.write_text(unit.read_text() + "# hand edit\n")
+        failing = tmp_path / "systemctl-fail"
+        failing.write_text('#!/usr/bin/env bash\n[[ "$1" == "daemon-reload" ]] && exit 1\ntrue\n')
+        failing.chmod(0o755)
+        env = env_for(tmp_path, failing, COLAB_UI_URL=url, COLAB_UI_POLL_SECS="5")
+        result = run(UI / "watchdog.sh", env=env)
+        assert result.returncode == 0, result.stderr
+        assert "re-render failed" in result.stderr
+
+
+def test_watchdog_down_restarts_a_loaded_unit(tmp_path):
+    """Contract rung 6 (load-state verb): the unit is loaded
+    and active but the page does not answer — the ladder's
+    verb is restart, not start (a start would no-op against
+    the loaded unit). The stub serves no HTTP, so the ladder
+    still fails overall; the verb is what this pins."""
+    stub, log = stub_systemctl(tmp_path, active=True)
+    env = env_for(tmp_path, stub, COLAB_UI_URL="http://127.0.0.1:1/", COLAB_UI_POLL_SECS="2")
+    result = run(UI / "watchdog.sh", env=env)
+    assert result.returncode == 1, result.stderr
+    assert f"restart {UNIT_NAME}" in log.read_text()
+

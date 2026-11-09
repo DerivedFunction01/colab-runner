@@ -3,6 +3,20 @@
 # server (ui/server.py on 127.0.0.1:8793), in the sibling servers'
 # shape (scheduler ops/watchdog.sh, workbench ops/watchdog.sh).
 #
+# Conforms to the VM-restart survival pattern contract v1
+# (canonical text: the spec-driven-starter SPEC; plan
+# 2026-11-08-vm-restart-survival-pattern, Step 3). The rungs as
+# they map here: tracked template + installer (1); the reaper
+# hook's UI duty drives this watchdog every pass, ~120 s (2);
+# unit presence checked separately from health (3);
+# render-when-invalid — a present unit not byte-equal to the
+# current render is re-rendered on the healthy path too (4);
+# the probe is curl --max-time, a whole-operation deadline —
+# a trickling body cannot stretch it (5); a loaded unit that
+# does not answer is restarted, not merely started (6);
+# poll-verified ladder with the pre-systemd start as the last
+# rung (8); suite coverage in tests/test_ui_supervision.py (11).
+#
 # Why this exists: the server was started by ui.sh under nohup with
 # no supervision. Runtime deployments replace this VM (PID 1
 # restarts, /etc is wiped, every unsupervised process dies) —
@@ -56,22 +70,49 @@ wait_healthy() {
 }
 
 if healthy; then
-  if [[ ! -f "$UNIT_FILE" ]]; then
-    if bash "$UI_DIR/install-unit.sh"; then
-      echo "watchdog: server healthy; unit file was missing, reinstalled"
-    else
-      echo "watchdog: server healthy but unit reinstall failed" >&2
-      exit 1
-    fi
-  fi
+  unit_state="$(bash "$UI_DIR/install-unit.sh" --check 2>/dev/null || echo unknown)"
+  case "$unit_state" in
+    current)
+      ;;
+    missing)
+      if bash "$UI_DIR/install-unit.sh"; then
+        echo "watchdog: server healthy; unit file was missing, reinstalled"
+      else
+        echo "watchdog: server healthy but unit reinstall failed" >&2
+        exit 1
+      fi
+      ;;
+    stale)
+      # Render-when-invalid (rung 4): a present unit that is
+      # not the current render is re-rendered while healthy —
+      # the next boot must not inherit a stale unit. A failed
+      # repair while the server answers is a warning, not an
+      # escalation: the next pass retries it.
+      if bash "$UI_DIR/install-unit.sh"; then
+        echo "watchdog: server healthy; unit render was stale, re-rendered"
+      else
+        echo "watchdog: server healthy; stale unit re-render failed (unit rechecked next pass)" >&2
+      fi
+      ;;
+    *)
+      echo "watchdog: unit state check failed; leaving the unit as found" >&2
+      ;;
+  esac
   exit 0
 fi
 
 echo "watchdog: lease UI server down; running restore ladder" >&2
 
-# Rung 1: systemd supervision.
+# Rung 1: systemd supervision. The repair verb follows the
+# unit's load state (rung 6): a loaded unit that does not
+# answer gets a restart (a start would no-op against it);
+# anything else gets a start.
 if bash "$UI_DIR/install-unit.sh"; then
-  "$SYSTEMCTL" start "$UNIT_NAME" 2>/dev/null || true
+  if "$SYSTEMCTL" is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+    "$SYSTEMCTL" restart "$UNIT_NAME" 2>/dev/null || true
+  else
+    "$SYSTEMCTL" start "$UNIT_NAME" 2>/dev/null || true
+  fi
   if wait_healthy; then
     echo "watchdog: restored via systemd and verified healthy" >&2
     exit 0

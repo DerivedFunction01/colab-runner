@@ -24,6 +24,23 @@ trap 'rm -f "$tmp"' EXIT
 sed -e "s|@ROOT@|$ROOT|g" -e "s|@PYTHON@|$PYTHON|g" -e "s|@HOME@|$HOME_DIR|g" \
     "$UI_DIR/colab-lease-ui.service.tmpl" > "$tmp"
 
+# --check: report the installed unit's state against the
+# current render (missing | stale | current) and exit; the
+# watchdog's healthy path uses it for the presence and
+# render-currency checks (contract rungs 3-4).
+if [[ "${1:-}" == "--check" ]]; then
+  if [[ ! -f "$UNIT_DIR/$UNIT_NAME" ]]; then
+    echo missing
+    exit 0
+  fi
+  if cmp -s "$tmp" "$UNIT_DIR/$UNIT_NAME"; then
+    echo current
+  else
+    echo stale
+  fi
+  exit 0
+fi
+
 mkdir -p "$UNIT_DIR"
 if [[ -f "$UNIT_DIR/$UNIT_NAME" ]] && cmp -s "$tmp" "$UNIT_DIR/$UNIT_NAME"; then
   echo "install-unit: $UNIT_NAME already installed (unchanged)"

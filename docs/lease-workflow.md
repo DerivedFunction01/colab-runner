@@ -672,3 +672,27 @@ same verb.
   or not; the budget caps and the hard deadline are the controls.
   Cost is never a reason to stop a session early — the reaper
   owns the end.
+
+## Panel server supervision
+
+The lease panel's companion server (`ui/server.py` on
+127.0.0.1:8793) conforms to the **VM-restart survival pattern
+contract v1** (canonical text: the spec-driven-starter SPEC;
+conformance landed 2026-11-08 under the survival-pattern plan's
+Step 3). The unit's source is the tracked template
+`ui/colab-lease-ui.service.tmpl`, rendered by
+`ui/install-unit.sh` into the system instance and enabled;
+`Restart=always` guards it within a boot. The reaper hook's UI
+duty drives `ui/watchdog.sh` every pass (~120 s): the watchdog
+probes the page (a whole-operation-deadline read), checks the
+unit's presence and render currency beside the health check —
+a missing unit is reinstalled, a unit not byte-equal to the
+current render is re-rendered, both quietly while the server
+answers — and when the page does not answer it runs the ladder:
+install, then the load-state verb (a loaded unit is restarted,
+anything else started), poll-verified, with the pre-systemd
+`ui.sh` start as the last rung. A failed ladder wakes; a
+successful restore is silent. Proof: the 2026-11-08 19:14 EST
+VM replacement restored the panel unattended in ~2¾ minutes,
+and an adoption drill the same evening (unit removed, service
+stopped) is recorded in the repo's run logs.
