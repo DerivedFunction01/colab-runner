@@ -752,7 +752,17 @@ def main() -> int:
                 save_record(rec)
                 return 1
         script = REPO / job["script"]
-        err = upload_one(session, script, script.name, run_id)
+        # The remote script slot is scoped to this run: the bare
+        # basename is one shared slot per session, and two jobs
+        # whose scripts share a basename (every lane's run.py)
+        # overwrote each other between upload and launch — a run
+        # then executed a foreign payload with its own args
+        # (2026-11-08 remainder lanes: an eraattr payload ran
+        # under a rem20d launch). The payload never names its own
+        # slot (the runner invokes it), so scoping is safe;
+        # manifest uploads keep their contract names by contrast.
+        remote_script = f"{run_id}-{script.name}"
+        err = upload_one(session, script, remote_script, run_id)
         if err is not None:
             rec.update(state="failed", error=f"runner script upload: {err}")
             save_record(rec)
@@ -830,7 +840,7 @@ def main() -> int:
         job_args = "".join(f",'{a}'" for a in list(job.get("args", [])) + (["--skip-clone"] if seeded else []) + extra_args)
         stamp = (
             "import subprocess, sys\n"
-            f"rc = subprocess.run([sys.executable, '{script.name}', '--out', '{remote_out}'{job_args}]).returncode\n"
+            f"rc = subprocess.run([sys.executable, '{remote_script}', '--out', '{remote_out}'{job_args}]).returncode\n"
             f"open('{remote_out}.exit-code', 'w').write(str(rc))\n"
         )
         launch = (

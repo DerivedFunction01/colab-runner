@@ -683,3 +683,28 @@ def test_oversize_manifest_upload_moves_chunked_and_verified(tmp_path):
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     landed = Path(env["FAKE_COLAB_STATE"]) / "sessions" / rec["session"] / "big.bin"
     assert landed.stat().st_size == 51 * 1024 * 1024
+
+
+def test_job_scripts_upload_to_run_scoped_remote_names(tmp_path):
+    """Foreign-payload regression (2026-11-08 remainder lanes):
+    every lane's gate script is named run.py, and the runner's
+    /content/<basename> slot made runs on a shared session
+    execute whichever payload landed last — one run carried a
+    foreign job's label and another died on its foreign args.
+    The remote script name now carries the run id: two jobs
+    whose scripts share a basename land in different slots,
+    neither of them the bare shared name."""
+    env = runner_env(tmp_path)
+    install_bare_job(env, "scopeone", 0)
+    install_bare_job(env, "scopetwo", 0)
+    env.update(COLAB_BIN=str(logging_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE))
+    r1 = run_verb(env, "scopeone")
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    r2 = run_verb(env, "scopetwo")
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    uploads = [c for c in cli_calls(env) if "upload" in c]
+    script_dests = [c[-1] for c in uploads if c[-1].endswith("payload.py")]
+    assert len(script_dests) == 2, uploads
+    assert "scopeone" in script_dests[0] and "scopetwo" in script_dests[1]
+    assert script_dests[0] != script_dests[1]
+    assert all(d != "/content/payload.py" for d in script_dests)
