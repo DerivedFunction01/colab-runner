@@ -591,13 +591,20 @@ def main() -> int:
         # resume moment, erasing its launch time.)
         prior = RUNS / f"{run_id}.json"
         if prior.exists():
-            rec = json.loads(prior.read_text())
-            # A resurrected run announces its NEW terminal state
-            # afresh: the sweep's orphan event is history, not
-            # this run's outcome.
-            rec.pop("terminal_event_state", None)
-            rec.pop("terminal_event_at", None)
-            rec.update(state="starting", resumed=True, resumed_at=now())
+            rec = load_run_record(run_id)
+            if rec is None:
+                # A torn prior (a flap-killed fire's 0-byte
+                # record) holds nothing to preserve: the resume
+                # starts the run fresh rather than crashing
+                # every later entry on the damaged file.
+                print(f"colab-run: prior record for {run_id} is unreadable (torn); starting fresh", file=sys.stderr)
+            else:
+                # A resurrected run announces its NEW terminal state
+                # afresh: the sweep's orphan event is history, not
+                # this run's outcome.
+                rec.pop("terminal_event_state", None)
+                rec.pop("terminal_event_at", None)
+                rec.update(state="starting", resumed=True, resumed_at=now())
     if rec is None:
         rec = {"run_id": run_id, "job": job_name, "shape": shape_id, "state": "starting", "started_at": now(), "resumed": bool(resume)}
     if caller:

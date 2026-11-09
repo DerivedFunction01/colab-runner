@@ -211,6 +211,29 @@ def test_resume_preserves_the_original_started_at(tmp_path):
         rec_path.unlink(missing_ok=True)
 
 
+def test_resume_over_a_torn_record_starts_fresh_instead_of_crashing(tmp_path):
+    """A flap-killed fire can leave a 0-byte run record. The
+    sweep already skips torn records; the resume path must too
+    — a torn prior holds nothing to preserve, so the run starts
+    fresh (its damaged file replaced by a valid record) rather
+    than every later entry dying on JSONDecodeError (the
+    geodata lane's 2026-11-08 block)."""
+    env = runner_env(tmp_path)
+    runs = runs_dir(env)
+    runs.mkdir(parents=True, exist_ok=True)
+    run_id = "smoke-tornprior"
+    rec_path = runs / f"{run_id}.json"
+    rec_path.write_bytes(b"")
+    try:
+        r = subprocess.run([sys.executable, str(run_bin(env)), "smoke", "--resume", run_id], capture_output=True, text=True, env=env, timeout=300)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "torn" in r.stderr
+        rec = json.loads(rec_path.read_text())
+        assert rec["state"] == "complete"
+    finally:
+        rec_path.unlink(missing_ok=True)
+
+
 def test_checkpoint_pull_lands_outputs_during_the_run(tmp_path):
     """checkpoint_pull_seconds is a pull cadence, not only a poll
     cadence: declared outputs download at every checkpoint while
