@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""colab-harness-bootstrap — prepare a Colab session to consume
+the harness connector (connector plan, Step 5).
+
+  bin/colab-harness-bootstrap [--consumer CALLER]
+      [--scopes read,write-state,send] [--remint]
+
+One command: the consumer's connector token is minted (or the
+staged one reused) through the scheduler's connector-token
+verb into an untracked staging file at 0600 — never printed —
+the bin/harness client is staged as-is, the harness-bootstrap
+job installs both in a session (token at 0600, the upload copy
+shredded) and runs one smoke call (chat_list, a bridged read)
+through the ferry, this driver relays until the run lands, and
+the verdict JSON is printed: run id, session, run state, relay
+totals, and the smoke result (which names the consumer's
+attributed read). Exit 0 only when the smoke read succeeded.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _load  # noqa: E402
+
+harness = _load.sync("harness")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="colab-harness-bootstrap")
+    ap.add_argument("--consumer", default="sweeper-venue")
+    ap.add_argument("--scopes", default="read,write-state,send")
+    ap.add_argument("--remint", action="store_true",
+                    help="mint a fresh token even if one is staged (rotates the old one out)")
+    a = ap.parse_args()
+    verdict = harness.bootstrap(
+        _load.REPO, consumer=a.consumer, scopes=a.scopes, remint=a.remint)
+    print(json.dumps(verdict, indent=2, sort_keys=True))
+    return 0 if verdict.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

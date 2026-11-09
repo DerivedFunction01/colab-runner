@@ -1,0 +1,1 @@
+{"caller":"panel","name":"harness-bootstrap","outputs":["smoke-result.json"],"script":"jobs/harness-bootstrap/bootstrap.py","shape":"cpu-highram","timeout":1800,"uploads":["var/harness/harness","var/harness/sweeper-venue.token"]}
