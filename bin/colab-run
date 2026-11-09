@@ -89,6 +89,44 @@ def load_run_record(run_id: str) -> dict | None:
     return rec if isinstance(rec, dict) else None
 
 
+# Pre-launch uploads above this size move through the chunked
+# transfer (which verifies the whole-file hash) instead of the
+# plain upload: the single-file ceiling the fs tools enforce.
+UPLOAD_CHUNK_THRESHOLD_BYTES = 50 * 1024 * 1024
+
+
+def upload_one(session: str, src: Path, dest_name: str, tag: str) -> str | None:
+    """One pre-launch upload, verified before the job starts.
+    A failed or short transfer is an error HERE — never a
+    missing file discovered inside the job later (2026-11-08:
+    a ~100 MB snapshot bundle's plain upload failed with its
+    return code unchecked and the run proceeded without it).
+    Large files move chunked (hash-verified by the transfer);
+    smaller files move plain and are verified by remote size
+    through a probe exec in the session's working directory,
+    the reader's own model. Returns an error string, or None
+    on a verified landing."""
+    if src.stat().st_size > UPLOAD_CHUNK_THRESHOLD_BYTES:
+        up = transfer.chunked_upload(session, src, dest_name)
+        if not up["ok"]:
+            return f"chunked upload failed: {json.dumps(up)[:300]}"
+        return None
+    r = colab("upload", "-s", session, str(src), f"/content/{dest_name}", timeout=600)
+    if r.returncode != 0:
+        return f"upload failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}"
+    probe = REPO / "var" / f"upload-probe-{tag}.py"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text(f"import os, json\np = {dest_name!r}\nprint(json.dumps({{'size': os.path.getsize(p) if os.path.exists(p) else None}}))\n")
+    pr = colab("exec", "-s", session, "--timeout", "120", "-f", str(probe), timeout=300)
+    try:
+        size = json.loads(pr.stdout[pr.stdout.index("{"):])["size"]
+    except (ValueError, KeyError):
+        return f"upload verify unreadable for {dest_name}: {pr.stdout.strip()[-200:]}"
+    if size != src.stat().st_size:
+        return f"upload verify: {dest_name} landed at {size} bytes, expected {src.stat().st_size}"
+    return None
+
+
 def outbox_path() -> Path:
     # The UI outbox lives in the runner var dir (the panel's own
     # var_dir() convention: $COLAB_RUNNER_VAR, else the repo's var).
@@ -206,9 +244,16 @@ def write_reader(run_id: str, remote_out: str, outputs: list) -> Path:
         "        return {'size': s.st_size, 'mtime': s.st_mtime}\n"
         "    except OSError:\n"
         "        return None\n"
+        "def _ecode(p):\n"
+        "    try:\n"
+        "        return int(p.read_text().strip())\n"
+        "    except (OSError, ValueError):\n"
+        "        return None\n"
+        f"ecode = Path({remote_out + '.exit-code'!r})\n"
         "out = {'checkpoint': json.loads(ck.read_text()) if ck.exists() else None,\n"
         "       'heartbeat_tail': log.read_text().strip().split('\\n')[-3:] if log.exists() else [],\n"
         "       'job_log_tail': jlog.read_text(errors='replace').strip().split('\\n')[-5:] if jlog.exists() else [],\n"
+        "       'exit_stamp': _ecode(ecode),\n"
         f"       'job_pids': subprocess.run(['pgrep','-f',{remote_out!r}], capture_output=True, text=True).stdout.split(),\n"
         "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split(),\n"
         "       'outputs': {n: _stat(d / n) for n in names}}\n"
@@ -339,11 +384,15 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     outcome (2026-11-05: a job-zero build whose init_venv.py
     failed recorded "complete" with a clean-looking pull; only a
     human reading the pulled report saw assertions_passed:
-    false). Jobs whose checkpoints carry no exit_code are
-    unaffected. Outputs are pulled regardless — reports and
+    false). Jobs whose checkpoints carry no exit_code fall back
+    to the launch wrapper's exit stamp — the same truth for
+    payloads that never write a checkpoint. Outputs are pulled
+    regardless — reports and
     verdicts land locally either way."""
     pulled = pull_outputs(rec, job, session, remote_out, reader_state)
     exit_code = (reader_state.get("checkpoint") or {}).get("exit_code")
+    if exit_code is None:
+        exit_code = reader_state.get("exit_stamp")
     usage_after = colab("usage", timeout=120).stdout.strip()
     if exit_code not in (None, 0):
         mark_terminal(rec, "failed", finished_at=now(), error=f"job payload exited {exit_code}", pulled=pulled, usage_before=usage_before, usage_after=usage_after)
@@ -409,7 +458,7 @@ def poll_run(run_id: str) -> int:
         pull_outputs(rec, job, session, remote_out, state)
         save_record(rec)
     log = state.get("heartbeat_tail") or []
-    complete = any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"])
+    complete = any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None
     if not complete and not state.get("job_pids") and state.get("job_log_tail"):
         # The launched process is gone with no completion signal:
         # the same death the poll loop fails on (see main).
@@ -703,7 +752,12 @@ def main() -> int:
                 save_record(rec)
                 return 1
         script = REPO / job["script"]
-        colab("upload", "-s", session, str(script), f"/content/{script.name}", timeout=600)
+        err = upload_one(session, script, script.name, run_id)
+        if err is not None:
+            rec.update(state="failed", error=f"runner script upload: {err}")
+            save_record(rec)
+            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+            return 1
         # Manifest-declared extra uploads land at /content/<name>
         # before launch: a shell_job payload names its script in
         # args (--script /content/env_build.sh) and the registry it
@@ -719,7 +773,12 @@ def main() -> int:
                 save_record(rec)
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
-            colab("upload", "-s", session, str(src), f"/content/{src.name}", timeout=600)
+            err = upload_one(session, src, src.name, run_id)
+            if err is not None:
+                rec.update(state="failed", error=f"manifest upload failed: {extra}: {err}")
+                save_record(rec)
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
         seeded = False
         if seed_ctx is not None:
             # Move the bundle (chunked — it can exceed the
@@ -734,8 +793,14 @@ def main() -> int:
                 save_record(rec)
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
-            colab("upload", "-s", session, str(seed_ctx["bundle_path"]) + ".manifest.json", f"/content/{seed_ctx['bundle_path'].name}.manifest.json", timeout=300)
-            colab("upload", "-s", session, str(REPO / "sync" / "apply_bundle_remote.py"), "/content/apply_bundle_remote.py", timeout=300)
+            err = upload_one(session, Path(str(seed_ctx["bundle_path"]) + ".manifest.json"), seed_ctx["bundle_path"].name + ".manifest.json", run_id)
+            if err is None:
+                err = upload_one(session, REPO / "sync" / "apply_bundle_remote.py", "apply_bundle_remote.py", run_id)
+            if err is not None:
+                rec.update(state="failed", error=f"bundle seed: {err}")
+                save_record(rec)
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
             seed_remote = REPO / "var" / f"seed-{run_id}.py"
             seed_remote.write_text(
                 "import subprocess\n"
@@ -758,10 +823,19 @@ def main() -> int:
         save_record(rec)
         # Detached launch (default pending the kill-matrix verdict): a short
         # exec starts the job under nohup; the CLI is never the job's lifeline.
+        # The payload runs under a stamp wrapper: its exit code lands at
+        # <remote_out>.exit-code, so a payload that never writes a
+        # checkpoint still reports its outcome truthfully (2026-11-08:
+        # checkpoint-less gate jobs recorded failed on green runs).
         job_args = "".join(f",'{a}'" for a in list(job.get("args", [])) + (["--skip-clone"] if seeded else []) + extra_args)
+        stamp = (
+            "import subprocess, sys\n"
+            f"rc = subprocess.run([sys.executable, '{script.name}', '--out', '{remote_out}'{job_args}]).returncode\n"
+            f"open('{remote_out}.exit-code', 'w').write(str(rc))\n"
+        )
         launch = (
-            f"import subprocess; subprocess.Popen(['nohup','python3','{script.name}',"
-            f"'--out','{remote_out}'{job_args}], stdout=open('{remote_out}.log','w'), stderr=subprocess.STDOUT, start_new_session=True)"
+            f"import subprocess; subprocess.Popen(['nohup','python3','-c',{stamp!r}],"
+            f" stdout=open('{remote_out}.log','w'), stderr=subprocess.STDOUT, start_new_session=True)"
         )
         launcher = REPO / "var" / f"launch-{run_id}.py"
         launcher.parent.mkdir(parents=True, exist_ok=True)
@@ -815,7 +889,7 @@ def main() -> int:
                 pull_outputs(rec, job, session, remote_out, state)
                 save_record(rec)
             log = state.get("heartbeat_tail") or []
-            if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]):
+            if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None:
                 break
             if not state.get("job_pids") and state.get("job_log_tail"):
                 # The launched process is gone and its launcher log

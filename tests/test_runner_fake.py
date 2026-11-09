@@ -553,3 +553,133 @@ def test_acquire_refusal_names_an_orphaned_live_session(tmp_path):
     r = subprocess.run([sys.executable, str(run_bin(agent_env)), "smoke"], capture_output=True, text=True, env=agent_env, timeout=300)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "orphan-live-1" in r.stderr and "bin/colab-lease adopt orphan-live-1" in r.stderr, r.stderr
+
+
+def install_bare_job(env, name, exit_code, uploads=None):
+    """Replace the fixture repo's jobs symlink with a real dir
+    holding one checkpoint-less job: its payload writes its
+    declared output and exits with the given code, speaking
+    none of the runner's completion protocol (no checkpoint,
+    no 'complete' line) — the shape the 2026-11-08 remainder
+    gate jobs had when green runs recorded failed."""
+    root = Path(env["TEST_REPO_ROOT"])
+    jobs_dir = root / "jobs"
+    if jobs_dir.is_symlink():
+        jobs_dir.unlink()
+    job_dir = jobs_dir / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "payload.py").write_text(
+        "import argparse, sys\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "a = ap.parse_args()\n"
+        "out = Path(a.out)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'result.txt').write_text('bare-result\\n')\n"
+        f"sys.exit({exit_code})\n"
+    )
+    manifest = {"name": name, "script": f"jobs/{name}/payload.py", "args": [], "outputs": ["result.txt"], "shape": "cpu-highram", "checkpoint_pull_seconds": 1, "timeout": 180}
+    if uploads:
+        manifest["uploads"] = uploads
+    (job_dir / "job.json").write_text(json.dumps(manifest))
+    return job_dir
+
+
+def test_checkpoint_less_job_completes_on_its_exit_stamp(tmp_path):
+    """D2 (2026-11-08 remainder report): a job that writes its
+    outputs and exits 0 without the checkpoint protocol records
+    complete — the launch wrapper's exit stamp is the outcome
+    truth the death branch used to override with 'failed'."""
+    env = runner_env(tmp_path)
+    install_bare_job(env, "bareok", 0)
+    r = run_verb(env, "bareok")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    assert any(p["path"] == "result.txt" for p in out["pulled"])
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec["state"] == "complete"
+
+
+def test_checkpoint_less_job_failure_records_its_exit_code(tmp_path):
+    """The same job exiting non-zero records failed with the
+    payload's own code — not the generic 'exited before
+    completing' the death branch used to stamp on it."""
+    env = runner_env(tmp_path)
+    install_bare_job(env, "barebad", 3)
+    r = run_verb(env, "barebad")
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "failed"
+    assert "job payload exited 3" in out["error"]
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec["state"] == "failed" and "job payload exited 3" in rec["error"]
+
+
+def upload_fail_wrapper(tmp_path):
+    """A COLAB_BIN wrapper that fails uploads of one named file
+    (ctl {"fail_upload_named": "name"} in the fake state dir),
+    delegating everything else to the real fake — flaky_wrapper's
+    shape, aimed at the upload verb."""
+    wrapper = tmp_path / "uploadfail_colab.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_COLAB_STATE'])\n"
+        "ctl_path = state / 'uploadfail.json'\n"
+        "ctl = json.loads(ctl_path.read_text()) if ctl_path.exists() else {}\n"
+        "args = sys.argv[1:]\n"
+        "if 'upload' in args and ctl.get('fail_upload_named') and any(ctl['fail_upload_named'] in a for a in args):\n"
+        "    print('uploadfail wrapper: upload refused', file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "sys.exit(subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode)\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_manifest_upload_failure_fails_the_run_at_upload_time(tmp_path):
+    """D1 (2026-11-08 remainder report): a manifest upload whose
+    transfer fails ends the run AT the upload — failed record,
+    the upload named — instead of launching a job that discovers
+    the missing file itself (or never does)."""
+    env = runner_env(tmp_path)
+    install_bare_job(env, "bareup", 0, uploads=["var/payload-data.bin"])
+    root = Path(env["TEST_REPO_ROOT"])
+    (root / "var").mkdir(exist_ok=True)
+    (root / "var" / "payload-data.bin").write_bytes(b"payload-data")
+    state = Path(env["FAKE_COLAB_STATE"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "uploadfail.json").write_text(json.dumps({"fail_upload_named": "payload-data.bin"}))
+    env.update(COLAB_BIN=str(upload_fail_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE))
+    r = run_verb(env, "bareup")
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "failed"
+    assert "manifest upload failed" in out["error"] and "payload-data.bin" in out["error"]
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec["state"] == "failed" and "remote_out" not in rec
+
+
+def test_oversize_manifest_upload_moves_chunked_and_verified(tmp_path):
+    """An upload over the single-file ceiling routes through
+    the chunked transfer (hash-verified) and lands whole on the
+    session — the ~100 MB bundle shape that silently failed
+    through the plain upload."""
+    env = runner_env(tmp_path)
+    install_bare_job(env, "barebig", 0, uploads=["var/big.bin"])
+    root = Path(env["TEST_REPO_ROOT"])
+    (root / "var").mkdir(exist_ok=True)
+    big = root / "var" / "big.bin"
+    with open(big, "wb") as fh:
+        fh.seek(51 * 1024 * 1024 - 1)
+        fh.write(b"\x01")
+    r = run_verb(env, "barebig")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    landed = Path(env["FAKE_COLAB_STATE"]) / "sessions" / rec["session"] / "big.bin"
+    assert landed.stat().st_size == 51 * 1024 * 1024
