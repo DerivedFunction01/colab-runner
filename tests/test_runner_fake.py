@@ -255,9 +255,14 @@ def test_checkpoint_pull_lands_outputs_during_the_run(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["state"] == "complete"
-    downloads = [" ".join(call) for call in cli_calls(env) if "download" in call]
-    heartbeat = [d for d in downloads if d.endswith("heartbeat.log")]
-    unit0 = [d for d in downloads if d.endswith("unit-0.bin")]
+    downloads = [call for call in cli_calls(env) if "download" in call]
+    def pulls_of(name):
+        # A pull is counted by its remote source: pulls land on a
+        # staging sibling (dest ends .pulling) since the shrink
+        # guard, so the destination no longer ends with the name.
+        return [c for c in downloads if any(a.startswith("/content/") and a.endswith("/" + name) for a in c)]
+    heartbeat = pulls_of("heartbeat.log")
+    unit0 = pulls_of("unit-0.bin")
     assert len(heartbeat) >= 2, f"heartbeat.log downloaded {len(heartbeat)} time(s): the final pull only, no checkpoint pull during the run"
     assert len(unit0) == 1, f"unit-0.bin downloaded {len(unit0)} time(s): an unchanged output must be pulled once and skipped thereafter"
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
