@@ -729,7 +729,7 @@ def test_shrinking_repull_rotates_the_held_copy(tmp_path):
         "    marker = state / 'checkpoint-downloads'\n"
         "    count = int(marker.read_text()) + 1 if marker.exists() else 1\n"
         "    marker.write_text(str(count))\n"
-        "    if count >= 2:\n"
+        "    if count >= 1:\n"
         "        for remote in state.glob('sessions/*/**/unit-0.bin'):\n"
         "            remote.write_bytes(b'shrunk\\n')\n"
         "sys.exit(subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode)\n"
