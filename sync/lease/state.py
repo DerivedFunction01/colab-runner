@@ -86,7 +86,7 @@ def budget_snapshot(colab, repo: Path, now_dt: datetime | None = None) -> dict:
             _dial_cache_write(repo, "state-cache-usage.json", balance, now_dt)
     day_spent = month_spent = standing_day_spent = None
     if balance is not None:
-        spend = _mod_spend.attributed_spend(repo)
+        spend = _mod_spend.attributed_spend(repo, now_dt)
         day_spent = spend["day_spent"]
         month_spent = spend["month_spent"]
         # The standing caller's day spend from the same derivation

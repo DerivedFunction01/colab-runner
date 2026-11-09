@@ -540,14 +540,19 @@ def test_budget_snapshot_serves_standing_day_spend(repo, tmp_path, monkeypatch):
     var = tmp_path / "var"
     var.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("COLAB_RUNNER_VAR", str(var))
-    now = datetime.now(timezone.utc)
+    # A fixed mid-day now: the fixture must not depend on the
+    # wall clock — inside the first minute of a UTC day the
+    # segment is shorter than the rate floor below assumes and
+    # the invariant breaks (a gate that happened to start at
+    # 00:00 UTC caught exactly that).
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     hours = max((now - day_start).total_seconds() / 3600.0, 1 / 60)
     # One lobby segment covering today so far, rated to total 2.42 CU.
     seg = {"caller": "standing", "session": "lobby", "start": day_start.isoformat(), "end": now.isoformat(), "rate": 2.42 / hours}
     (var / "lease-spend-journal.jsonl").write_text(json.dumps(seg) + "\n")
 
-    out = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), repo)
+    out = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 768.38 compute units"), repo, now_dt=now)
     assert out["balance"] == 768.38
     assert out["standing_day_spent"] == 2.42
     assert out["day_spent"] == 2.42
@@ -557,7 +562,7 @@ def test_budget_snapshot_serves_standing_day_spend(repo, tmp_path, monkeypatch):
 
     # A balance collapse (the 2026-11-01 expiration step) moves
     # nothing: spend is attributed, not balance-derived.
-    out2 = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 699.00 compute units"), repo)
+    out2 = lease.budget_snapshot(lambda *a, **k: cp("Current balance: 699.00 compute units"), repo, now_dt=now)
     assert out2["standing_day_spent"] == 2.42
     assert out2["day_spent"] == 2.42
 
