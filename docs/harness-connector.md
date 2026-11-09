@@ -74,5 +74,15 @@ bin/colab-harness-relay -s SESSION [--interval 5] [--cycles N]
 ```
 
 With no `--cycles` it runs until interrupted and prints what
-it served. One relay per session at a time is the working
-assumption; cycles are idempotent reads of the ferry dirs.
+it served, one timestamped line per serve (id, method, path,
+status). The bootstrap driver keeps the same record as JSONL
+at `var/harness/relay-<session>.jsonl`.
+
+One relay per session, enforced: a relay holds an flock on
+`var/harness-relay-<session>.lock` for its lifetime, and a
+second relay for the same session refuses — two relays cycling
+one ferry both read the same listing and both perform the same
+envelope, which for a bridged write is duplicated work with
+side effects (a `chat_send` would send twice). When the
+bootstrap finds the lock held, it serves nothing itself and
+runs reconcile-only while the holder serves the ferry.

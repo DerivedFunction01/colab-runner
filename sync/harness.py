@@ -38,6 +38,8 @@ there, sweeper-venue by default) — one caller per consumer
 role, never per session.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -150,10 +152,14 @@ def _exec_script(colab, repo: Path, session: str, script_text: str, tag: str) ->
     return json.loads((r.stdout or "").strip().splitlines()[-1])
 
 
-def relay_cycle(colab, repo: Path, session: str, service_url: str = SERVICE_URL) -> dict:
+def relay_cycle(colab, repo: Path, session: str, service_url: str = SERVICE_URL, log=None) -> dict:
     """One ferry cycle for one session: read pending requests,
     execute them against the service, deliver the responses and
-    clear the served requests. Returns the cycle's accounting."""
+    clear the served requests. Returns the cycle's accounting.
+    When log is given it is called per serve with
+    (request id, method, path, status) — the serve record that
+    makes duplicate-execution questions answerable after the
+    fact."""
     listing = _exec_script(colab, repo, session, read_requests_script(), "read")
     requests = listing.get("requests") or {}
     if not requests:
@@ -162,41 +168,89 @@ def relay_cycle(colab, repo: Path, session: str, service_url: str = SERVICE_URL)
     for rid, envelope in requests.items():
         if isinstance(envelope, dict):
             responses[rid] = execute_request(envelope, service_url)
+            if log is not None:
+                log(rid, envelope.get("method"), envelope.get("path"), responses[rid]["status"])
     if responses:
         _exec_script(colab, repo, session, deliver_script(responses), "deliver")
     return {"requests": len(requests), "served": sorted(responses)}
 
 
-def relay_until(colab, repo: Path, session: str, done, service_url: str = SERVICE_URL, interval_s: float = 5.0, max_s: float = 1800.0, reconcile=None) -> dict:
+class RelayBusy(RuntimeError):
+    """Another relay already holds this session's ferry."""
+
+
+@contextlib.contextmanager
+def relay_lock(repo: Path, session: str):
+    """One relay per session, enforced: an flock held for the
+    relay's lifetime. Two relays cycling one session both read
+    the same ferry-out listing and both perform the same
+    envelope — for a bridged write that is duplicated work with
+    side effects (a chat_send would send twice), and it
+    happened live when a hand-started recovery relay overlapped
+    the bootstrap driver's own relay. The second relay refuses
+    (or, for the driver, falls back to reconciling only)."""
+    path = repo / "var" / f"harness-relay-{session}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise RelayBusy(f"another relay holds the ferry for {session}") from None
+    fh.write(json.dumps({"pid": os.getpid(), "session": session}) + "\n")
+    fh.flush()
+    try:
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+def relay_until(colab, repo: Path, session: str, done, service_url: str = SERVICE_URL, interval_s: float = 5.0, max_s: float = 1800.0, reconcile=None, log=None) -> dict:
     """Cycle the relay until done() reports true (checked between
     cycles) or the bound passes. When reconcile is given it runs
     once per cycle before the check — the bootstrap passes the
     run's --poll reconcile, because a detached run's record
     advances only when something reconciles it; reading the
     record alone would wait forever on a run that finished
-    in-session long ago. Returns the totals."""
+    in-session long ago. The session's relay lock is held for
+    the loop's life; if another relay already holds it, this
+    loop runs reconcile-only (the holder serves the ferry) and
+    says so in its totals. Returns the totals."""
     totals = {"cycles": 0, "served": 0, "errors": 0}
     deadline = time.time() + max_s
-    while True:
-        try:
-            cycle = relay_cycle(colab, repo, session, service_url)
-            totals["served"] += len(cycle["served"])
-        except Exception:  # noqa: BLE001 - a failed cycle is a skipped cycle
-            # Channel execs fail under load (429s, liveness
-            # blips); the requests persist in ferry-out and the
-            # next cycle re-reads them. A relay that dies on the
-            # first failed cycle strands every later request —
-            # the first live proof's smoke died exactly that way.
-            totals["errors"] += 1
-        totals["cycles"] += 1
-        if reconcile is not None:
-            reconcile()
-        if done():
-            return totals
-        if time.time() > deadline:
-            totals["timed_out"] = True
-            return totals
-        time.sleep(interval_s)
+    lock_ctx = relay_lock(repo, session)
+    try:
+        lock_ctx.__enter__()
+        totals["relay_external"] = False
+    except RelayBusy:
+        lock_ctx = None
+        totals["relay_external"] = True
+    try:
+        while True:
+            if lock_ctx is not None:
+                try:
+                    cycle = relay_cycle(colab, repo, session, service_url, log=log)
+                    totals["served"] += len(cycle["served"])
+                except Exception:  # noqa: BLE001 - a failed cycle is a skipped cycle
+                    # Channel execs fail under load (429s, liveness
+                    # blips); the requests persist in ferry-out and the
+                    # next cycle re-reads them. A relay that dies on the
+                    # first failed cycle strands every later request —
+                    # the first live proof's smoke died exactly that way.
+                    totals["errors"] += 1
+            totals["cycles"] += 1
+            if reconcile is not None:
+                reconcile()
+            if done():
+                return totals
+            if time.time() > deadline:
+                totals["timed_out"] = True
+                return totals
+            time.sleep(interval_s)
+    finally:
+        if lock_ctx is not None:
+            lock_ctx.__exit__(None, None, None)
 
 
 # --- bootstrap driver ------------------------------------------------------
@@ -309,7 +363,13 @@ def bootstrap(repo: Path, consumer: str = "sweeper-venue", scopes: str = "read,w
                 stdout=fh, stderr=subprocess.STDOUT, timeout=900,
             )
 
-    totals = relay_until(colab, repo, session, _terminal, reconcile=_reconcile)
+    def _serve_log(rid, method, path, status) -> None:
+        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "id": rid, "method": method, "path": path, "status": status}
+        with open(stage_dir(repo) / f"relay-{session}.jsonl", "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+
+    totals = relay_until(colab, repo, session, _terminal, reconcile=_reconcile, log=_serve_log)
     wait_out = stage_dir(repo) / "wait-output.log"
     with open(wait_out, "w") as fh:
         wait = subprocess.run(

@@ -35,12 +35,19 @@ def main() -> int:
     a = ap.parse_args()
     totals = {"cycles": 0, "served": 0, "errors": 0}
     try:
+        lock_ctx = harness.relay_lock(_load.REPO, a.session)
+        lock_ctx.__enter__()
+    except harness.RelayBusy:
+        print(f"colab-harness-relay: another relay already holds the ferry for {a.session}")
+        return 2
+    try:
         while True:
             try:
-                cycle = harness.relay_cycle(cli.colab, _load.REPO, a.session, a.url)
+                def _log(rid, method, path, status):
+                    import time as _time
+                    print(f"{_time.strftime('%H:%M:%S')} relay: served {rid} {method} {path} -> {status}", flush=True)
+                cycle = harness.relay_cycle(cli.colab, _load.REPO, a.session, a.url, log=_log)
                 totals["served"] += len(cycle["served"])
-                if cycle["served"]:
-                    print(f"relay: served {cycle['served']}", flush=True)
             except Exception as exc:  # noqa: BLE001 - a failed cycle is a skipped cycle
                 totals["errors"] += 1
                 print(f"relay: cycle failed ({type(exc).__name__}: {exc}); continuing", flush=True)
@@ -51,6 +58,8 @@ def main() -> int:
             time.sleep(a.interval)
     except KeyboardInterrupt:
         pass
+    finally:
+        lock_ctx.__exit__(None, None, None)
     print(f"relay totals: {totals}")
     return 0
 

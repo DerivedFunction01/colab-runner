@@ -158,8 +158,11 @@ def test_relay_cycle_with_fake_channel(stub_service, tmp_path):
         proc = subprocess.run([sys.executable, "-c", text], capture_output=True, text=True)
         return subprocess.CompletedProcess(argv, proc.returncode, proc.stdout, proc.stderr)
 
-    cycle = harness.relay_cycle(fake_colab, tmp_path, "any-session", url)
+    served_log = []
+    cycle = harness.relay_cycle(fake_colab, tmp_path, "any-session", url,
+                                log=lambda *entry: served_log.append(entry))
     assert cycle == {"requests": 1, "served": ["cafe01"]}
+    assert served_log == [("cafe01", "POST", "/tools/chat_list", 200)]
     assert seen[0]["auth"] == "Bearer tok-abc"
     assert json.loads((in_dir / "cafe01.json").read_text())["body"]["ok"] is True
     empty = harness.relay_cycle(fake_colab, tmp_path, "any-session", url)
@@ -218,6 +221,35 @@ def test_payload_failed_smoke_fails_the_run(tmp_path):
     assert proc.returncode == 1
     verdict = json.loads((out_dir / "smoke-result.json").read_text())
     assert verdict["ok"] is False and verdict["exit_code"] == 3
+
+
+def test_relay_lock_refuses_a_second_holder(tmp_path):
+    """One relay per session: two relays cycling one ferry both
+    perform the same envelope (live-proven duplication — a
+    hand-started relay overlapped the driver's). The second
+    holder is refused while the first holds the lock."""
+    import pytest as _pytest
+    with harness.relay_lock(tmp_path, "sess-1"):
+        with _pytest.raises(harness.RelayBusy):
+            with harness.relay_lock(tmp_path, "sess-1"):
+                pass
+    with harness.relay_lock(tmp_path, "sess-1"):  # free again after release
+        pass
+
+
+def test_relay_until_runs_reconcile_only_when_the_lock_is_held(tmp_path):
+    """The bootstrap's fallback: another relay holds the ferry,
+    so the driver serves nothing itself but still reconciles
+    and finishes on the run's terminal state."""
+
+    def forbidden_colab(*argv, **_kw):
+        raise AssertionError("no channel use in reconcile-only mode")
+
+    with harness.relay_lock(tmp_path, "sess-2"):
+        totals = harness.relay_until(
+            forbidden_colab, tmp_path, "sess-2", lambda: True, interval_s=0)
+    assert totals["relay_external"] is True
+    assert totals["served"] == 0
 
 
 def test_mint_token_never_prints_and_stages_0600(tmp_path, monkeypatch):
