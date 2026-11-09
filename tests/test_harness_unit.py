@@ -293,7 +293,11 @@ def test_bootstrap_launch_survives_pipe_holding_descendants(tmp_path):
         "  exit 0\n"
         "fi\n"
         "(sleep 20) &\n"
-        "echo '{\"run_id\": \"r1\", \"session\": \"s1\", \"state\": \"polling\"}'\n"
+        "echo '{'\n"
+        "echo '  \"run_id\": \"r1\",'\n"
+        "echo '  \"session\": \"s1\",'\n"
+        "echo '  \"state\": \"polling\"'\n"
+        "echo '}'\n"
         "exit 0\n")
     fake_run.chmod(0o755)
     sched_bin = tmp_path / "scheduler" / "bin"

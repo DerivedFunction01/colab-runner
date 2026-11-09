@@ -286,8 +286,10 @@ def bootstrap(repo: Path, consumer: str = "sweeper-venue", scopes: str = "read,w
     if launch.returncode != 0:
         return {"ok": False, "stage": "launch", "error": launch_out.read_text()[-300:]}
     try:
-        started = json.loads(launch_out.read_text().strip().splitlines()[-1])
-    except (ValueError, IndexError):
+        # The launch prints its receipt as pretty JSON over
+        # several lines — parse the whole file, not a last line.
+        started = json.loads(launch_out.read_text())
+    except ValueError:
         return {"ok": False, "stage": "launch", "error": f"unparsable launch output: {launch_out.read_text()[-200:]}"}
     run_id, session = started["run_id"], started["session"]
 
