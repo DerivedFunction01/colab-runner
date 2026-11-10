@@ -97,6 +97,31 @@ def test_registry_reads_fresh_and_ignores_malformed_entries(tmp_path, monkeypatc
     assert lease_mod.resolve_caller(repo, flag="beta") == "beta"
 
 
+def test_active_marking_reads_the_registry(tmp_path, monkeypatch):
+    repo = caller_repo(tmp_path, monkeypatch, callers=("alpha", "beta"))
+    (repo / "config" / "callers.json").write_text(json.dumps({"callers": ["alpha", "beta"], "active": ["alpha"]}))
+    assert lease_mod.active_caller_registry(repo) == {"alpha"}
+    assert lease_mod.is_active_caller(repo, "alpha") is True
+    # A lane suffix inherits its base's marking.
+    assert lease_mod.is_active_caller(repo, "alpha:lane-1") is True
+    assert lease_mod.is_active_caller(repo, "beta") is False
+    assert lease_mod.is_active_caller(repo, "beta:lane-1") is False
+    # An invalid or unregistered claim is never active.
+    assert lease_mod.is_active_caller(repo, "gamma") is False
+    assert lease_mod.is_active_caller(repo, None) is False
+
+
+def test_active_marking_ignores_unregistered_names_and_absence(tmp_path, monkeypatch):
+    repo = caller_repo(tmp_path, monkeypatch, callers=("alpha", "beta"))
+    # A marking for an unregistered caller is ignored, not an error.
+    (repo / "config" / "callers.json").write_text(json.dumps({"callers": ["alpha", "beta"], "active": ["gamma", 7, None]}))
+    assert lease_mod.active_caller_registry(repo) == set()
+    # No "active" list at all marks nobody.
+    (repo / "config" / "callers.json").write_text(json.dumps({"callers": ["alpha", "beta"]}))
+    assert lease_mod.active_caller_registry(repo) == set()
+    assert lease_mod.is_active_caller(repo, "alpha") is False
+
+
 def test_claims_journal_round_trip(tmp_path, monkeypatch):
     repo = caller_repo(tmp_path, monkeypatch)
     assert lease_mod.load_caller_claims(repo) == {}

@@ -492,3 +492,56 @@ def test_detached_evidence_dedupes_record_jobs_and_scan(tmp_path, monkeypatch):
     ev = lease_mod.active_callers(root, SESSION, T0 + timedelta(minutes=1))
     kinds = [item["kind"] for item in ev["beta"]]
     assert kinds == ["detached"]
+
+
+def mark_active(root, *names):
+    """Rewrite the scratch registry with an "active" marking
+    (the fixture writes the base shape; the marking is the
+    registry's optional sibling list)."""
+    path = root / "config" / "callers.json"
+    data = json.loads(path.read_text())
+    data["active"] = list(names)
+    path.write_text(json.dumps(data))
+
+
+def test_active_caller_refused_sync_on_a_quiet_session(tmp_path, monkeypatch):
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    mark_active(root, "alpha")
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is False
+    assert verdict["action"] == "sync-refused-active-caller"
+    assert verdict["blocked_by"] == "active-caller"
+    assert verdict["holder"] == "alpha"
+    assert verdict["evidence"] == [{"kind": "active-caller", "caller": "alpha"}]
+    # No claim is granted to an active caller, even at sole
+    # occupancy — the refusal is the standing marking, not a
+    # contention outcome.
+    assert lease_mod.read_sync_claim(root, SESSION, now_dt=T0) is None
+    out = lease_mod.claim_sync(root, SESSION, "alpha", now_dt=T0)
+    assert out["action"] == "sync-claim-refused-active-caller" and out["holder"] == "alpha"
+    # A lane of the marked base is refused under the same rule.
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha:lane-1", now_dt=T0)
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "active-caller"
+    assert verdict["evidence"] == [{"kind": "active-caller", "caller": "alpha"}]
+
+
+def test_active_refusal_outranks_claim_and_activity(tmp_path, monkeypatch):
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    lease_mod.claim_sync(root, SESSION, "beta", now_dt=T0)
+    mark_active(root, "alpha")
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0 + timedelta(minutes=1))
+    # Beta's live claim stands, but alpha's refusal names its own
+    # marking first — that verdict never lifts with occupancy.
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "active-caller"
+    assert verdict["claim"]["caller"] == "beta"
+
+
+def test_unmarked_caller_syncs_as_before(tmp_path, monkeypatch):
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    mark_active(root, "alpha")
+    verdict = lease_mod.sync_rights(root, SESSION, "beta", now_dt=T0)
+    assert verdict["allowed"] is True and verdict["auto_claimed"] is True
+    assert verdict["claim"]["caller"] == "beta"

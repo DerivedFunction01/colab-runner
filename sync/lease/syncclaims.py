@@ -398,9 +398,14 @@ def note_long_hold(repo: Path, session: str, caller: str, bound_seconds: float, 
 def sync_rights(repo: Path, session: str, caller: str | None, now_dt: datetime | None = None) -> dict:
     """May `caller` use the synchronous channel to `session` now?
     The verdict: {"allowed": True, "claim", "auto_claimed"} or
-    {"allowed": False, "blocked_by": "claim"|"activity", "holder",
+    {"allowed": False, "blocked_by": "claim"|"activity"|"active-caller", "holder",
     "evidence", "expires_at"}. Rules, in order:
 
+    - A caller marked active in the registry is refused outright
+      (blocked_by active-caller): active means a potential use for
+      Colab exists even when no session is up (owner ruling
+      2026-11-10), so its work is detached-only — no claim is
+      granted and no occupancy state changes that.
     - A live claim held by another caller refuses (blocked_by
       claim) — the holder is named, with the claim's expiry.
     - Any other caller with live evidence refuses (blocked_by
@@ -416,6 +421,16 @@ def sync_rights(repo: Path, session: str, caller: str | None, now_dt: datetime |
     """
     now = _now(now_dt)
     claim = read_sync_claim(repo, session, now)
+    if caller is not None and callers.is_active_caller(repo, caller):
+        return {
+            "allowed": False,
+            "action": "sync-refused-active-caller",
+            "blocked_by": "active-caller",
+            "holder": caller,
+            "evidence": [{"kind": "active-caller", "caller": caller.partition(":")[0]}],
+            "expires_at": None,
+            "claim": claim,
+        }
     active = active_callers(repo, session, now)
     others = {c: ev for c, ev in active.items() if c != caller}
     if claim is not None and claim.get("caller") != caller:

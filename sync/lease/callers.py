@@ -52,6 +52,37 @@ def validate_caller(repo: Path, raw) -> str | None:
     return f"{base}:{suffix}" if sep else base
 
 
+def active_caller_registry(repo: Path) -> set:
+    """The registered callers marked active in the local
+    registry's "active" list. Active is the owner's standing
+    marking (2026-11-10): a caller with a potential use for
+    Colab even when no session is currently up — while marked
+    active its work is detached-only, and the sync gate refuses
+    its synchronous attaches outright (syncclaims.sync_rights).
+    Markings naming unregistered callers are ignored; a missing
+    or malformed list marks nobody."""
+    names = set()
+    raw = foundation.load_json(callers_path(repo), {})
+    listed = raw.get("active") if isinstance(raw, dict) else None
+    if isinstance(listed, list):
+        registered = caller_registry(repo)
+        for name in listed:
+            if isinstance(name, str) and name in registered:
+                names.add(name)
+    return names
+
+
+def is_active_caller(repo: Path, raw) -> bool:
+    """Whether a presented caller claim belongs to an
+    active-marked caller: the claim must validate, and its
+    base must be marked — a lane suffix inherits its base's
+    marking."""
+    validated = validate_caller(repo, raw)
+    if validated is None:
+        return False
+    return validated.partition(":")[0] in active_caller_registry(repo)
+
+
 def resolve_caller(repo: Path, flag: str | None = None, env: str | None = None) -> str | None:
     """The seam's caller claim, resolved: the flag when one was
     presented, else the env value, validated. None when no claim

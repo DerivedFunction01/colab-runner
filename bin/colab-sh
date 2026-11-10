@@ -31,8 +31,10 @@ Rules:
 - Synchronous use is claim-gated: before connecting, the lease
   core's sync_rights verdict must allow this caller (a TTL'd claim
   held by the session's sole active caller; attaches auto-claim).
-  A refusal exits 2 naming the holder, the evidence, and the
-  detached alternative. --detach and --poll are the async path —
+  A caller marked active in the registry is refused outright —
+  active callers are detached-only. A refusal exits 2 naming the
+  holder, the evidence, and the detached alternative. --detach
+  and --poll are the async path —
   seconds-long connects that launch or read in-session work — and
   stay open to every caller; they never take the claim. Lease- and
   runner-internal calls never pass through this gate by
@@ -368,6 +370,8 @@ def _evidence_text(verdict: dict) -> str:
             parts.append(f"detached launch {item.get('id')} running")
         elif kind == "long-hold":
             parts.append(f"long hold until {item.get('until')}")
+        elif kind == "active-caller":
+            parts.append(f"caller {item.get('caller')} marked active in config/callers.json")
         elif kind == "attach":
             parts.append(f"attach via {item.get('seam')} at {item.get('ts')}")
     return "; ".join(parts) or "no detail"
@@ -398,6 +402,8 @@ def refusal_message(session: str, caller: str | None, verdict: dict, alternative
     who = f"caller {caller!r}" if caller else "an unattributed caller"
     if verdict.get("blocked_by") == "error":
         head = f"the sync-claim check failed ({verdict.get('error')}); refusing — fail closed"
+    elif verdict.get("blocked_by") == "active-caller":
+        head = "this caller is marked active in the caller registry — active callers launch detached; synchronous ops are not allowed for them"
     elif verdict.get("blocked_by") == "claim":
         head = f"the sync claim is held by {verdict.get('holder')!r} until {verdict.get('expires_at')}"
     else:

@@ -202,6 +202,16 @@ duration. Synchronous use is therefore a claim, not a default
   caller's attach auto-claims, journaled in the caller-claims
   journal. Refusals exit 2 naming the holder, the evidence,
   the expiry, and the detached form of the refused command.
+- A caller marked active in the caller registry
+  (`config/callers.json`'s "active" list) is refused before
+  any of that: active means a potential use for Colab exists
+  for that caller even when no session is currently up
+  (owner ruling 2026-11-10), so while the marking stands its
+  synchronous attaches refuse outright (`sync-refused-active-
+  caller`, exit 2 with the detached form) — no claim is
+  granted, and no occupancy state changes the verdict. A lane
+  suffix inherits its base's marking. Detached work is
+  unaffected, as for every caller.
 - A claim lapses at its TTL or when its holder goes quiet
   (last attach older than the window, no other live evidence);
   a lapsed claim reads as absent. `bin/colab-lease claim-sync`
