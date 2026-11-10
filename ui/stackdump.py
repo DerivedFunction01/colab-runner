@@ -1,16 +1,7 @@
-"""Stack-dump watchdog for the lease panel (stackdump-contract: v1;
-canonical text: the spec-driven-starter SPEC, "Stack-dump
-contract — v1"; reference shape: the starter's ops/stackdump.py).
-
-Two daemon threads: the checker performs the panel's internal
-health check (the state computation, injected) and stamps each
-success; the watcher observes the stamp's age and, past the lag
-threshold, dumps every Python thread's stack through a handle
-opened at startup. The watcher never calls the health path and
-takes no lock the request handlers hold, so the dump cannot block
-on the wedge it diagnoses. Diagnostic only: it restarts, kills,
-and mutates nothing.
-"""
+"""Reference shape for the stack-dump contract (SPEC.md,
+`stackdump-contract: v1`): a checker thread stamps each
+health success; a watchdog thread observes the stamp's
+age and dumps through a startup-opened handle."""
 
 import faulthandler
 import threading
