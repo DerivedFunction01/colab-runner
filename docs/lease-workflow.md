@@ -696,3 +696,19 @@ successful restore is silent. Proof: the 2026-11-08 19:14 EST
 VM replacement restored the panel unattended in ~2¾ minutes,
 and an adoption drill the same evening (unit removed, service
 stopped) is recorded in the repo's run logs.
+
+The server also conforms to the **stack-dump contract**
+(`stackdump-contract: v1`; canonical text: the
+spec-driven-starter SPEC). An in-process watchdog
+(`ui/stackdump.py`) checks the state computation the reads
+serve — `run_core`'s state path, called directly, never an
+HTTP self-call — on the cadence `ui/config.json`'s
+`stackdump_*` keys set (defaults 5 s cadence, 15 s threshold,
+60 s repeat, 16 MiB aggregate cap), and on a lag dumps every
+Python thread's stack to `stackdumps.log` in the server's var
+dir (`COLAB_RUNNER_VAR`; the repo's `var/` in the live
+deployment) through a handle opened at startup. The dump is
+diagnostic only — recovery stays with the ladder above. Every
+`/api/state` response carries `stackdump_last_at`, the last
+dump's timestamp or null, so a watcher can tell "wedged and
+dumped" from "wedged silently" without reading the dump.

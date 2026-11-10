@@ -1,1 +1,1 @@
-{"host":"127.0.0.1","port":8793}
+{"host":"127.0.0.1","port":8793,"stackdump_cadence_s":5,"stackdump_max_bytes":16777216,"stackdump_repeat_s":60,"stackdump_threshold_s":15}

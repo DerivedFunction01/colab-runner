@@ -52,6 +52,7 @@ class UiServer:
         ui_dir = root / "ui"
         ui_dir.mkdir(parents=True)
         shutil.copy(SERVER, ui_dir / "server.py")
+        shutil.copy(REPO / "ui" / "stackdump.py", ui_dir / "stackdump.py")
         shutil.copy(REPO / "ui" / "config.json", ui_dir / "config.json")
         (ui_dir / "static").symlink_to(REPO / "ui" / "static")
         repo_fixture.write_config(root)
@@ -61,6 +62,7 @@ class UiServer:
             COLAB_LEASE_BIN=str(stub),
             COLAB_RUNNER_VAR=str(self.var),
             COLAB_LEASE_UI_PORT=str(self.port),
+            COLAB_LEASE_UI_STACKDUMP="0",
             STUB_LEASE_LOG=str(self.log),
         )
         env.update(extra_env or {})
@@ -177,12 +179,23 @@ def test_state_part_endpoints_serve_their_slice(ui):
     assert grant["grant"] is None and grant["envelope"] is None
 
     meta = ui.get_json("/api/state/meta")
-    assert meta == {"bridge": None}
+    assert meta["bridge"] is None
+    assert meta["stackdump_last_at"] is None
 
     invocations = ui.invocations()
     for part in ("records", "specs", "budget", "grant", "meta"):
         assert f"state --part {part}" in invocations
     assert "state" not in invocations  # the composed read was never used
+
+
+def test_state_payloads_carry_stackdump_last_at(ui):
+    """stackdump-contract: v1, clause 6: every state response
+    reports the last dump's timestamp (one field, no content);
+    the harness runs with the watchdog disabled, so it is null."""
+    data = ui.get_json("/api/state")
+    assert data["stackdump_last_at"] is None
+    records = ui.get_json("/api/state/records")
+    assert records["stackdump_last_at"] is None
 
 
 def test_state_part_failure_is_isolated(tmp_path):

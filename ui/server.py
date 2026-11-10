@@ -17,6 +17,7 @@ Env overrides (used by the tests):
   COLAB_LEASE_UI_SH UI control script path (default <repo>/ui/ui.sh)
   COLAB_RUNNER_VAR  var dir (default <repo>/var)
   COLAB_LEASE_UI_HOST / COLAB_LEASE_UI_PORT
+  COLAB_LEASE_UI_STACKDUMP  "0" disables the stack-dump watchdog
 """
 
 import json
@@ -30,6 +31,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from stackdump import StackDumpWatchdog
 
 UI_DIR = Path(__file__).resolve().parent
 REPO = UI_DIR.parent
@@ -163,6 +166,44 @@ class Outbox:
 
 OUTBOX: Outbox | None = None
 
+STACKDUMP: StackDumpWatchdog | None = None
+
+
+def stackdump_health() -> bool:
+    """The watchdog's internal check (stackdump-contract: v1): the
+    state computation this server's own reads serve — run_core's
+    state path, called directly, never an HTTP self-call. Answers
+    (a parsed state document) is healthy; anything else is a
+    non-completion the lag clock accrues against."""
+    _rc, result, _err = run_core("state")
+    return isinstance(result, dict)
+
+
+def load_stackdump_config() -> dict:
+    """Watchdog knobs from ui/config.json, contract defaults as
+    the shipped values (stackdump-contract: v1, clause 2)."""
+    knobs = {"cadence_s": 5.0, "threshold_s": 15.0, "repeat_s": 60.0, "max_bytes": 16 * 1024 * 1024}
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return knobs
+    for key, field, cast in (
+        ("stackdump_cadence_s", "cadence_s", float),
+        ("stackdump_threshold_s", "threshold_s", float),
+        ("stackdump_repeat_s", "repeat_s", float),
+        ("stackdump_max_bytes", "max_bytes", int),
+    ):
+        try:
+            if cfg.get(key) is not None:
+                knobs[field] = cast(cfg[key])
+        except (TypeError, ValueError):
+            pass
+    return knobs
+
+
+def stackdump_last_at():
+    return STACKDUMP.last_dump_at if STACKDUMP is not None else None
+
 
 def reaper_events_path() -> Path:
     return var_dir() / "reaper-events.jsonl"
@@ -292,6 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(502, {"error": "lease core state unavailable", "detail": err, "rc": rc})
         payload = dict(result)
         payload["caps"] = repo_config()
+        payload["stackdump_last_at"] = stackdump_last_at()
         return self.send_json(200, payload)
 
     def api_state_part(self, part: str) -> None:
@@ -307,6 +349,7 @@ class Handler(BaseHTTPRequestHandler):
             # The repo-file caps ride the portions whose sections
             # render them — an instant local read.
             payload["caps"] = repo_config()
+        payload["stackdump_last_at"] = stackdump_last_at()
         return self.send_json(200, payload)
 
     def api_outbox(self, parsed) -> None:
@@ -632,7 +675,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json(400, result)
 
 def main(argv: list[str]) -> int:
-    global OUTBOX
+    global OUTBOX, STACKDUMP
     host, port = load_ui_config()
     for i, arg in enumerate(argv):
         if arg == "--host" and i + 1 < len(argv):
@@ -640,6 +683,14 @@ def main(argv: list[str]) -> int:
         if arg == "--port" and i + 1 < len(argv):
             port = int(argv[i + 1])
     OUTBOX = Outbox(outbox_path())
+    if os.environ.get("COLAB_LEASE_UI_STACKDUMP", "1") != "0":
+        STACKDUMP = StackDumpWatchdog(
+            "colab-lease-panel",
+            stackdump_health,
+            var_dir() / "stackdumps.log",
+            **load_stackdump_config(),
+        )
+        STACKDUMP.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"lease-ui listening on http://{host}:{server.server_address[1]}", flush=True)
     try:
