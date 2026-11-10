@@ -55,6 +55,7 @@ __pycache__/
 # repos' rule): plans and workbench bundle todos are harness working
 # documents — the harness runs on the files, not the git index.
 .plans/
+/workbench/
 
 # Probe run outputs are run records, not source.
 probes/results/*.json

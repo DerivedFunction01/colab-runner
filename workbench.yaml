@@ -4,3 +4,7 @@ registry: workbench/registry.db
 plans: .plans
 mockups: workbench/entries
 archive: workbench/archive
+
+catalog_origin: hand
+catalog_generality: parameterized
+catalog_use_case: work-tracking
