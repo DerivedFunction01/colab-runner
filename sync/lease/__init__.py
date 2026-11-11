@@ -30,7 +30,7 @@ for its endpoint on the release fallback path, and for its tunnel
 host when a session is born (acquire / renewal swap / adoption).
 """
 
-from . import (foundation, catalog, callers, syncclaims, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, lifecycle, bridge, state, standing, reap, auto)
+from . import (foundation, catalog, callers, syncclaims, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, lifecycle, bridge, state, standing, reap, auto, health)
 from .foundation import var_dir, load_json, load_config, ACTOR_ENV_CLAIM, PANEL_ACTOR, GATE_DEFAULT_AGENT_CLASSES, GATE_DEFAULT_BYPASS_ACTORS, GATE_DEFAULT_INFRA_ACTOR, parse_dt, parse_balance, spend_journal_path, reaper_events_path, append_reaper_event
 from .catalog import shape_id_for, CLI_CATALOG_TTL_S, SHAPE_TIMEOUT_S, parse_cli_shapes, _catalog_cache_path, _cli_shapes, _shape_entries, shape_rates_path, load_shape_rates, shape_rate, catalog_shapes, default_shape, standing_caller, standing_shape, _session_shape_args
 from .callers import CALLER_ENV, MACHINERY_CALLERS, _CALLER_PART, callers_path, caller_registry, active_caller_registry, is_active_caller, validate_caller, resolve_caller, caller_claim_error, caller_claims_path, append_caller_claim, load_caller_claims
@@ -45,6 +45,7 @@ from .grants import grant_ledger_path, append_grant_ledger, load_grant_ledger, _
 from .orphans import _jsonl_events, _orphan_contribution, _dt_or_none, orphan_evidence, derive_orphan
 from .renewal import SESSION_CAP_HOURS, RENEWAL_MARGIN, KIT_UPLOAD_TIMEOUT_S, KIT_LAUNCH_TIMEOUT_S, HANDOVER_READ_TIMEOUT_S, RENEWAL_KIT_REMOTE, _shape_spec_for, install_renewal_kit, _swap_session, _adopt_handover, _renew_fresh_session, _attempt_renewal, _ensure_remote_dirs
 from .lifecycle import acquire, extend, extend_grant, adopt_orphan, shorten, _job_record, touch_job, finish_job, release, ungrant
+from .health import launch_health_path, append_launch_outcome, launch_health
 from .bridge import BRIDGE_KIT_REMOTE, BRIDGE_REMOTE, BRIDGE_PROTOCOL, BRIDGE_READ_TIMEOUT_S, BRIDGE_INSTALL_COOLDOWN_S, BRIDGE_HEARTBEAT_STALE_S, bridge_limits, bridge_command, _bridge_arm_path, _bridge_arm, _bridge_arm_stamp, bridge_status_read, install_bridge_kit, _bridge_fold_stop, _bridge_ferry, bridge_duty
 from .state import _extend_guard_spec, extend_guard, status, specs, budget_snapshot, _UNSET, set_budget_caps, auth_required, _envelope_block, _bridge_block, state_records, state_specs, state_budget, state_grant, state_meta, state_extend_guard, state_orphans, state
 from .standing import standing_duty

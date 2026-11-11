@@ -1,9 +1,9 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, callers, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal
+from . import foundation, catalog, callers, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, health
 
-def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False, create: bool = False) -> dict:
+def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False, create: bool = False, prefer_session: str | None = None) -> dict:
     """Adopt a live lease at this shape or create one. The only
     entry point that ever creates a session under the lease model.
     A session is shared capacity, not a caller's possession: any
@@ -47,7 +47,26 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     filling the field only when the record predates attribution
     and the adopting call supplies one. A use by a different
     caller is journaled as a claim on the session — attribution
-    records who called; it never gates use."""
+    records who called; it never gates use.
+
+    Session pin (funnel-hardening, 2026-11-11): `prefer_session`
+    names one lease the call must adopt — the runner's --session
+    seam, for lanes that must target a specific session (a gate
+    that cannot execute on the session the deadline rule would
+    pick). A pin is an instruction, never a hint: the named
+    record is adopted when it is alive and unexpired at the
+    shape, and every other outcome is a `pin-unavailable`
+    refusal naming the reason — no silent substitution, and the
+    named record is never cleared by a pin that cannot use it.
+    An unreadable session list still reads acquire-unknown.
+
+    Launch health (same plan): within each caller tier the pool
+    prefers sessions the launch channel has not recently failed
+    on (sync/lease/health.py) — the deadline rule alone kept
+    adopting the one session whose upload probes were timing
+    out. Health demotes; it never reorders tiers and never
+    blocks: an all-degraded pool still adopts, flagged
+    `health_degraded` on the result."""
     now_dt = now_dt or datetime.now(timezone.utc)
     cfg = foundation.load_config(repo)
     if not cfg.get("enabled"):
@@ -72,9 +91,30 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         pool = at_shape
     # Preference: the caller's own record, then an unstamped one
     # (adoptable by the first caller to ask — the adoption stamps
-    # it, below), then any other caller's; latest deadline breaks
-    # ties within a tier.
-    pool.sort(key=lambda r: (caller is not None and r.get("caller") == caller, r.get("caller") is None, r.get("deadline") or ""), reverse=True)
+    # it, below), then any other caller's; within a tier, sessions
+    # the launch channel recently failed on rank below healthy
+    # ones; latest deadline breaks the remaining ties.
+    health_map = health.launch_health(repo, now_dt)
+    pool.sort(key=lambda r: (caller is not None and r.get("caller") == caller, r.get("caller") is None, not health_map.get(r.get("session"), {}).get("degraded", False), r.get("deadline") or ""), reverse=True)
+    if prefer_session is not None:
+        if create:
+            return {"action": "pin-unavailable", "session": prefer_session, "reason": "a pin names a lease to adopt; it cannot combine with create"}
+        # A pin narrows the pool to the named record or refuses:
+        # validated here, adopted by the loop below. A dead or
+        # expired pin refuses here precisely so the loop's
+        # clearing branch can never destroy the named record
+        # under a pin that asked for it by name; an unknown state
+        # falls through to the loop, whose first check returns
+        # acquire-unknown untouched.
+        pinned = next((r for r in records.all_records(repo) if r.get("session") == prefer_session), None)
+        if pinned is None:
+            return {"action": "pin-unavailable", "session": prefer_session, "reason": "no lease record for the named session"}
+        if pinned.get("shape") != shape_id:
+            return {"action": "pin-unavailable", "session": prefer_session, "reason": f"named session is shape {pinned.get('shape')}, not {shape_id}"}
+        pin_state = sessions.session_state(colab, prefer_session)
+        if pin_state != "unknown" and not (pin_state == "alive" and now_dt < foundation.parse_dt(pinned["deadline"])):
+            return {"action": "pin-unavailable", "session": prefer_session, "reason": f"named session is {pin_state} or past its deadline", "record": pinned}
+        pool = [pinned]
     rec = None
     for cand in pool:
         session = cand["session"]
@@ -119,6 +159,8 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         fresh, _age = keepalive.keepalive_fresh(colab, repo, session)
         ka = {"keepalive": "ok"} if fresh else keepalive.ensure_keepalive(colab, repo, session)
         out = {"action": "adopted", "record": rec, **ka}
+        if health_map.get(session, {}).get("degraded"):
+            out["health_degraded"] = True
         if caller and rec.get("caller") not in (None, caller):
             # Riding another caller's lease: the use is journaled
             # as this caller's claim on the session; the record's

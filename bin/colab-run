@@ -2,8 +2,14 @@
 """Run a named job on Colab: sync in, execute detached, poll,
 pull results, stop the session on every exit path.
 
-Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [-- <job args>...]
+Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [--session NAME] [-- <job args>...]
        colab-run --poll RUN_ID | --wait RUN_ID [--max SECONDS] | --sweep
+--session NAME (or $COLAB_RUN_SESSION) pins the run to the named
+lease: it adopts that session or fails pin-unavailable — never a
+silent substitution. A launch is confirmed against the venue:
+when the channel answers and no job footprint exists, the run
+closes as failed with launch_lost set instead of claiming a run
+that does not exist.
 Job manifest: jobs/<name>/job.json (JSON: repo code parses it, so not YAML).
 --caller TAG (or the manifest's "caller" key, or $COLAB_CALLER)
 attributes the run to its thread: it rides the lease acquire and
@@ -74,6 +80,16 @@ TERMINAL_STATES = ("complete", "failed", "orphaned")
 # read budget (2 attempts x 45 s), so one classification costs a
 # bounded ~90 s worst case, never the standard ~370 s.
 POLL_FAILURE_BOUND = 3
+# A launched job's footprint (its launcher log, opened by the
+# stamp wrapper at spawn) exists from the launch instant; total
+# absence of footprint this long after the launch exec is a
+# launch that never landed, not a slow start.
+LAUNCH_ABSENCE_GRACE_S = 600
+# A record still in "running" (the pre-confirmation state) this
+# long after its start, with no fresher evidence, had its
+# launcher die mid-launch: live launchers pass through the state
+# in minutes (launch exec + one confirmation read, both bounded).
+STALE_RUNNING_S = 1200
 
 # E6: the file channel's measured single-file reliability ceiling
 # (AGENTS.md, file channel) — a declared output larger than this
@@ -106,24 +122,48 @@ def upload_one(session: str, src: Path, dest_name: str, tag: str) -> str | None:
     through a probe exec in the session's working directory,
     the reader's own model. Returns an error string, or None
     on a verified landing."""
+    # Every outcome is journaled as launch-channel health
+    # (sync/lease/health.py): adoption ranks sessions by it.
+    # Every call is timeout-guarded: colab() re-raises
+    # TimeoutExpired by design, and an unguarded timeout here
+    # killed the launcher by exception and stranded the run's
+    # record (2026-11-11: five consecutive consol launches died
+    # at this probe) — a timeout is an upload failure with an
+    # error string, never a dead launcher.
     if src.stat().st_size > UPLOAD_CHUNK_THRESHOLD_BYTES:
         up = transfer.chunked_upload(session, src, dest_name)
+        lease.append_launch_outcome(REPO, session, "upload", bool(up["ok"]), dest_name)
         if not up["ok"]:
             return f"chunked upload failed: {json.dumps(up)[:300]}"
         return None
-    r = colab("upload", "-s", session, str(src), f"/content/{dest_name}", timeout=600)
+    try:
+        r = colab("upload", "-s", session, str(src), f"/content/{dest_name}", timeout=600)
+    except subprocess.TimeoutExpired:
+        lease.append_launch_outcome(REPO, session, "upload", False, f"{dest_name}: upload timed out")
+        return f"upload timed out for {dest_name}"
     if r.returncode != 0:
+        lease.append_launch_outcome(REPO, session, "upload", False, dest_name)
         return f"upload failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}"
     probe = REPO / "var" / f"upload-probe-{tag}.py"
     probe.parent.mkdir(parents=True, exist_ok=True)
     probe.write_text(f"import os, json\np = {dest_name!r}\nprint(json.dumps({{'size': os.path.getsize(p) if os.path.exists(p) else None}}))\n")
-    pr = colab("exec", "-s", session, "--timeout", "120", "-f", str(probe), timeout=300)
+    # The timeout is env-tunable for the reason the poll loop's
+    # is: tests shrink it (COLAB_RUN_POLL_TIMEOUT_S precedent).
+    probe_timeout = int(os.environ.get("COLAB_RUN_PROBE_TIMEOUT_S", "300"))
+    try:
+        pr = colab("exec", "-s", session, "--timeout", "120", "-f", str(probe), timeout=probe_timeout)
+    except subprocess.TimeoutExpired:
+        lease.append_launch_outcome(REPO, session, "probe", False, f"{dest_name}: verify probe timed out")
+        return f"upload verify timed out for {dest_name}"
     try:
         size = json.loads(pr.stdout[pr.stdout.index("{"):])["size"]
     except (ValueError, KeyError):
+        lease.append_launch_outcome(REPO, session, "probe", False, dest_name)
         return f"upload verify unreadable for {dest_name}: {pr.stdout.strip()[-200:]}"
     if size != src.stat().st_size:
+        lease.append_launch_outcome(REPO, session, "probe", False, dest_name)
         return f"upload verify: {dest_name} landed at {size} bytes, expected {src.stat().st_size}"
+    lease.append_launch_outcome(REPO, session, "probe", True, dest_name)
     return None
 
 
@@ -221,7 +261,46 @@ def orphan_sweep() -> tuple[list[dict], bool]:
             if emit_terminal_event(rec):
                 save_record(rec)
             findings.append({"run_id": rec["run_id"], "job": rec["job"], "action": "marked orphaned; relaunch with --resume RUN_ID to continue from its remote run-id"})
+        elif rec.get("state") == "running" and rec.get("remote_out") and not rec.get("launch_confirmed_at"):
+            # Stale-running: the launcher died between stamping
+            # "running" and confirming the launch (a killed
+            # launcher — flap, signal — lands here even with the
+            # launch path's timeout guards). "running" is a
+            # minutes-long state for any live launcher, and an
+            # actively reconciled run keeps last_evidence_at
+            # fresh, so staleness on both clocks is a dead
+            # launcher, never live work. The remote_out gate is
+            # the discriminator: a launched record always carries
+            # it (stamped in the same save as "running"), while a
+            # registration-style record without one is co-tenancy
+            # evidence the sweep has never touched.
+            try:
+                started_age = (datetime.now(timezone.utc) - datetime.fromisoformat(rec["started_at"])).total_seconds()
+                evidence_age = (datetime.now(timezone.utc) - datetime.fromisoformat(rec["last_evidence_at"])).total_seconds() if rec.get("last_evidence_at") else None
+            except (KeyError, ValueError):
+                started_age, evidence_age = 0, None
+            if started_age > STALE_RUNNING_S and (evidence_age is None or evidence_age > STALE_RUNNING_S):
+                mark_terminal(rec, "failed", launch_lost=True, error=f"record still 'running' {int(started_age // 60)} min after start with no launch confirmation and no fresher evidence: the launcher died mid-launch; relaunch with --resume {rec['run_id']} to continue from its remote run-id")
+                findings.append({"run_id": rec["run_id"], "job": rec["job"], "action": "marked failed (launch-lost): stale 'running' record whose launcher died mid-launch; relaunch with --resume RUN_ID"})
     return findings, True
+
+
+def _absence_grace_s() -> int:
+    """The launch-absence grace: env-tunable for the reason the
+    poll timeout is (tests shrink it), defaulting to the
+    constant."""
+    return int(os.environ.get("COLAB_RUN_ABSENCE_GRACE_S", str(LAUNCH_ABSENCE_GRACE_S)))
+
+
+def _launch_age_s(rec: dict) -> float:
+    """Seconds since the launch exec fired (launch_at), falling
+    back to the run's start for records that predate the stamp.
+    Unparseable stamps read as 0 — an absence verdict never
+    fires on a clock it cannot read."""
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(rec.get("launch_at") or rec.get("started_at"))).total_seconds()
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def write_reader(run_id: str, remote_out: str, outputs: list) -> Path:
@@ -423,7 +502,12 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     exit_code = (reader_state.get("checkpoint") or {}).get("exit_code")
     if exit_code is None:
         exit_code = reader_state.get("exit_stamp")
-    usage_after = colab("usage", timeout=120).stdout.strip()
+    try:
+        usage_after = colab("usage", timeout=120).stdout.strip()
+    except subprocess.TimeoutExpired:
+        # Accounting context only: a usage read that times out
+        # must never strand a run at its finalize step.
+        usage_after = ""
     if exit_code not in (None, 0):
         mark_terminal(rec, "failed", finished_at=now(), error=f"job payload exited {exit_code}", pulled=pulled, usage_before=usage_before, usage_after=usage_after)
         return 1, {"run_id": rec["run_id"], "state": "failed", "error": rec["error"], "pulled": pulled}
@@ -483,12 +567,23 @@ def poll_run(run_id: str) -> int:
     rec["poll_failures"] = 0
     done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
     rec["last_checkpoint_units"] = done_units
+    rec["last_evidence_at"] = now()
     save_record(rec)
     if job.get("outputs"):
         pull_outputs(rec, job, session, remote_out, state)
         save_record(rec)
     log = state.get("heartbeat_tail") or []
     complete = any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None
+    if not complete and not state.get("job_pids") and not state.get("job_log_tail") and state.get("exit_stamp") is None and not state.get("checkpoint") and _launch_age_s(rec) > _absence_grace_s():
+        # Total absence past the grace bound: the launch never
+        # landed, and the record closes as launch-lost instead
+        # of reading "still running" forever (2026-11-11
+        # consol-featall: planted run.py, no out dir, no process,
+        # record "running" for hours).
+        mark_terminal(rec, "failed", launch_lost=True, error=f"no job footprint on {session} {_absence_grace_s()}s after launch: the launch never landed; relaunch with --resume {run_id} to retry")
+        close_out_lease(rec)
+        print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+        return 1
     if not complete and not state.get("job_pids") and state.get("job_log_tail"):
         # The launched process is gone with no completion signal:
         # the same death the poll loop fails on (see main).
@@ -600,7 +695,7 @@ def main() -> int:
     # as the job. (Job-first-only parsing read a leading --caller
     # as a job name; it bit a consumer following shorthand in a
     # message, 2026-11-05.)
-    resume = caller_flag = None
+    resume = caller_flag = session_flag = None
     seed_flag = detach_flag = False
     extra_args = []
     positional = []
@@ -624,11 +719,14 @@ def main() -> int:
         elif args[i] == "--caller" and i + 1 < len(args):
             caller_flag = args[i + 1]
             i += 2
+        elif args[i] == "--session" and i + 1 < len(args):
+            session_flag = args[i + 1]
+            i += 2
         else:
             positional.append(args[i])
             i += 1
     if not positional:
-        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [-- <job args>...]", file=sys.stderr)
+        print("usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [--session NAME] [-- <job args>...]", file=sys.stderr)
         return 2
     job_name = positional[0]
     manifest_path = REPO / "jobs" / job_name / "job.json"
@@ -645,6 +743,11 @@ def main() -> int:
         print(f"colab-run: {claim_err}", file=sys.stderr)
         return 2
     caller = lease.resolve_caller(REPO, flag=claim_raw, env=os.environ.get("COLAB_CALLER"))
+    # Session pin: flag over the env seam, mirroring the caller
+    # claim's precedence. A pin names the lease this run must
+    # adopt (acquire refuses pin-unavailable rather than
+    # substituting another session).
+    pin_session = session_flag if session_flag is not None else os.environ.get("COLAB_RUN_SESSION")
     if not TOKEN.exists() and not os.environ.get("COLAB_BIN"):
         print("colab-run: STAGED — no colab login yet. Run ops/bootstrap_local.sh, then the one-time login (see README).", file=sys.stderr)
         return 2
@@ -724,7 +827,11 @@ def main() -> int:
         seed_ctx = {"repo": seed_repo_id, "dest": seed_dest, "clone_url": seed_entry["clone_url"], "bundle_path": Path(seed_manifest["bundle"]), "manifest": seed_manifest}
         rec["bundle_seed"] = {"repo": seed_repo_id, "dest": seed_dest, "sha256": seed_manifest["sha256"], "bytes": seed_manifest["bytes"], "snapshot_commit": seed_manifest["snapshot_commit"], "tree": seed_manifest["tree"]}
         save_record(rec)
-    usage_before = colab("usage", timeout=120).stdout.strip()
+    try:
+        usage_before = colab("usage", timeout=120).stdout.strip()
+    except subprocess.TimeoutExpired:
+        # Accounting context only — never a dead launcher.
+        usage_before = ""
     # Lease model (sync/lease/): adopt-or-acquire the shared session and
     # leave it up at the end; the reaper owns its lifecycle. With the lease
     # disabled in config, fall back to the original per-job session.
@@ -738,10 +845,19 @@ def main() -> int:
         save_record(rec)
         print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
         return 2
+    if pin_session and not use_lease:
+        # A pin names a lease; the fallback's per-run session is
+        # run-named, so there is nothing to pin to.
+        rec.update(state="failed", error="--session requires the lease path (lease.enabled); the fallback per-job session is run-named")
+        save_record(rec)
+        print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+        return 2
     session = run_id  # the lease-disabled fallback's per-run session
     if use_lease:
-        got = lease.acquire(colab, REPO, shape_id, via="runner", caller=caller)
-        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused", "unknown-shape"):
+        if pin_session:
+            rec["session_pin"] = pin_session
+        got = lease.acquire(colab, REPO, shape_id, via="runner", caller=caller, prefer_session=pin_session)
+        if got["action"] in ("refused-budget", "create-failed", "shape-refused", "shape-mismatch", "caller-start-refused", "unknown-shape", "pin-unavailable"):
             rec.update(state="failed", error=json.dumps(got)[:300])
             save_record(rec)
             # E1: if live sessions sit unrecorded at this shape,
@@ -753,6 +869,12 @@ def main() -> int:
             print(json.dumps({"run_id": run_id, "state": "failed", "lease": got}, indent=2))
             return 1
         rec["lease_action"] = got["action"]
+        if got.get("health_degraded"):
+            # Adopted anyway (every candidate was degraded):
+            # the record says the launch channel has been
+            # failing on this session, so a launch failure here
+            # reads as a known condition, not a surprise.
+            rec["health_degraded"] = True
         # The lease's session is whatever the acquire created or
         # adopted — a generated name, never a configured one.
         session = got["record"]["session"]
@@ -847,12 +969,21 @@ def main() -> int:
                 f"r = subprocess.run(['python3','apply_bundle_remote.py','{seed_ctx['bundle_path'].name}','{seed_ctx['dest']}','--origin-url','{seed_ctx['clone_url']}'], capture_output=True, text=True)\n"
                 "print(r.stdout); print(r.stderr[-500:])\n"
             )
-            sr = colab("exec", "-s", session, "--timeout", "1800", "-f", str(seed_remote), timeout=1900)
-            if '"applied": true' not in sr.stdout or seed_ctx["manifest"]["tree"] not in sr.stdout:
-                rec.update(state="failed", error=f"bundle seed: seed did not verify: {sr.stdout.strip()[-300:]}")
+            try:
+                sr = colab("exec", "-s", session, "--timeout", "1800", "-f", str(seed_remote), timeout=1900)
+                seed_out = sr.stdout
+            except subprocess.TimeoutExpired:
+                # A seed timeout is a failed seed (the verify
+                # below cannot pass on no output), never a dead
+                # launcher stranding the record at "starting".
+                seed_out = ""
+                lease.append_launch_outcome(REPO, session, "seed", False, "seed exec timed out")
+            if '"applied": true' not in seed_out or seed_ctx["manifest"]["tree"] not in seed_out:
+                rec.update(state="failed", error=f"bundle seed: seed did not verify: {seed_out.strip()[-300:]}")
                 save_record(rec)
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
+            lease.append_launch_outcome(REPO, session, "seed", True, seed_ctx["dest"])
             seeded = True
         # Relative to the session working dir (/content on a real Colab VM;
         # the fake CLI's sandbox root under test) so the same code runs both.
@@ -880,10 +1011,70 @@ def main() -> int:
         launcher = REPO / "var" / f"launch-{run_id}.py"
         launcher.parent.mkdir(parents=True, exist_ok=True)
         launcher.write_text(launch + "\nprint('launched')\n")
-        colab("exec", "-s", session, "--timeout", "120", "-f", str(launcher), timeout=300)
-        rec["state"] = "polling"
+        rec["launch_at"] = now()
         save_record(rec)
+        # The launch exec's outcome is CHECKED, and the launch is
+        # then confirmed against the venue before the record may
+        # claim polling. Until this existed the exec's result was
+        # ignored entirely — and its timeout re-raised through
+        # the launcher — so a launch that never landed (the
+        # daemon's exec lost under kernel saturation) left a
+        # record claiming a run that did not exist, forever
+        # (2026-11-11 consol records). The stamp wrapper opens
+        # the job's log at spawn, so a landed launch has a
+        # footprint (pids, log, checkpoint, or exit stamp) on
+        # the first reader pass; total absence is a lost launch.
+        launch_error = None
+        launch_timeout = int(os.environ.get("COLAB_RUN_LAUNCH_TIMEOUT_S", "300"))
+        try:
+            lr = colab("exec", "-s", session, "--timeout", "120", "-f", str(launcher), timeout=launch_timeout)
+            if lr.returncode != 0 or "launched" not in lr.stdout:
+                launch_error = f"launch exec rc {lr.returncode}: {(lr.stderr or lr.stdout).strip()[-200:]}"
+        except subprocess.TimeoutExpired:
+            launch_error = "launch exec timed out"
+        lease.append_launch_outcome(REPO, session, "launch", launch_error is None, launch_error or run_id)
         reader = write_reader(run_id, remote_out, job.get("outputs", []))
+        # The confirmation is a reader pass and shares the poll
+        # timeout's discipline (a test that shrinks poll timeouts
+        # shrinks this one too), capped at 120 s so a wedged
+        # channel cannot hold the launcher for a full poll bound.
+        confirm_timeout = int(os.environ.get("COLAB_RUN_CONFIRM_TIMEOUT_S") or min(int(os.environ.get("COLAB_RUN_POLL_TIMEOUT_S", "300")), 120))
+        cstate, _confirm_error = read_reader(session, reader, confirm_timeout)
+        footprint = bool(cstate) and bool(cstate.get("job_pids") or cstate.get("exit_stamp") is not None or cstate.get("job_log_tail") or cstate.get("checkpoint"))
+        if footprint:
+            rec["state"] = "polling"
+            rec["launch_confirmed_at"] = now()
+            rec["last_evidence_at"] = rec["launch_confirmed_at"]
+            save_record(rec)
+        elif cstate is not None:
+            # The channel answered and there is no footprint:
+            # the launch is lost, and the record closes honestly
+            # now instead of claiming a run that does not exist.
+            mark_terminal(rec, "failed", launch_lost=True, error=f"launch never landed on {session} ({launch_error or 'no job footprint on the confirmation read'}); relaunch with --resume {run_id} to retry")
+            print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+            return 1
+        elif launch_error is None:
+            # The venue accepted the launch (the exec printed
+            # 'launched') but the confirmation read produced no
+            # evidence — the refusing channel is the unknown, and
+            # an accepted launch reads polling as it always has,
+            # stamped unconfirmed with the failed read noted as
+            # poll evidence. Reconciles confirm it, or close it
+            # past the absence grace if nothing ever lands.
+            rec["state"] = "polling"
+            rec["launch_unconfirmed_at"] = now()
+            rec["last_poll_error"] = _confirm_error
+            save_record(rec)
+        else:
+            # The launch exec itself failed AND the confirmation
+            # read is unreadable: nothing is known, and the
+            # record stays in the pre-polling "running" state,
+            # stamped unconfirmed — polls reconcile it if the
+            # job exists, and the sweep's stale-running rule
+            # closes it if nothing ever confirms.
+            rec["launch_unconfirmed_at"] = now()
+            rec["last_poll_error"] = _confirm_error
+            save_record(rec)
         if detach_flag:
             # E5: launch exactly as the foreground form, write
             # the record, return. usage_before is stamped now —
@@ -923,6 +1114,7 @@ def main() -> int:
                 continue
             done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
             rec["last_checkpoint_units"] = done_units
+            rec["last_evidence_at"] = now()
             rec["poll_failures"] = 0
             save_record(rec)
             if job.get("outputs"):
@@ -931,6 +1123,14 @@ def main() -> int:
             log = state.get("heartbeat_tail") or []
             if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None:
                 break
+            if not state.get("job_pids") and not state.get("job_log_tail") and state.get("exit_stamp") is None and not state.get("checkpoint") and _launch_age_s(rec) > _absence_grace_s():
+                # Total absence past the grace bound: no process,
+                # no log, no checkpoint, no stamp — the launch
+                # never landed (the confirmation read's one pass
+                # can race a slow kernel; a grace of polls cannot).
+                mark_terminal(rec, "failed", launch_lost=True, error=f"no job footprint on {session} {_absence_grace_s()}s after launch: the launch never landed; relaunch with --resume {run_id} to retry")
+                print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
+                return 1
             if not state.get("job_pids") and state.get("job_log_tail"):
                 # The launched process is gone and its launcher log
                 # is all that exists: the job died before producing
