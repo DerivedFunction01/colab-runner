@@ -40,7 +40,7 @@ RESULT = ROOT / "result.json"
 
 def require_colab_vm() -> None:
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from _remote_guard import require_colab
 
         require_colab("broker_probe")

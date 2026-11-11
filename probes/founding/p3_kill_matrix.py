@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from _driver import colab, colab_bin, download, record, require_login, stop_session, upload, REPO
 
 SESSION = "probe"
@@ -76,14 +76,14 @@ def launch(pattern: str, units: int, unit_seconds: float, cli_timeout: int | Non
     elif pattern == "run":
         cmd = [colab_bin(), "--auth", "oauth2", "run", "-s", SESSION, snippet, "--out", JOB, "--units", str(units), "--unit-seconds", str(unit_seconds), "--seed", "km"]
     else:  # detached: short exec starts nohup, returns immediately
-        launcher = REPO / "snippets" / "launch_detached.py"
-        r = colab("exec", "-s", SESSION, "--timeout", "120", "-f", str(launcher), timeout=300)
+        launcher = REPO / "snippets" / "kill_matrix_kit.py"
+        r = colab("exec", "-s", SESSION, "--timeout", "120", "--env", "KM_KIT_MODE=launch", "-f", str(launcher), timeout=300)
         return subprocess.Popen(["true"])  # already detached remotely; nothing local to kill
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 def run_cell(pattern: str, kill: str, units: int, unit_seconds: float, wait: int) -> dict:
-    colab("exec", "-s", SESSION, "--timeout", "60", "-f", str(REPO / "snippets" / "reset_dir.py"), timeout=120)
+    colab("exec", "-s", SESSION, "--timeout", "60", "--env", "KM_KIT_MODE=reset", "-f", str(REPO / "snippets" / "kill_matrix_kit.py"), timeout=120)
     cli_timeout = 20 if kill == "timeout" else None
     proc = launch(pattern, units, unit_seconds, cli_timeout)
     time.sleep(unit_seconds * 1.5)

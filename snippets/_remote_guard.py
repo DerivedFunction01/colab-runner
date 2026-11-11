@@ -24,7 +24,7 @@ def require_colab(name: str) -> bool:
         print(
             f"{name}: REFUSED — this is a Colab-only limit probe and no Colab runtime "
             "marker was found (no COLAB_* env, no /content). Run it via the probe "
-            "driver (probes/p3_oom_lowtier.py) on a Colab session, never locally.",
+            "driver (probes/founding/p3_oom_lowtier.py) on a Colab session, never locally.",
             file=sys.stderr,
         )
         raise SystemExit(2)

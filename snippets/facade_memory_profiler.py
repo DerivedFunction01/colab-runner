@@ -2,20 +2,24 @@
 
 One file, two lives: launched by system python3 it re-execs itself under
 the repo venv interpreter, then profiles in that dedicated process.
-Follows the colab-run harness contract: progress to <out>/heartbeat.log,
-completion is <out>/checkpoint.json with completed_units=1 plus a final
-heartbeat line containing "complete".
+Follows the colab-run harness contract (implemented once in
+job_harness.py): progress to <out>/heartbeat.log, completion is
+<out>/checkpoint.json with completed_units=1 plus a final heartbeat
+line containing "complete".
 Outputs: profile-report.json (all measurements), profile.log.
 """
 
 from __future__ import annotations
 
-import argparse
 import gc
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import job_harness
 
 def _resolve_profile_repo():
     """Resolve (repo_dir, venv_python) for the profiled clone.
@@ -122,20 +126,15 @@ def _component_of(filename: str) -> str:
 
 def main() -> int:
     argv = [a for a in sys.argv[1:] if a != "--bootstrapped"]
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out", required=True)
+    parser = job_harness.job_parser()
     parser.add_argument("--stream-iters", type=int, default=300)
     parser.add_argument("--folders", nargs="*", default=None,
                         help="Subset of sp100 folders for phases A/B/D.")
     args = parser.parse_args(argv)
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    heartbeat = out / "heartbeat.log"
     log_path = out / "profile.log"
-
-    def beat(message: str) -> None:
-        with heartbeat.open("a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+    beat = partial(job_harness.beat, out)
 
     def log(message: str) -> None:
         line = f"{time.strftime('%H:%M:%S')} {message}"
@@ -463,8 +462,7 @@ def main() -> int:
 
     (out / "profile-report.json").write_text(
         json.dumps(report, indent=1) + "\n", encoding="utf-8")
-    (out / "checkpoint.json").write_text(
-        json.dumps({"completed_units": 1, "rc": rc}) + "\n", encoding="utf-8")
+    job_harness.write_checkpoint(out, rc)
     beat(f"profiler exited rc={rc}")
     beat("memory profile complete")
     return rc

@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from _driver import colab, download, record, require_login, stop_session, upload, REPO
 
 SESSION = "probe-low"
@@ -78,7 +78,7 @@ def main() -> int:
         data["ramp"] = run_detached(SESSION, "memory_ramp.py", "ramp.log", poll_s=600, done_marker="survived_ramp")
         # Post-ramp survival: a fresh, short-timeout kernel call and a status read.
         try:
-            alive = colab("exec", "-s", SESSION, "-f", str(REPO / "snippets" / "alive_check.py"), timeout=120)
+            alive = colab("exec", "-s", SESSION, "--env", "KM_KIT_MODE=alive", "-f", str(REPO / "snippets" / "kill_matrix_kit.py"), timeout=120)
             data["kernel_alive_after_ramp"] = "session-reusable" in alive.stdout
         except Exception as e:  # noqa: BLE001
             data["kernel_alive_after_ramp"] = False
@@ -89,7 +89,7 @@ def main() -> int:
             data["status_after_ramp_error"] = f"{type(e).__name__}: {e}"
         data["bert"] = run_detached(SESSION, "bert_batch_ramp.py", "bert.log", poll_s=1500, done_marker="ceiling_batch")
         try:
-            alive = colab("exec", "-s", SESSION, "-f", str(REPO / "snippets" / "alive_check.py"), timeout=120)
+            alive = colab("exec", "-s", SESSION, "--env", "KM_KIT_MODE=alive", "-f", str(REPO / "snippets" / "kill_matrix_kit.py"), timeout=120)
             data["session_reusable"] = "session-reusable" in alive.stdout
         except Exception as e:  # noqa: BLE001
             data["session_reusable"] = False
