@@ -38,16 +38,21 @@ class ScriptedRun:
     install walks the scripted outcomes, marking the missing
     set installed on a success."""
 
-    def __init__(self, install_outcomes):
+    def __init__(self, install_outcomes, plain_candidates=True):
         self.calls = []
         self.installed = set(payload.PACKAGES) - set(MISSING)
         self.install_outcomes = list(install_outcomes)
+        self.plain_candidates = plain_candidates
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
         if argv[0] == "dpkg-query":
             pkg = argv[-1]
             return cp(0, "install ok installed" if pkg in self.installed else "deinstall ok")
+        if argv[:2] == ["apt-cache", "policy"]:
+            pkg = argv[-1]
+            has = pkg.endswith("t64") or self.plain_candidates
+            return cp(0, f"{pkg}:\n  Installed: (none)\n  Candidate: {'1.0-1' if has else '(none)'}")
         if argv[:2] == ["apt-get", "update"]:
             return cp(0)
         if argv[:2] == ["apt-get", "install"]:
@@ -61,8 +66,8 @@ class ScriptedRun:
         return [c for c in self.calls if c[:2] == ["apt-get", verb]]
 
 
-def run_payload(tmp_path, monkeypatch, install_outcomes):
-    fake = ScriptedRun(install_outcomes)
+def run_payload(tmp_path, monkeypatch, install_outcomes, plain_candidates=True):
+    fake = ScriptedRun(install_outcomes, plain_candidates=plain_candidates)
     sleeps = []
     monkeypatch.setattr(payload.subprocess, "run", fake)
     monkeypatch.setattr(payload.time, "sleep", sleeps.append)
@@ -101,6 +106,18 @@ def test_non_lock_failure_does_not_retry(tmp_path, monkeypatch):
     assert "lock_contended" not in verdict
     assert verdict["install_attempts"] == 1
     assert sleeps == []
+
+
+def test_t64_only_distro_installs_the_t64_names(tmp_path, monkeypatch):
+    # Noble's shape: the plain names have no candidate at all;
+    # the install must name the t64 alternatives or it aborts
+    # atomically and installs nothing (ember specimen).
+    verdict, fake, _sleeps = run_payload(tmp_path, monkeypatch, [cp(0)], plain_candidates=False)
+    assert verdict["chromium"] == "installed"
+    assert verdict["install_names"] == [pkg + "t64" for pkg in MISSING]
+    install_argv = fake.apt_calls("install")[0]
+    assert "libasound2t64" in install_argv and "libasound2" not in install_argv
+    assert verdict["missing_after"] == []
 
 
 def test_nothing_missing_never_calls_apt(tmp_path, monkeypatch):

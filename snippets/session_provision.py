@@ -39,7 +39,9 @@ import time
 from pathlib import Path
 
 # The Debian package set Playwright's install-deps installs
-# for Chromium (the lane-proven cure), checked by dpkg state.
+# for Chromium (the lane-proven cure), as logical names —
+# _alternatives resolves each to the name this distro
+# actually carries (noble's t64 renames included).
 PACKAGES = [
     "libatk1.0-0",
     "libatk-bridge2.0-0",
@@ -77,16 +79,66 @@ def _is_lock_error(text: str) -> bool:
     return any(marker in (text or "") for marker in _LOCK_MARKERS)
 
 
+def _alternatives(pkg: str) -> list:
+    """The names a logical package may carry on this distro.
+    Ubuntu noble's t64 transition renamed part of the set
+    (libasound2 -> libasound2t64, libatk1.0-0 ->
+    libatk1.0-0t64, ...): the plain name has no installation
+    candidate there at all, and an install that names it
+    aborts atomically for the whole set (specimen: ember
+    r1794417373, 2026-11-11 — "Package 'libasound2' has no
+    installation candidate", nothing installed). A logical
+    package is satisfied by any alternative installed, and
+    installs under the first alternative that has a
+    candidate."""
+    return [pkg, pkg + "t64"]
+
+
+def _dpkg_installed(pkg: str) -> bool:
+    r = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", pkg],
+        capture_output=True, text=True,
+    )
+    return "install ok installed" in r.stdout
+
+
 def missing_packages() -> list:
-    missing = []
-    for pkg in PACKAGES:
-        r = subprocess.run(
-            ["dpkg-query", "-W", "-f=${Status}", pkg],
-            capture_output=True, text=True,
-        )
-        if "install ok installed" not in r.stdout:
-            missing.append(pkg)
-    return missing
+    return [pkg for pkg in PACKAGES if not any(_dpkg_installed(alt) for alt in _alternatives(pkg))]
+
+
+def _has_candidate(pkg: str) -> bool:
+    r = subprocess.run(["apt-cache", "policy", pkg], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Candidate:"):
+            return line.split(":", 1)[1].strip() not in ("", "(none)")
+    return False
+
+
+def _install_name(pkg: str) -> str:
+    for alt in _alternatives(pkg):
+        if _has_candidate(alt):
+            return alt
+    return pkg
+
+
+def _run_apt(argv: list, timeout: int):
+    """One apt verb with the lock stance: apt waits on the
+    dpkg lock (the -o option in argv), and a lock failure
+    still retries a bounded number of times. Returns
+    (result, attempts)."""
+    result = None
+    attempts = 0
+    while attempts < INSTALL_ATTEMPTS:
+        attempts += 1
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            break
+        if attempts < INSTALL_ATTEMPTS and _is_lock_error(result.stderr or result.stdout):
+            time.sleep(LOCK_RETRY_SLEEP_S)
+            continue
+        break
+    return result, attempts
 
 
 def main() -> int:
@@ -101,29 +153,22 @@ def main() -> int:
         verdict["chromium"] = "ok"
     else:
         lock_opt = f"DPkg::Lock::Timeout={LOCK_TIMEOUT_S}"
-        update = subprocess.run(
-            ["apt-get", "update", "-qq", "-o", lock_opt], capture_output=True, text=True, timeout=600
+        update, update_attempts = _run_apt(
+            ["apt-get", "update", "-qq", "-o", lock_opt], timeout=600)
+        if update.returncode != 0:
+            verdict["update_rc"] = update.returncode
+            verdict["update_attempts"] = update_attempts
+            verdict["update_error"] = (update.stderr or update.stdout).strip()[-300:]
+        install_names = [_install_name(pkg) for pkg in missing]
+        verdict["install_names"] = install_names
+        install, attempts = _run_apt(
+            ["apt-get", "install", "-y", "-qq", "-o", lock_opt, *install_names],
+            timeout=1200,
         )
-        install = None
-        attempts = 0
-        while attempts < INSTALL_ATTEMPTS:
-            attempts += 1
-            install = subprocess.run(
-                ["apt-get", "install", "-y", "-qq", "-o", lock_opt, *missing],
-                capture_output=True, text=True, timeout=1200,
-            )
-            if install.returncode == 0:
-                break
-            if attempts < INSTALL_ATTEMPTS and _is_lock_error(install.stderr or install.stdout):
-                time.sleep(LOCK_RETRY_SLEEP_S)
-                continue
-            break
         still = missing_packages()
         verdict["missing_after"] = still
         verdict["install_rc"] = install.returncode
         verdict["install_attempts"] = attempts
-        if update.returncode != 0:
-            verdict["update_rc"] = update.returncode
         verdict["chromium"] = "installed" if not still else "failed"
         if still:
             verdict["error"] = (install.stderr or install.stdout).strip()[-300:]
