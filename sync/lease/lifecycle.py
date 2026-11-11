@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, callers, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, health
+from . import foundation, catalog, callers, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, health, provisioning
 
 def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False, create: bool = False, prefer_session: str | None = None) -> dict:
     """Adopt a live lease at this shape or create one. The only
@@ -159,6 +159,13 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         fresh, _age = keepalive.keepalive_fresh(colab, repo, session)
         ka = {"keepalive": "ok"} if fresh else keepalive.ensure_keepalive(colab, repo, session)
         out = {"action": "adopted", "record": rec, **ka}
+        # First registration of this session in the fleet (no
+        # stamp on file): fire the provisioning ensure beside
+        # the keepalive. Later adoptions read the stamp inside
+        # ensure and no-op (or retry a failed attempt past its
+        # window) — the ensure is per-session-lifetime.
+        if not provisioning.read_stamp(repo, session):
+            out.update(provisioning.ensure_provisioning(colab, repo, session))
         if health_map.get(session, {}).get("degraded"):
             out["health_degraded"] = True
         if caller and rec.get("caller") not in (None, caller):
@@ -235,6 +242,7 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         rec["renew"] = True
     records.save_record(repo, rec)
     ka = keepalive.ensure_keepalive(colab, repo, session)
+    prov = provisioning.ensure_provisioning(colab, repo, session)
     pulse_result = keepalive.kernel_pulse(colab, repo, session)
     rec["last_pulse_at"] = now_dt.isoformat()
     rec["last_pulse_result"] = pulse_result
@@ -242,7 +250,7 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     host_changed = keepalive._capture_session_host(repo, rec, "acquire", spool_on_first=True)
     if host_changed:
         records.save_record(repo, rec)
-    out = {"action": "created", "record": rec, "pulse": pulse_result, **ka}
+    out = {"action": "created", "record": rec, "pulse": pulse_result, **ka, **prov}
     if host_changed:
         out["host_changed"] = True
         out["host"] = rec["host"]

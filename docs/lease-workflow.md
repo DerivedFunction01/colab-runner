@@ -341,6 +341,25 @@ executing. The idle path releases a lease only past its idle
 threshold AND with an empty `jobs` list: registered jobs are
 protection, not activity bookkeeping.
 
+**Provisioning**: a fresh session image carries no Chromium
+runtime libraries, so browser (Playwright e2e) work fails at
+launch until the session is provisioned — and the provisioning
+dies with the session. At a session's first registration (a
+creation, or the first adoption with no stamp on file) the
+acquire path launches the provisioning ensure
+(`snippets/session_provision.py`) detached beside the
+keepalive launch: the payload checks the Chromium dependency
+package set, installs what is missing, and writes its verdict
+to `/content/provision-verdict.json`. The stamp lives in a
+side file (`var/provision-<session>.json`) — never on the
+lease record, whose whole-record saves would race a detached
+writer — and the served status merges it as `provisioning`,
+reconciling a landed verdict on the read. A stamped-ok
+session is never re-provisioned; a failed attempt retries on
+a later acquire past its retry window; the ensure never
+blocks or fails an acquire. An e2e leg that fails at launch
+cites the stamp instead of reading as product or contention.
+
 **Auto-lease**: `config/lease.json`'s `auto_acquire.enabled`
 (default off) gates the auto duty. Demand is planted with
 `bin/colab-lease request` (writes `var/lease-request.json`); on

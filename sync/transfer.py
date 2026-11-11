@@ -37,6 +37,56 @@ PART_ATTEMPTS = 3
 PART_BACKOFF_S = 5
 REPO = Path(__file__).resolve().parent.parent
 
+# Launch-health journal (written by the runner's launch path,
+# sync/lease/health.py owns the shape): the trailing window and
+# failure cluster that mark a session degraded.
+HEALTH_WINDOW_MINUTES = 30
+HEALTH_FAILURE_CLUSTER = 2
+
+
+def _session_degraded(session: str) -> bool:
+    """Whether the launch-health journal marks this session
+    degraded right now, under the lease health module's rule
+    (most recent outcome in the trailing window a failure, or a
+    failure cluster since the last success). The journal is
+    evidence, not state: a missing or unreadable journal reads
+    as not degraded. Mirrored here rather than imported — the
+    transfer layer sits below the lease package."""
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        lines = (REPO / "var" / "launch-health.jsonl").read_text().splitlines()
+    except OSError:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=HEALTH_WINDOW_MINUTES)
+    last_ok = None
+    last_fail = None
+    fails_since_ok = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = _json.loads(line)
+            if entry.get("session") != session:
+                continue
+            at = datetime.fromisoformat(entry["ts"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if at < cutoff:
+            continue
+        if entry.get("ok"):
+            last_ok = entry["ts"]
+            fails_since_ok = 0
+        else:
+            last_fail = entry["ts"]
+            fails_since_ok += 1
+    return bool(
+        (last_fail and (last_ok is None or last_fail > last_ok))
+        or fails_since_ok >= HEALTH_FAILURE_CLUSTER
+    )
+
 
 def colab_bin() -> str:
     env_bin = os.environ.get("COLAB_BIN")
@@ -218,7 +268,16 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
             progress({"parts": len(metas), "parts_done": resumed + moved,
                       "resumed_parts": resumed, "moved_parts": moved})
 
-    remote_hashes = _remote_part_hashes(session, [m["name"] for m in metas], mkdir_dir=staging_dir)
+    # The part-hash probe is resume detection only — an
+    # optimization. On a session the launch journal already
+    # reads degraded, the probe contends with the part uploads
+    # for the same worst channel and its bounded stall is paid
+    # serially before any byte moves (the 2026-11-11 file-cap
+    # specimen: the verify leg timed out twice against
+    # byte-identical parts). Skip it there; every part uploads
+    # and the end-to-end hash still verifies.
+    probe_skipped = _session_degraded(session)
+    remote_hashes = {} if probe_skipped else _remote_part_hashes(session, [m["name"] for m in metas], mkdir_dir=staging_dir)
     resumed = uploaded = retried = 0
     emit(0, 0)
     for i, m in enumerate(metas):
@@ -273,7 +332,8 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
     _cleanup_parts(session, remote_name, staging_dir)
     return {"ok": True, "sha256": digest, "remote_sha256": got,
             "parts": len(metas), "resumed_parts": resumed,
-            "uploaded_parts": uploaded, "retried_parts": retried}
+            "uploaded_parts": uploaded, "retried_parts": retried,
+            "probe_skipped": probe_skipped}
 
 
 def chunked_download(session: str, remote_name: str, dest: Path, progress=None) -> dict:
