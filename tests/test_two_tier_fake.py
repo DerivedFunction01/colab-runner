@@ -4,59 +4,17 @@ grant + standing duty, the standing budget sub-cap, and the `state`
 read the UI renders.
 """
 
-import importlib.util
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-FAKE = REPO / "tests" / "fixtures" / "fake_colab.py"
 
-_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
-repo_fixture = importlib.util.module_from_spec(_fixture_spec)
-_fixture_spec.loader.exec_module(repo_fixture)
-
-
-def lease_env(tmp_path):
-    # Scratch HOME with a dummy token (see test_lease_fake.lease_env:
-    # the post-start shape assertion reads the binding under HOME).
-    home = tmp_path / "home"
-    token = home / ".config" / "colab-cli" / "token.json"
-    token.parent.mkdir(parents=True, exist_ok=True)
-    token.write_text('{"refresh_token": "fake-test-token"}')
-    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
-    # The CLI under test runs against a fixture repo (authored
-    # config in the test tree), never the checkout's operator one.
-    root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
-    return dict(
-        os.environ,
-        HOME=str(home),
-        TEST_REPO_ROOT=str(root),
-        COLAB_BIN=str(FAKE),
-        FAKE_COLAB_STATE=str(tmp_path / "fake"),
-        COLAB_RUNNER_VAR=str(tmp_path / "var"),
-        # Session shape gate: the suite's test actor claim (see
-        # test_lease_fake.lease_env); the standing-duty tests use
-        # standing_env instead, so standing admission rides the
-        # gate's infra exemption exactly as the hook runs it.
-        COLAB_LEASE_ACTOR="test",
-        KEEPALIVE_MAX_CYCLES="2",
-        KEEPALIVE_INTERVAL_SECONDS="0",
-        KEEPALIVE_ALLOW_NONCOLAB="1",
-    )
-
-
-def standing_env(tmp_path):
-    """lease_env without the test actor claim: the standing duty's
-    admission is the infra exemption (the infra actor + the
-    standing marker on the standing shape), never a bypass."""
-    env = lease_env(tmp_path)
-    env.pop("COLAB_LEASE_ACTOR", None)
-    return env
+sys.path.insert(0, str(REPO / "tests" / "fixtures"))
+import repo_fixture  # noqa: E402
+from env_fixtures import lease_env, standing_env  # noqa: E402, F401
 
 
 def run_lease(env, *args, expect_rc=0):

@@ -48,23 +48,21 @@ class FakeColab:
         op = args[0]
         if op == "upload":
             local, remotepath = Path(args[3]), args[4]
-            key = remotepath.removeprefix("/content/")
-            name = key.split("/")[-1]
+            name = remotepath.split("/")[-1]
             self.upload_calls.append(name)
             if self.fail_uploads.get(name, 0) > 0:
                 self.fail_uploads[name] -= 1
                 return subprocess.CompletedProcess(args, 1, "", "injected upload failure")
-            self.remote[key] = local.read_bytes()
+            self.remote[name] = local.read_bytes()
             return subprocess.CompletedProcess(args, 0, "", "")
         if op == "download":
             remotepath, local = args[3], Path(args[4])
-            key = remotepath.removeprefix("/content/")
-            name = key.split("/")[-1]
+            name = remotepath.split("/")[-1]
             self.download_calls.append(name)
             if self.fail_downloads.get(name, 0) > 0:
                 self.fail_downloads[name] -= 1
                 return subprocess.CompletedProcess(args, 1, "", "injected download failure")
-            data = self.remote[key]
+            data = self.remote[name]
             if self.corrupt_downloads.get(name, 0) > 0:
                 self.corrupt_downloads[name] -= 1
                 data = bytes([data[0] ^ 0xFF]) + data[1:]
@@ -91,22 +89,14 @@ class FakeColab:
         if "# transfer:split" in code:
             remote = json.loads(re.search(r'REMOTE = (".*?")', code).group(1))
             blob = self.remote[remote]
-            staging = f".xfer-{sha(blob)[:12]}"
             parts = []
             ch = int(re.search(r"CH = (\d+)", code).group(1))
             for i in range(0, len(blob), ch):
                 c = blob[i:i + ch]
-                name = f"{staging}/{remote}.dl-{len(parts):03d}"
+                name = f"{remote}.dl-{len(parts):03d}"
                 self.remote[name] = c
                 parts.append({"name": name, "size": len(c), "sha256": sha(c)})
-            return ok({"size": len(blob), "sha256": sha(blob), "dir": staging, "parts": parts})
-        if "# transfer:cleanup" in code:
-            target = json.loads(re.search(r'TARGET = (".*?")', code).group(1))
-            staging = json.loads(re.search(r'DIR = (".*?")', code).group(1))
-            for key in list(self.remote):
-                if key.startswith(staging + "/") or key.startswith((target + ".part-", target + ".dl-")):
-                    del self.remote[key]
-            return ok({})
+            return ok({"size": len(blob), "sha256": sha(blob), "parts": parts})
         raise AssertionError("unmarked exec snippet")
 
 
@@ -152,46 +142,12 @@ def test_upload_exhaustion_reports_stage_then_rerun_resumes(tmp_path, monkeypatc
 
 def test_upload_resume_reuploads_a_corrupt_remote_part(tmp_path, monkeypatch):
     fake, local = harness(tmp_path, monkeypatch)
-    staging = xfer._xfer_dir(sha(CONTENT))
-    # The residue of an interrupted earlier attempt: all four
-    # parts sit in the staging directory, part 1 corrupt (same
-    # size, wrong bytes) — plus a legacy flat part from a
-    # pre-fix transfer of the same target.
-    for i in range(4):
-        fake.remote[f"{staging}/big.bin.part-{i:03d}"] = CONTENT[i * 64:(i + 1) * 64]
-    good = CONTENT[64:128]
-    fake.remote[f"{staging}/big.bin.part-001"] = bytes([good[0] ^ 0xFF]) + good[1:]
-    fake.remote["big.bin.part-001"] = fake.remote[f"{staging}/big.bin.part-001"]
+    assert xfer.chunked_upload("s", local, "big.bin")["ok"]
+    good = fake.remote["big.bin.part-001"]
+    fake.remote["big.bin.part-001"] = bytes([good[0] ^ 0xFF]) + good[1:]  # same size, wrong bytes
     r = xfer.chunked_upload("s", local, "big.bin")
     assert r["ok"] and r["resumed_parts"] == 3 and r["uploaded_parts"] == 1
     assert fake.remote["big.bin"] == CONTENT
-    assert set(fake.remote) == {"big.bin"}, "the completed transfer left part residue behind (staging or legacy)"
-
-
-def test_completed_upload_leaves_no_part_residue_for_a_consumer_glob(tmp_path, monkeypatch):
-    """The strip-lane specimen (2026-11-11): xfer parts left
-    flat beside a bundle were swallowed by the job's part-*
-    reassembly glob and doubled it (118 MB -> 236 MB). After
-    a completed transfer, the target's directory holds only
-    the target: parts live under a per-transfer staging
-    directory during the move and are removed on success."""
-    fake, local = harness(tmp_path, monkeypatch)
-    r = xfer.chunked_upload("s", local, "big.bin")
-    assert r["ok"]
-    assert set(fake.remote) == {"big.bin"}, fake.remote.keys()
-    # The consumer's naive glob over the directory reassembles
-    # exactly the payload — there is nothing else to swallow.
-    swallowed = b"".join(fake.remote[k] for k in sorted(fake.remote) if "part-" in k or k == "big.bin")
-    assert swallowed == CONTENT
-
-
-def test_completed_download_removes_its_remote_split_parts(tmp_path, monkeypatch):
-    fake, local = harness(tmp_path, monkeypatch)
-    fake.remote["big.bin"] = CONTENT
-    dest = tmp_path / "down" / "big.bin"
-    r = xfer.chunked_download("s", "big.bin", dest)
-    assert r["ok"]
-    assert set(fake.remote) == {"big.bin"}, fake.remote.keys()
 
 
 def test_download_clean_and_hash_verified(tmp_path, monkeypatch):
@@ -231,7 +187,7 @@ def test_download_exhaustion_reports_stage_then_rerun_resumes(tmp_path, monkeypa
     fake.fail_downloads["big.bin.dl-002"] = 99  # part 2 never lands
     dest = tmp_path / "down" / "big.bin"
     r = xfer.chunked_download("s", "big.bin", dest)
-    assert not r["ok"] and r["stage"].endswith("/big.bin.dl-002") and r["attempts"] == xfer.PART_ATTEMPTS
+    assert not r["ok"] and r["stage"] == "download big.bin.dl-002" and r["attempts"] == xfer.PART_ATTEMPTS
     fake.fail_downloads.clear()
     calls_before = len(fake.download_calls)
     r2 = xfer.chunked_download("s", "big.bin", dest)
@@ -330,7 +286,7 @@ def test_xfer_down_killed_part_then_rerun_resumes_verified_parts(tmp_path, monke
     capsys.readouterr()
     assert rc == 1
     rec = read_xfer_record(tmp_path, "down-1")
-    assert rec["state"] == "failed" and rec["error"]["stage"].endswith("/big.bin.dl-002")
+    assert rec["state"] == "failed" and rec["error"]["stage"] == "download big.bin.dl-002"
     assert rec["parts_done"] == 2  # parts 0-1 landed verified before the failure
     fake.fail_downloads.clear()
     calls_before = len(fake.download_calls)

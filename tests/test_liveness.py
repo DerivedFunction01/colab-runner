@@ -9,21 +9,19 @@ fixture via the environment (the isolate-tests-from-live-
 state rule: nothing here may touch the real registry, the
 real binding, or the real gate state).
 """
-import importlib.util
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CHECKER = REPO / "bin" / "colab-liveness"
 
-_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
-repo_fixture = importlib.util.module_from_spec(_fixture_spec)
-_fixture_spec.loader.exec_module(repo_fixture)
+sys.path.insert(0, str(REPO / "tests" / "fixtures"))
+import env_fixtures  # noqa: E402
+import repo_fixture  # noqa: E402
 
 sys.path.insert(0, str(REPO / "sync"))
 import liveness_entry as le  # noqa: E402
@@ -186,30 +184,10 @@ def lease_cli_env(tmp_path):
     fake token, the fake CLI, a scratch var — plus the jobs
     seam pointed at a scratch registry so the lifecycle arms
     and disarms entries the test can inspect."""
-    home = tmp_path / "home"
-    token = home / ".config" / "colab-cli" / "token.json"
-    token.parent.mkdir(parents=True, exist_ok=True)
-    token.write_text('{"refresh_token": "fake-test-token"}')
-    (home / ".config" / "colab-cli" / "sessions.json").write_text("{}")
+    env = env_fixtures.lease_env(tmp_path)
     jobs = tmp_path / "jobs"
     jobs.mkdir()
-    # The lease CLI under test runs against a fixture repo
-    # (authored config in the test tree), never the checkout's
-    # operator one.
-    root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
-    env = dict(
-        os.environ,
-        HOME=str(home),
-        TEST_REPO_ROOT=str(root),
-        COLAB_BIN=str(REPO / "tests" / "fixtures" / "fake_colab.py"),
-        FAKE_COLAB_STATE=str(tmp_path / "fake"),
-        COLAB_RUNNER_VAR=str(tmp_path / "var"),
-        COLAB_LEASE_ACTOR="test",
-        KEEPALIVE_MAX_CYCLES="2",
-        KEEPALIVE_INTERVAL_SECONDS="0",
-        KEEPALIVE_ALLOW_NONCOLAB="1",
-        COLAB_LIVENESS_JOBS_DIR=str(jobs),
-    )
+    env["COLAB_LIVENESS_JOBS_DIR"] = str(jobs)
     return env, jobs
 
 

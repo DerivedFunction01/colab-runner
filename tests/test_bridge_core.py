@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sync import lease  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
+import repo_fixture  # noqa: E402
 SPEC = importlib.util.spec_from_file_location("bridge_agent", ROOT / "snippets" / "bridge_agent.py")
 agent_mod = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(agent_mod)
@@ -48,16 +50,7 @@ class Fake:
         return SimpleNamespace(returncode=1, stdout="", stderr="")
 
 
-def make_repo(tmp_path):
-    repo = tmp_path / "repo"
-    (repo / "config").mkdir(parents=True)
-    (repo / "var").mkdir(parents=True)
-    (repo / "snippets").mkdir(parents=True)
-    (repo / "config" / "lease.json").write_text(json.dumps({"enabled": True, "standing": {"caller": "standing", "shape": "cpu"}}))
-    (repo / "var" / "shape-rates.json").write_text(json.dumps({"cpu": 0.08, "cpu-highram": 0.26}))
-    for name in ("bridge_agent.py", "_remote_guard.py"):
-        (repo / "snippets" / name).write_text("# test stand-in\n")
-    return repo
+make_repo = repo_fixture.bridge_repo
 
 
 def seed_lobby(repo, now=NOW):

@@ -9,26 +9,19 @@ transition, and release. Time is injected (now_dt) throughout —
 no wall clock, no network.
 """
 
-import importlib.util
 import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-_spec = importlib.util.spec_from_file_location(
-    "lease_mod", REPO / "sync" / "lease" / "__init__.py",
-    submodule_search_locations=[str(REPO / "sync" / "lease")])
-lease_mod = importlib.util.module_from_spec(_spec)
-sys.modules["lease_mod"] = lease_mod
-_spec.loader.exec_module(lease_mod)
+sys.path.insert(0, str(REPO / "tests" / "fixtures"))
+import repo_fixture  # noqa: E402
+from module_loader import load_lease  # noqa: E402
 
-_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
-repo_fixture = importlib.util.module_from_spec(_fixture_spec)
-_fixture_spec.loader.exec_module(repo_fixture)
+lease_mod = load_lease("lease_mod")
 
 T0 = datetime(2026, 11, 8, 15, 0, tzinfo=timezone.utc)
 SESSION = "amber-otter-42"
@@ -39,9 +32,7 @@ def iso(dt):
 
 
 def repo(tmp_path, monkeypatch):
-    root = repo_fixture.scratch_repo(tmp_path)
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(root / "var"))
-    return root
+    return repo_fixture.lease_repo(tmp_path, monkeypatch)
 
 
 def save_lease_record(root, caller="alpha", jobs=()):

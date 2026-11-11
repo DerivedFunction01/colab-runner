@@ -7,7 +7,6 @@ right argv and append the right outbox events with increasing seq,
 and /api/outbox?after= filters without acknowledging.
 """
 
-import importlib.util
 import json
 import os
 import shutil
@@ -17,7 +16,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -26,9 +24,8 @@ REPO = Path(__file__).resolve().parent.parent
 STUB_SRC = REPO / "tests" / "fixtures" / "stub_lease_bin.py"
 SERVER = REPO / "ui" / "server.py"
 
-_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
-repo_fixture = importlib.util.module_from_spec(_fixture_spec)
-_fixture_spec.loader.exec_module(repo_fixture)
+sys.path.insert(0, str(REPO / "tests" / "fixtures"))
+import repo_fixture  # noqa: E402
 
 
 def free_port() -> int:

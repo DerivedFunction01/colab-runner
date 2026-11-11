@@ -10,27 +10,21 @@ only, burst extension is independent of the grant, direct standing
 extension is refused, and an expired grant refuses extension.
 """
 
-import importlib.util
 import json
 import subprocess
 from datetime import datetime, timezone
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 import sys
-spec = importlib.util.spec_from_file_location(
-    "lease", REPO / "sync" / "lease" / "__init__.py",
-    submodule_search_locations=[str(REPO / "sync" / "lease")])
-lease = importlib.util.module_from_spec(spec)
-sys.modules["lease"] = lease
-spec.loader.exec_module(lease)
+
+sys.path.insert(0, str(REPO / "tests" / "fixtures"))
+import repo_fixture  # noqa: E402
+from module_loader import load_lease  # noqa: E402
+
+lease = load_lease()
 
 import pytest
-
-_fixture_spec = importlib.util.spec_from_loader("repo_fixture", SourceFileLoader("repo_fixture", str(REPO / "tests" / "fixtures" / "repo_fixture.py")))
-repo_fixture = importlib.util.module_from_spec(_fixture_spec)
-_fixture_spec.loader.exec_module(repo_fixture)
 
 
 @pytest.fixture()
@@ -38,9 +32,7 @@ def repo(tmp_path, monkeypatch):
     """A scratch repo carrying the authored fixture config (see
     tests/fixtures/repo_fixture.py): the suite must pass in a
     bare clone, where the checkout has no operator config."""
-    root = repo_fixture.scratch_repo(tmp_path)
-    monkeypatch.setenv("COLAB_RUNNER_VAR", str(tmp_path / "var"))
-    return root
+    return repo_fixture.lease_repo(tmp_path, monkeypatch)
 
 
 @pytest.fixture(autouse=True)

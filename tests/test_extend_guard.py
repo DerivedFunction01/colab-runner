@@ -3,9 +3,10 @@ lapses (sync/extend_guard.py, driven by bin/colab-extend-guard
 on a scheduler cadence).
 
 In-process against the lease fake harness (scratch repo + fake
-CLI from test_lease_fake): a lease far from its deadline is left
-alone, a lease inside the threshold is extended by a full window
-through the core's extend(), a standing lease is skipped (its
+CLI, tests/test_lease_fake/fake_harness.py): a lease far from
+its deadline is left alone, a lease inside the threshold is
+extended by a full window through the core's extend(), a
+standing lease is skipped (its
 lifetime belongs to the grant), and a refusal surfaces as an
 exit-3 finding, episode-tracked so it speaks once.
 """
@@ -21,7 +22,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "sync"))
 import extend_guard as guard_mod  # noqa: E402
 
-spec = importlib.util.spec_from_loader("lease_fake_harness", SourceFileLoader("lease_fake_harness", str(REPO / "tests" / "test_lease_fake.py")))
+spec = importlib.util.spec_from_loader("lease_fake_harness", SourceFileLoader("lease_fake_harness", str(REPO / "tests" / "test_lease_fake" / "fake_harness.py")))
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 lease_mod = harness.lease_mod
