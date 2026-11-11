@@ -103,11 +103,51 @@ def _attempt(fn) -> tuple:
     return proc, PART_ATTEMPTS
 
 
-def _remote_part_hashes(session: str, names: list) -> dict:
+def _xfer_dir(digest: str) -> str:
+    """The per-transfer staging directory for one payload,
+    derived from its whole-file SHA-256: .xfer-<digest[:12]>.
+    Parts live under it, never flat beside the target — residue
+    from a completed transfer must be unable to poison a
+    consumer globbing the target's directory (2026-11-11: xfer
+    .part-000 chunks beside a bundle were swallowed by a job's
+    part-* reassembly glob and doubled it). The derivation is
+    content-keyed so both directions and any re-run agree on
+    the directory, which keeps resume working."""
+    return f".xfer-{digest[:12]}"
+
+
+def _cleanup_parts(session: str, target: str, staging_dir: str) -> None:
+    """Remove a completed transfer's staging directory and any
+    legacy flat parts for the same target. Best-effort: the
+    transfer has already verified end to end when this runs,
+    and a cleanup failure must not fail it — the residue it
+    leaves is inert under the staging directory (a failed
+    transfer keeps its parts: they are its resume state)."""
+    try:
+        _exec_file(session, (
+            "# transfer:cleanup\n"
+            "import glob, os, shutil\n"
+            "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
+            f"TARGET = {json.dumps(target)}\n"
+            f"DIR = {json.dumps(staging_dir)}\n"
+            "shutil.rmtree(os.path.join(BASE, DIR), ignore_errors=True)\n"
+            "for pat in (TARGET + '.part-*', TARGET + '.dl-*'):\n"
+            "    for p in glob.glob(os.path.join(BASE, pat)):\n"
+            "        os.unlink(p)\n"
+            "print('{}')\n"
+        ), timeout=240)
+    except Exception:
+        pass
+
+
+def _remote_part_hashes(session: str, names: list, mkdir_dir: str = "") -> dict:
     """SHA-256 of each named part already in /content ({} on any failure).
 
     A failed probe is not fatal: the caller just uploads everything,
-    and the end-to-end hash still gates the result.
+    and the end-to-end hash still gates the result. When
+    mkdir_dir is given, the script creates that staging
+    directory first — uploads into a directory that does not
+    exist fail on the far side.
     """
     names_json = json.dumps(names)
     # The generated scripts address session files through BASE:
@@ -127,6 +167,9 @@ def _remote_part_hashes(session: str, names: list) -> dict:
             "# transfer:part-hashes\n"
             "import hashlib, json, os\n"
             "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
+            f"MKDIR = {json.dumps(mkdir_dir)}\n"
+            "if MKDIR:\n"
+            "    os.makedirs(os.path.join(BASE, MKDIR), exist_ok=True)\n"
             f"NAMES = {names_json}\n"
             "out = {}\n"
             "for name in NAMES:\n"
@@ -159,6 +202,7 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
     """
     local = Path(local)
     digest = sha256_file(local)
+    staging_dir = _xfer_dir(digest)
     metas = []
     with open(local, "rb") as fh:
         i = 0
@@ -166,7 +210,7 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
             part = REPO / "var" / "chunks" / f"{remote_name}.part-{i:03d}"
             part.parent.mkdir(parents=True, exist_ok=True)
             part.write_bytes(chunk)
-            metas.append({"name": part.name, "path": part, "sha256": sha256_bytes(chunk)})
+            metas.append({"name": f"{staging_dir}/{part.name}", "path": part, "sha256": sha256_bytes(chunk)})
             i += 1
 
     def emit(resumed: int, moved: int) -> None:
@@ -174,7 +218,7 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
             progress({"parts": len(metas), "parts_done": resumed + moved,
                       "resumed_parts": resumed, "moved_parts": moved})
 
-    remote_hashes = _remote_part_hashes(session, [m["name"] for m in metas])
+    remote_hashes = _remote_part_hashes(session, [m["name"] for m in metas], mkdir_dir=staging_dir)
     resumed = uploaded = retried = 0
     emit(0, 0)
     for i, m in enumerate(metas):
@@ -223,6 +267,10 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
                 "parts": len(metas), "resumed_parts": resumed,
                 "uploaded_parts": uploaded, "retried_parts": retried,
                 "stderr": "" if r is None else (r.stderr or "")[-300:]}
+    # Verified end to end: the parts have done their work.
+    # Remove them (and any legacy flat residue for this target)
+    # so the target's directory holds only the target.
+    _cleanup_parts(session, remote_name, staging_dir)
     return {"ok": True, "sha256": digest, "remote_sha256": got,
             "parts": len(metas), "resumed_parts": resumed,
             "uploaded_parts": uploaded, "retried_parts": retried}
@@ -251,16 +299,23 @@ def chunked_download(session: str, remote_name: str, dest: Path, progress=None) 
         "size = os.path.getsize(path)\n"
         f"CH = {CHUNK}\n"
         "whole = hashlib.sha256()\n"
+        "with open(path, 'rb') as f:\n"
+        "    while c := f.read(1024*1024):\n"
+        "        whole.update(c)\n"
+        "digest = whole.hexdigest()\n"
+        "DIR = '.xfer-' + digest[:12]\n"
+        "os.makedirs(os.path.join(BASE, DIR), exist_ok=True)\n"
         "parts = []\n"
         "with open(path, 'rb') as f:\n"
         "    i = 0\n"
         "    while c := f.read(CH):\n"
-        "        name = REMOTE + '.dl-' + format(i, '03d')\n"
-        "        open(os.path.join(BASE, name), 'wb').write(c)\n"
-        "        whole.update(c)\n"
+        "        name = DIR + '/' + REMOTE + '.dl-' + format(i, '03d')\n"
+        "        dest = os.path.join(BASE, name)\n"
+        "        os.makedirs(os.path.dirname(dest), exist_ok=True)\n"
+        "        open(dest, 'wb').write(c)\n"
         "        parts.append({'name': name, 'size': len(c), 'sha256': hashlib.sha256(c).hexdigest()})\n"
         "        i += 1\n"
-        "print(json.dumps({'size': size, 'sha256': whole.hexdigest(), 'parts': parts}))\n"
+        "print(json.dumps({'size': size, 'sha256': digest, 'dir': DIR, 'parts': parts}))\n"
     )))
     if r is None:
         return {"ok": False, "stage": "remote split", "stdout": "", "stderr": "remote split exec timed out on every attempt"}
@@ -282,7 +337,7 @@ def chunked_download(session: str, remote_name: str, dest: Path, progress=None) 
     local_parts = []
     for meta in parts:
         name, want_sha = meta["name"], meta["sha256"]
-        tmp = REPO / "var" / "chunks" / name
+        tmp = REPO / "var" / "chunks" / Path(name).name
         tmp.parent.mkdir(parents=True, exist_ok=True)
         if tmp.exists() and tmp.stat().st_size == meta["size"] and sha256_file(tmp) == want_sha:
             resumed += 1
@@ -314,7 +369,14 @@ def chunked_download(session: str, remote_name: str, dest: Path, progress=None) 
             data = tmp.read_bytes()
             out.write(data)
             h.update(data)
-    return {"ok": h.hexdigest() == info["sha256"], "bytes": dest.stat().st_size,
+    ok = h.hexdigest() == info["sha256"]
+    if ok:
+        # Verified end to end: remove the split's staging
+        # directory (and any legacy flat residue for this
+        # target). A failed assembly keeps its remote parts —
+        # they are the resume state for the next attempt.
+        _cleanup_parts(session, remote_name, info.get("dir") or _xfer_dir(info["sha256"]))
+    return {"ok": ok, "bytes": dest.stat().st_size,
             "sha256": h.hexdigest(), "remote_sha256": info["sha256"],
             "parts": len(parts), "resumed_parts": resumed,
             "downloaded_parts": downloaded, "retried_parts": retried}
