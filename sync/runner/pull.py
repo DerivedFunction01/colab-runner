@@ -168,9 +168,23 @@ def misplaced_outputs(session: str, missing: list) -> list:
         return []
     if getattr(r, "returncode", 1) != 0:
         return []
-    try:
-        found = json.loads(r.stdout[r.stdout.index("["):])
-    except (ValueError, json.JSONDecodeError):
+    # The real CLI's exec stdout carries a preamble (its
+    # update-check notice opens with "[colab]"), so the probe's
+    # JSON is read as the last line that parses as a list —
+    # slicing from the first "[" reads the preamble and the
+    # naming silently comes back empty (2026-11-11 live
+    # specimen: both outputs present at /content, probe JSON
+    # in the output, record unnamed).
+    found = None
+    for line in reversed(r.stdout.splitlines()):
+        try:
+            parsed = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, list):
+            found = parsed
+            break
+    if found is None:
         return []
     wanted = set(missing)
     return [e for e in found if isinstance(e, dict) and e.get("name") in wanted]

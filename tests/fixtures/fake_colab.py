@@ -122,6 +122,13 @@ def main() -> int:
             shutil.copy2(f, local_f)
         extra = pos[1:] if cmd == "run" else []
         r = subprocess.run([sys.executable, str(local_f), *extra], cwd=root, capture_output=True, text=True)
+        if Path(f).name == "misplaced-probe.py":
+            # Production shape: the real CLI's exec stdout
+            # opens with its update-check preamble, whose
+            # first line starts with "[colab]" — a consumer
+            # slicing from the first "[" reads the preamble,
+            # not the payload (2026-11-11 live specimen).
+            sys.stdout.write("\n[colab] A new version of Colab CLI is available: 0.8.0 (current: 0.7.5)\n[colab] Run 'colab update' to update.\n\n")
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
         return r.returncode
