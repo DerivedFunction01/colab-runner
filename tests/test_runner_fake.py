@@ -915,3 +915,90 @@ def test_session_pin_adopts_the_named_lease_and_refuses_an_unknown_one(tmp_path)
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec["state"] == "failed" and "pin-unavailable" in rec["error"]
     assert not rec.get("session"), "a refused pin adopted a session anyway"
+
+
+def _write_starting_record(runs, run_id, session, started_at):
+    p = runs / f"{run_id}.json"
+    p.write_text(json.dumps({"run_id": run_id, "job": "smoke", "session": session, "caller": "test", "state": "starting", "started_at": started_at}))
+    return p
+
+
+def test_sweep_closes_a_stale_starting_record_and_spares_a_fresh_one(tmp_path):
+    """The sweep's "starting" class: a pre-launch record whose
+    freshest stamp (and file mtime — every pre-launch save
+    rewrites the file) is past the stale bound is a phantom
+    whose launcher died in the upload phase; it closes
+    launch-lost instead of reading as in-flight work forever
+    (2026-11-11: six steampower records sat in "starting" for
+    hours). A fresh "starting" record — a launch in progress —
+    is untouched."""
+    env = runner_env(tmp_path)
+    runs = runs_dir(env)
+    runs.mkdir(parents=True, exist_ok=True)
+    first = _fire_smoke(env)
+    session = json.loads((runs / f"{first['run_id']}.json").read_text())["session"]
+    stale = _write_starting_record(runs, "ghost-start", session, "2000-01-01T00:00:00+00:00")
+    os.utime(stale, (946684800, 946684800))
+    fresh = _write_starting_record(runs, "fresh-start", session, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    r = run_verb(env, "--sweep")
+    assert r.returncode == 0, r.stdout + r.stderr
+    rec = json.loads(stale.read_text())
+    assert rec["state"] == "failed" and rec.get("launch_lost"), rec
+    assert json.loads(fresh.read_text())["state"] == "starting"
+
+
+def test_sweep_orphans_a_starting_record_on_a_dead_session(tmp_path):
+    """A "starting" record bound to a session that no longer
+    exists shares the fate of its running/polling siblings:
+    orphaned by the same sweep, resumable by --resume."""
+    env = runner_env(tmp_path)
+    runs = runs_dir(env)
+    runs.mkdir(parents=True, exist_ok=True)
+    _fire_smoke(env)
+    p = _write_starting_record(runs, "dead-start", "no-such-session-xyz", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    r = run_verb(env, "--sweep")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(p.read_text())["state"] == "orphaned"
+
+
+def install_partial_job(env, name):
+    """A bare job (install_bare_job's shape) that writes only
+    one of its two declared outputs and exits 0."""
+    root = Path(env["TEST_REPO_ROOT"])
+    jobs_dir = root / "jobs"
+    if jobs_dir.is_symlink():
+        jobs_dir.unlink()
+    job_dir = jobs_dir / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "payload.py").write_text(
+        "import argparse, sys\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "a = ap.parse_args()\n"
+        "out = Path(a.out)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'present.txt').write_text('here\\n')\n"
+        "sys.exit(0)\n"
+    )
+    manifest = {"name": name, "script": f"jobs/{name}/payload.py", "args": [], "outputs": ["present.txt", "absent.txt"], "shape": "cpu-highram", "checkpoint_pull_seconds": 1, "timeout": 180}
+    (job_dir / "job.json").write_text(json.dumps(manifest))
+    return job_dir
+
+
+def test_finalize_reports_declared_outputs_that_never_arrived(tmp_path):
+    """Declared-vs-pulled accounting (the pull-gap): a payload
+    that exits 0 without writing one of its declared outputs
+    still completes — the exit code is the outcome truth — but
+    the shortfall is recorded on the run and returned in the
+    result, never a silent short pull."""
+    env = runner_env(tmp_path)
+    install_partial_job(env, "partial")
+    r = subprocess.run([sys.executable, str(run_bin(env)), "partial"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    assert out.get("missing_outputs") == ["absent.txt"], out
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec.get("missing_outputs") == ["absent.txt"]
+    assert [e["path"] for e in rec["pulled"]] == ["present.txt"]

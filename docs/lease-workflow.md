@@ -112,11 +112,25 @@ The runner's own lifecycle verbs ride the same record:
   stranding the record. `launch_confirmed_at` and
   `last_evidence_at` on the record are the liveness evidence
   supervision reads.
+- The sweep also reconciles the pre-launch state: a
+  `starting` record bound to a dead session is orphaned like
+  its running siblings, and one whose freshest stamp (or file
+  mtime — every pre-launch save rewrites the file) is over
+  two hours old closes `failed` with `launch_lost` set — the
+  bound clears the worst legitimate pre-launch hold (one
+  wedged upload call plus its surrounding phases). A resume
+  of a run that already launched keeps the record's launched
+  state; only its own launch re-stamps it.
 - Pulls are change-detected: the reader payload reports each
   declared output's size/mtime and unchanged outputs are
   skipped; outputs over the 50 MB single-file ceiling move via
   the chunked transfer. Every output a run lands is recorded
-  in the record's `pulled` list with its route.
+  in the record's `pulled` list with its route, and finalize
+  reconciles the pull against the manifest: a declared output
+  that never arrived is named in the record's
+  `missing_outputs` and in the run's result — the payload's
+  exit code stays the outcome truth, but a short pull is
+  never silent.
 
 Jobs are shape-addressed, not session-pinned: acquire picks
 the shape's shared session, whichever one is live. A job whose
