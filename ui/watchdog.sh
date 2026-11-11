@@ -15,7 +15,7 @@
 # a trickling body cannot stretch it (5); a loaded unit that
 # does not answer is restarted, not merely started (6);
 # poll-verified ladder with the pre-systemd start as the last
-# rung (8); suite coverage in tests/test_ui_supervision.py (11).
+# rung (8); suite coverage in tests/ui/test_ui_supervision.py (11).
 #
 # Why this exists: the server was started by ui.sh under nohup with
 # no supervision. Runtime deployments replace this VM (PID 1
