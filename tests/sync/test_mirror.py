@@ -24,7 +24,7 @@ def test_capture_restore_and_newer_canonical_wins(tmp_path):
     token = home / ".config" / "colab-cli" / "token.json"
     token.parent.mkdir(parents=True)
     token.write_text('{"refresh_token": "v1-0123456789abcdef0123456789"}')
-    mirror_token = REPO / "state" / "transient" / "colab-cli" / "token.json"
+    mirror_token = home / "state" / "transient" / "colab-cli" / "token.json"
     backup = mirror_token.read_bytes() if mirror_token.exists() else None
     try:
         assert report_for(run_mirror("capture", home), "colab-token")["capture"] == "captured"
@@ -53,7 +53,7 @@ STUB_TOKEN = '{"refresh_token": "stub15chars000"}'
 def _token_paths(home):
     canonical = home / ".config" / "colab-cli" / "token.json"
     canonical.parent.mkdir(parents=True, exist_ok=True)
-    mirror = REPO / "state" / "transient" / "colab-cli" / "token.json"
+    mirror = home / "state" / "transient" / "colab-cli" / "token.json"
     return canonical, mirror
 
 
