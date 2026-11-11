@@ -114,3 +114,14 @@ def test_reconcile_without_a_verdict_keeps_the_attempt_stamp(repo):
     stub = StubColab(verdict=None)
     stamp = provisioning.reconcile_provisioning(stub, repo, "sess-6")
     assert stamp.get("state") == "launched" and "chromium" not in stamp
+
+
+def test_disabled_config_short_circuits_the_ensure(repo):
+    cfg_path = repo / "config" / "lease.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["provisioning"] = {"enabled": False}
+    cfg_path.write_text(json.dumps(cfg))
+    stub = StubColab()
+    assert provisioning.ensure_provisioning(stub, repo, "sess-7") == {"provisioning": "disabled"}
+    assert stub.calls == [], "a disabled ensure touched the channel"
+    assert provisioning.read_stamp(repo, "sess-7") == {}, "a disabled ensure stamped an attempt"

@@ -159,13 +159,16 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         fresh, _age = keepalive.keepalive_fresh(colab, repo, session)
         ka = {"keepalive": "ok"} if fresh else keepalive.ensure_keepalive(colab, repo, session)
         out = {"action": "adopted", "record": rec, **ka}
-        # First registration of this session in the fleet (no
-        # stamp on file): fire the provisioning ensure beside
-        # the keepalive. Later adoptions read the stamp inside
-        # ensure and no-op (or retry a failed attempt past its
-        # window) — the ensure is per-session-lifetime.
-        if not provisioning.read_stamp(repo, session):
-            out.update(provisioning.ensure_provisioning(colab, repo, session))
+        # The provisioning ensure is per-session-lifetime and
+        # reads the stamp itself: a verdict-ok stamp no-ops, an
+        # attempt inside its retry window reads pending, and a
+        # failed attempt past its window retries here. The call
+        # must stay unconditional — an earlier no-stamp guard
+        # at this site made the retry unreachable for any
+        # registered session, so a first failed stamp was
+        # terminal for the session's life (specimen: ember
+        # r1794417373's lock-contended failure, 2026-11-11).
+        out.update(provisioning.ensure_provisioning(colab, repo, session))
         if health_map.get(session, {}).get("degraded"):
             out["health_degraded"] = True
         if caller and rec.get("caller") not in (None, caller):
@@ -515,6 +518,10 @@ def adopt_orphan(colab, repo: Path, session: str, deadline=None, hours: float | 
         if kit.get("kit") == "installed":
             rec["kit"] = "installed"
             records.save_record(repo, rec)
+    # An orphan's adoption is a first registration too: fire
+    # the provisioning ensure beside it (the ensure reads the
+    # stamp itself and no-ops, pends, or retries as it decides).
+    out.update(provisioning.ensure_provisioning(colab, repo, session))
     return out
 
 

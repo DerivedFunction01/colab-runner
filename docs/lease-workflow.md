@@ -344,21 +344,30 @@ protection, not activity bookkeeping.
 **Provisioning**: a fresh session image carries no Chromium
 runtime libraries, so browser (Playwright e2e) work fails at
 launch until the session is provisioned — and the provisioning
-dies with the session. At a session's first registration (a
-creation, or the first adoption with no stamp on file) the
-acquire path launches the provisioning ensure
-(`snippets/session_provision.py`) detached beside the
-keepalive launch: the payload checks the Chromium dependency
-package set, installs what is missing, and writes its verdict
-to `/content/provision-verdict.json`. The stamp lives in a
-side file (`var/provision-<session>.json`) — never on the
-lease record, whose whole-record saves would race a detached
-writer — and the served status merges it as `provisioning`,
-reconciling a landed verdict on the read. A stamped-ok
-session is never re-provisioned; a failed attempt retries on
-a later acquire past its retry window; the ensure never
-blocks or fails an acquire. An e2e leg that fails at launch
-cites the stamp instead of reading as product or contention.
+dies with the session. Every registration path — creation,
+acquisition-adoption, orphan adoption — fires the
+provisioning ensure (`snippets/session_provision.py`)
+detached beside the keepalive launch, and the ensure decides
+from the session's stamp: the payload checks the Chromium
+dependency package set, installs what is missing, and writes
+its verdict to `/content/provision-verdict.json`. The stamp
+lives in a side file (`var/provision-<session>.json`) — never
+on the lease record, whose whole-record saves would race a
+detached writer — and the served status merges it as
+`provisioning`, reconciling a landed verdict on the read. A
+stamped-ok session is never re-provisioned; a failed attempt
+retries on a later registration past its retry window; the
+ensure never blocks or fails an acquire. Inside the payload,
+the apt calls wait on the dpkg frontend lock and a lock
+failure retries a bounded number of times before a verdict
+may call itself failed — a fresh runtime's first minutes
+often have another apt-get running, and a verdict that still
+fails on the lock says so (`lock_contended`) instead of
+reading as a package failure. The lease config's
+`provisioning.enabled` (default on) is the off switch for an
+environment where the payload must not run. An e2e leg that
+fails at launch cites the stamp instead of reading as product
+or contention.
 
 **Auto-lease**: `config/lease.json`'s `auto_acquire.enabled`
 (default off) gates the auto duty. Demand is planted with

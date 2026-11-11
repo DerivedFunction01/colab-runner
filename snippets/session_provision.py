@@ -18,6 +18,17 @@ machinery reads the verdict back and stamps it on the session
 record, so a later launch failure can cite provisioning
 instead of masquerading as a product or contention failure.
 
+A fresh runtime is a busy place: something else (a lane's
+interim install-deps, an env build) often holds the dpkg
+frontend lock in the same minutes. The apt calls therefore
+wait on the lock (DPkg::Lock::Timeout) and a lock failure
+retries a bounded number of times before the verdict may
+call itself failed; a verdict that still fails on the lock
+says so (lock_contended) instead of reading as a package
+failure (specimen: ember r1794417373, 2026-11-11 — install
+rc 100, frontend lock held by a concurrent apt-get, missing
+set unchanged).
+
 Usage: session_provision.py --out VERDICT.json
 """
 
@@ -49,6 +60,23 @@ PACKAGES = [
 ]
 
 
+# apt waits this long for the dpkg frontend lock before
+# failing; a lock failure past the wait still retries below.
+LOCK_TIMEOUT_S = 180
+INSTALL_ATTEMPTS = 3
+LOCK_RETRY_SLEEP_S = 20
+
+_LOCK_MARKERS = (
+    "Could not get lock",
+    "Unable to acquire the dpkg frontend lock",
+    "dpkg frontend lock",
+)
+
+
+def _is_lock_error(text: str) -> bool:
+    return any(marker in (text or "") for marker in _LOCK_MARKERS)
+
+
 def missing_packages() -> list:
     missing = []
     for pkg in PACKAGES:
@@ -72,21 +100,35 @@ def main() -> int:
     if not missing:
         verdict["chromium"] = "ok"
     else:
+        lock_opt = f"DPkg::Lock::Timeout={LOCK_TIMEOUT_S}"
         update = subprocess.run(
-            ["apt-get", "update", "-qq"], capture_output=True, text=True, timeout=600
+            ["apt-get", "update", "-qq", "-o", lock_opt], capture_output=True, text=True, timeout=600
         )
-        install = subprocess.run(
-            ["apt-get", "install", "-y", "-qq", *missing],
-            capture_output=True, text=True, timeout=1200,
-        )
+        install = None
+        attempts = 0
+        while attempts < INSTALL_ATTEMPTS:
+            attempts += 1
+            install = subprocess.run(
+                ["apt-get", "install", "-y", "-qq", "-o", lock_opt, *missing],
+                capture_output=True, text=True, timeout=1200,
+            )
+            if install.returncode == 0:
+                break
+            if attempts < INSTALL_ATTEMPTS and _is_lock_error(install.stderr or install.stdout):
+                time.sleep(LOCK_RETRY_SLEEP_S)
+                continue
+            break
         still = missing_packages()
         verdict["missing_after"] = still
         verdict["install_rc"] = install.returncode
+        verdict["install_attempts"] = attempts
         if update.returncode != 0:
             verdict["update_rc"] = update.returncode
         verdict["chromium"] = "installed" if not still else "failed"
         if still:
             verdict["error"] = (install.stderr or install.stdout).strip()[-300:]
+            if _is_lock_error(verdict["error"]):
+                verdict["lock_contended"] = True
     Path(args.out).write_text(json.dumps(verdict))
     print(json.dumps(verdict))
     return 0

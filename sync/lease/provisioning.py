@@ -43,6 +43,16 @@ RETRY_AFTER_S = 1800
 REMOTE_VERDICT = "/content/provision-verdict.json"
 
 
+def _enabled(repo: Path) -> bool:
+    """Provisioning is on unless the lease config's
+    provisioning block explicitly disables it — the seam a
+    fixture or an operator uses to keep the ensure (and its
+    in-session payload) out of an environment where the
+    payload must not run."""
+    block = foundation.load_config(repo).get("provisioning")
+    return not (isinstance(block, dict) and block.get("enabled") is False)
+
+
 def _stamp_path(repo: Path, session: str) -> Path:
     return foundation.var_dir(repo) / f"provision-{session}.json"
 
@@ -79,10 +89,14 @@ def ensure_provisioning(colab, repo: Path, session: str) -> dict:
     {"provisioning": "ok"} when a verdict already reads ok or
     installed, {"provisioning": "launched"} when this call
     fired the ensure, {"provisioning": "pending"} when an
-    attempt is in flight inside its retry window, and
+    attempt is in flight inside its retry window,
+    {"provisioning": "disabled"} when the lease config
+    disables provisioning, and
     {"provisioning": "launch-failed", ...} when the launch
     itself failed (the acquire proceeds regardless).
     """
+    if not _enabled(repo):
+        return {"provisioning": "disabled"}
     stamp = read_stamp(repo, session)
     if stamp.get("chromium") in ("ok", "installed"):
         return {"provisioning": stamp["chromium"]}

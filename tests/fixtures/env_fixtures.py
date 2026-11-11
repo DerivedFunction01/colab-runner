@@ -9,6 +9,7 @@ test at a fixture repo from repo_fixture (authored config in
 the test tree) — never the checkout's operator config.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -34,6 +35,24 @@ def _scratch_home(tmp_path):
     return home
 
 
+def _disable_provisioning(root):
+    # The fake colab CLI executes exec'd scripts for real in
+    # its sandbox, so a provisioning ensure fired inside a CLI
+    # suite would run the payload against the host image's
+    # real dpkg — mutating the machine the suite runs on and,
+    # once the payload learned to wait out the dpkg lock,
+    # starving wall-clock cadence tests (2026-11-11 gate
+    # specimen: a dozen parked payloads, checkpoint-pull test
+    # starved). The subprocess suites therefore disable
+    # provisioning in their authored fixture config; the
+    # ensure's own logic stays pinned by the in-process unit
+    # suites, whose stub colab never executes anything.
+    cfg_path = Path(root) / "config" / "lease.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["provisioning"] = {"enabled": False}
+    cfg_path.write_text(json.dumps(cfg, sort_keys=True, separators=(",", ":")))
+
+
 def lease_env(tmp_path):
     home = _scratch_home(tmp_path)
     # The CLI under test runs against a fixture repo (authored
@@ -41,6 +60,7 @@ def lease_env(tmp_path):
     # root from its own location, so the checkout's untracked
     # operator config must never be the config it reads.
     root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
+    _disable_provisioning(root)
     return dict(
         os.environ,
         HOME=str(home),
@@ -75,6 +95,7 @@ def auto_env(tmp_path, enabled):
     # The CLI under test runs against a fixture repo (authored
     # config in the test tree), never the checkout's operator one.
     root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
+    _disable_provisioning(root)
     return dict(
         os.environ,
         HOME=str(home),
@@ -111,4 +132,5 @@ def runner_env(tmp_path, **extra):
     # from its own location, so its lease reads and its run records
     # land in the fixture, never the checkout.
     root = repo_fixture.cli_repo(tmp_path / "repo", tmp_path / "var")
+    _disable_provisioning(root)
     return dict(os.environ, HOME=str(home), TEST_REPO_ROOT=str(root), COLAB_BIN=str(FAKE), FAKE_COLAB_STATE=str(tmp_path / "fake"), COLAB_RUNNER_VAR=str(tmp_path / "var"), **FAKE_ENV_KEEPALIVE, **FAKE_ENV_GATE, **extra)
