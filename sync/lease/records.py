@@ -209,6 +209,29 @@ def detached_backing(repo: Path, det_id: str) -> tuple[dict | None, bool]:
     return (rec if isinstance(rec, dict) else None), path.exists()
 
 
+def detached_activity(repo: Path, session: str) -> str | None:
+    """The newest activity stamp among the session's detached
+    records (results/detached/): a record's activity is its
+    finished_at when it has one, else its started_at. None
+    when the session has no detached records. This is the
+    evidence the served last-use line folds in (state.status):
+    detached shell work is session use even though no lease
+    path stamps the lease record for it — the panel read cozy
+    as unused since 15:55Z while a detached probe ran there
+    from 15:58Z (2026-11-11)."""
+    latest = None
+    detached = repo / "results" / "detached"
+    if detached.is_dir():
+        for path in sorted(detached.glob("*.json")):
+            det = foundation.load_json(path, None)
+            if not isinstance(det, dict) or det.get("session") != session:
+                continue
+            stamp = det.get("finished_at") or det.get("started_at")
+            if isinstance(stamp, str) and (latest is None or stamp > latest):
+                latest = stamp
+    return latest
+
+
 def job_entry(repo: Path, job_id: str) -> dict | None:
     """One registration resolved against its backing record:
     {id, kind, state, started_at} while the backing record

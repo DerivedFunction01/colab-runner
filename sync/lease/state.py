@@ -5,7 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, gate as _mod_gate, sessions, records as _mod_records, spend as _mod_spend, access, keepalive, grants, orphans, bridge, syncclaims, provisioning
+from . import foundation, catalog, gate as _mod_gate, sessions, records as _mod_records, spend as _mod_spend, access, keepalive, grants, orphans, bridge, syncclaims, provisioning, identity, reconcile
 
 _extend_guard_spec = _ilu.spec_from_file_location("colab_extend_guard", Path(__file__).resolve().parent.parent / "extend_guard.py")
 extend_guard = _ilu.module_from_spec(_extend_guard_spec)
@@ -23,7 +23,23 @@ def status(colab, repo: Path, session: str | None = None) -> dict:
     # the write); the projection rides a copy.
     served = dict(rec)
     served["jobs"] = [entry["id"] for entry in _mod_records.live_jobs(repo, rec)]
-    out = {"action": "active" if sessions.session_alive(colab, rec["session"]) else "recorded-but-dead", "record": served}
+    # Last use folds in detached activity: a detached shell
+    # job stamps its own record (results/detached/), never
+    # the lease record, so the record's last_used_at alone
+    # reads a session as idle while detached work runs on
+    # it. The served value widens; the stored record is
+    # untouched (a read never writes the record).
+    detached_at = _mod_records.detached_activity(repo, rec["session"])
+    if detached_at and (not served.get("last_used_at") or detached_at > served["last_used_at"]):
+        served["last_used_at"] = detached_at
+    verdict = sessions.session_state(colab, rec["session"])
+    out = {"action": "active" if verdict == "alive" else "recorded-but-dead", "record": served}
+    if verdict == "absent":
+        # A live record whose session the channel reads
+        # absent is a records-vs-channel disagreement:
+        # journal it as evidence (an unreadable list —
+        # "unknown" — never journals; unknown is not absent).
+        reconcile.journal_disagreement(repo, rec["session"], "record-no-session", "record-live", "absent", "state")
     # The session's live sync claim rides the status read (the
     # panel renders holder + expiry from here); a lapsed claim
     # serves as None — honest absence, never a stale holder.
@@ -35,6 +51,12 @@ def status(colab, repo: Path, session: str | None = None) -> dict:
     # contention; no stamp serves as None.
     stamp = provisioning.reconcile_provisioning(colab, repo, rec["session"]) if out["action"] == "active" else provisioning.read_stamp(repo, rec["session"])
     out["provisioning"] = stamp or None
+    # The session's runtime identity rides the status read
+    # the same way (its stamp lives in a side file; the reap
+    # cycle keeps it current): which runtime the lease is
+    # talking to, and — after a replacement — when it changed
+    # and what it replaced. No stamp serves as None.
+    out["runtime"] = identity.read_stamp(repo, rec["session"]) or None
     if out["action"] == "active" and foundation.load_config(repo).get("keepalive", {}).get("enabled"):
         age = keepalive.heartbeat_age(colab, repo, rec["session"])
         out["keepalive_heartbeat_age_s"] = round(age, 1) if age is not None else None
@@ -348,6 +370,12 @@ def state_orphans(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         if not name or name in recorded or name.startswith("bridge-"):
             continue
         out.append(orphans.derive_orphan(repo, entry))
+        # The census is a records-vs-channel disagreement
+        # made visible; journal it as evidence too (the
+        # journal throttles a standing orphan to one line
+        # per window, so the panel's poll cadence cannot
+        # flood it).
+        reconcile.journal_disagreement(repo, name, "live-no-record", "no-record", "live", "state", now_dt=now_dt)
     return {"orphans": out}
 
 

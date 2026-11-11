@@ -99,7 +99,13 @@ The runner's own lifecycle verbs ride the same record:
   the stamp wrapper opens the log at spawn). A footprint
   stamps `launch_confirmed_at`; when the channel answers and
   no footprint exists, the run closes `failed` with
-  `launch_lost` set. When the confirmation read itself can
+  `launch_lost` set. The confirmation save also clears any
+  prior attempt's `launch_lost` / `error` (a resumed run
+  carries them as history; a record never reads confirmed
+  and lost at once) and stamps the session's measured shape
+  (`measured_shape`: the reader probe's nproc, MemTotal, and
+  cgroup limits) — sizing reads the machine that ran the
+  job, not the lease's declared shape. When the confirmation read itself can
   produce no evidence, the record carries `launch_unconfirmed_at`
   (polling if the venue accepted the launch, `running` if its
   exec also failed) and reconciles decide: the same
@@ -368,6 +374,39 @@ reading as a package failure. The lease config's
 environment where the payload must not run. An e2e leg that
 fails at launch cites the stamp instead of reading as product
 or contention.
+
+**Runtime identity**: a session's runtime can be replaced
+under its lease name (a platform recycle, a renewal-adjacent
+swap), erasing everything the name held. Each live lease
+carries a runtime identity — the binding's host endpoint
+plus a boot identity (the runtime's
+`/proc/sys/kernel/random/boot_id`, else a boot epoch derived
+from its uptime) — captured at first registration into a
+side file (`var/identity-<session>.json`, the provisioning
+stamp's pattern) and re-probed on the reap cycle. A
+confirmed change re-stamps with the previous identity
+preserved on the stamp; when registered jobs or
+non-terminal run records name the session, a
+`runtime-replaced` event spools for the outbox naming the
+work at risk — the replacement surfaces instead of the
+keepalive silently healing onto the new runtime. An
+unreadable probe is unknown, never a verdict. The served
+status merges the stamp as `runtime`.
+
+**Reconciliation evidence**: when the local record set and
+the channel's session list disagree — a session live with
+no lease record, or a live record whose session the channel
+reads absent — the disagreement lands as a journal line in
+`var/reconcile-journal.jsonl` carrying the session, both
+readings, the producing surface, and the timestamp (the
+lease state reads and colab-sh's orphan advisory produce
+them; a standing disagreement journals at most once per
+hour per reading-pair, a changed reading at once). The
+panel's per-session last-use line also folds in detached
+activity: the newest stamp across the session's detached
+records (`results/detached/`) counts as use, so detached
+shell work is visible as session use even though no lease
+path stamps the record for it.
 
 **Auto-lease**: `config/lease.json`'s `auto_acquire.enabled`
 (default off) gates the auto duty. Demand is planted with

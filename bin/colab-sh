@@ -205,6 +205,10 @@ def orphan_advisory(session: str) -> None:
                 f"it sits outside lease governance; adopt it with: bin/colab-lease adopt {session}",
                 file=sys.stderr,
             )
+            # The disagreement is evidence, not just a note:
+            # journal it (the lease core throttles a standing
+            # orphan to one line per window).
+            _lease_module().reconcile.journal_disagreement(REPO, session, "live-no-record", "no-record", "live", "colab-sh")
     except Exception:  # noqa: BLE001
         pass
 

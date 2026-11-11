@@ -47,11 +47,14 @@ def _launch_age_s(rec: dict) -> float:
 def write_reader(run_id: str, remote_out: str, outputs: list) -> Path:
     """The per-run reader payload: checkpoint, heartbeat tail,
     launcher log tail, payload pids — plus each declared output's
-    size/mtime, the change evidence pull_outputs skips on (E6)."""
+    size/mtime, the change evidence pull_outputs skips on (E6),
+    and the machine block (nproc, MemTotal, cgroup limits) the
+    launch confirmation stamps on the run record as its
+    measured shape."""
     reader = REPO / "var" / f"read-{run_id}.py"
     reader.parent.mkdir(parents=True, exist_ok=True)
     reader.write_text(
-        "import json, subprocess\n"
+        "import json, os, subprocess\n"
         "from pathlib import Path\n"
         f"d = Path({remote_out!r})\n"
         "ck = d / 'checkpoint.json'\n"
@@ -69,6 +72,34 @@ def write_reader(run_id: str, remote_out: str, outputs: list) -> Path:
         "        return int(p.read_text().strip())\n"
         "    except (OSError, ValueError):\n"
         "        return None\n"
+        "def _mem_total():\n"
+        "    try:\n"
+        "        for ln in Path('/proc/meminfo').read_text().splitlines():\n"
+        "            if ln.startswith('MemTotal:'):\n"
+        "                return int(ln.split()[1]) * 1024\n"
+        "    except (OSError, ValueError, IndexError):\n"
+        "        pass\n"
+        "    return None\n"
+        "def _cg_int(p):\n"
+        "    try:\n"
+        "        n = int(Path(p).read_text().strip())\n"
+        "        return n if 0 <= n < 2**60 else None\n"
+        "    except (OSError, ValueError):\n"
+        "        return None\n"
+        "def _mem_limit():\n"
+        "    v = _cg_int('/sys/fs/cgroup/memory.max')\n"
+        "    return v if v is not None else _cg_int('/sys/fs/cgroup/memory/memory.limit_in_bytes')\n"
+        "def _cpu_limit():\n"
+        "    try:\n"
+        "        parts = Path('/sys/fs/cgroup/cpu.max').read_text().split()\n"
+        "        if len(parts) == 2 and parts[0] != 'max':\n"
+        "            return int(parts[0]) / int(parts[1])\n"
+        "    except (OSError, ValueError, ZeroDivisionError):\n"
+        "        pass\n"
+        "    q = _cg_int('/sys/fs/cgroup/cpu/cpu.cfs_quota_us')\n"
+        "    p = _cg_int('/sys/fs/cgroup/cpu/cpu.cfs_period_us')\n"
+        "    return q / p if q and p else None\n"
+        "machine = {'nproc': os.cpu_count(), 'mem_total_bytes': _mem_total(), 'mem_limit_bytes': _mem_limit(), 'cpu_limit': _cpu_limit()}\n"
         f"ecode = Path({remote_out + '.exit-code'!r})\n"
         "out = {'checkpoint': json.loads(ck.read_text()) if ck.exists() else None,\n"
         "       'heartbeat_tail': log.read_text().strip().split('\\n')[-3:] if log.exists() else [],\n"
@@ -76,6 +107,7 @@ def write_reader(run_id: str, remote_out: str, outputs: list) -> Path:
         "       'exit_stamp': _ecode(ecode),\n"
         f"       'job_pids': subprocess.run(['pgrep','-f',{remote_out!r}], capture_output=True, text=True).stdout.split(),\n"
         "       'heartbeat_pids': subprocess.run(['pgrep','-f','heartbeat_job'], capture_output=True, text=True).stdout.split(),\n"
+        "       'machine': machine,\n"
         "       'outputs': {n: _stat(d / n) for n in names}}\n"
         "print(json.dumps(out))\n"
     )

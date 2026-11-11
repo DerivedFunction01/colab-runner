@@ -424,6 +424,20 @@ def main() -> int:
             rec["state"] = "polling"
             rec["launch_confirmed_at"] = now()
             rec["last_evidence_at"] = rec["launch_confirmed_at"]
+            # A confirmed launch is this attempt's truth: a
+            # prior attempt's launch_lost / error (a resume
+            # carries both on the record) die in this same
+            # save — a record must never read confirmed and
+            # lost at once (2026-11-11 record-truth item).
+            rec.pop("launch_lost", None)
+            rec.pop("error", None)
+            # The machine that actually runs the job, from
+            # the confirmation reader's own probe (cgroup-
+            # aware): sizing reads the measured shape, not
+            # the lease's declared one.
+            machine = cstate.get("machine")
+            if isinstance(machine, dict):
+                rec["measured_shape"] = {**machine, "at": rec["launch_confirmed_at"]}
             save_record(rec)
         elif cstate is not None:
             # The channel answered and there is no footprint:

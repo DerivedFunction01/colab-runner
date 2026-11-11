@@ -3,7 +3,7 @@ import fcntl
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, sessions, records, spend, access, keepalive, grants, renewal, lifecycle
+from . import foundation, sessions, records, spend, access, keepalive, grants, renewal, lifecycle, identity
 
 def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, now_dt: datetime) -> dict:
     """One record's reap: the pre-two-tier reap logic (hard deadline,
@@ -57,6 +57,17 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
     out = {"action": "kept", "session": rec["session"], "deadline": rec["deadline"], "jobs": [entry["id"] for entry in live]}
     if renewal_failed:
         out["renewal"] = "failed"
+    # Runtime identity, on this pass's cadence: a runtime
+    # replaced under this lease's name surfaces here (the
+    # check spools the event and re-stamps; an unreadable
+    # probe is unknown, never a verdict). Only a confirmed
+    # replacement rides the result — the notable-outcome
+    # precedent of the renewal flag above.
+    ident = identity.check_identity(colab, repo, rec, now_dt)
+    if ident.get("identity") == "replaced":
+        out["runtime_identity"] = "replaced"
+        out["runtime_jobs"] = ident.get("jobs", [])
+        out["runtime_runs"] = ident.get("runs", [])
     if cfg.get("keepalive", {}).get("enabled"):
         fresh, age = keepalive.keepalive_fresh(colab, repo, rec["session"])
         if fresh:

@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, callers, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, health, provisioning
+from . import foundation, catalog, callers, gate, sessions, records, spend, access, keepalive, grants, orphans, renewal, health, provisioning, identity
 
 def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, hours: float | None = None, max_hours_cap: float | None = None, via: str | None = None, caller: str | None = None, duty: bool = False, standing: bool = False, create: bool = False, prefer_session: str | None = None) -> dict:
     """Adopt a live lease at this shape or create one. The only
@@ -169,6 +169,12 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         # terminal for the session's life (specimen: ember
         # r1794417373's lock-contended failure, 2026-11-11).
         out.update(provisioning.ensure_provisioning(colab, repo, session))
+        # The same first-registration moment captures the
+        # runtime identity (a no-op once a stamp carries one):
+        # the baseline the reap cycle's replacement check
+        # compares against.
+        if not identity.read_stamp(repo, session):
+            out.update(identity.ensure_identity(colab, repo, session, "adopted"))
         if health_map.get(session, {}).get("degraded"):
             out["health_degraded"] = True
         if caller and rec.get("caller") not in (None, caller):
@@ -246,6 +252,7 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     records.save_record(repo, rec)
     ka = keepalive.ensure_keepalive(colab, repo, session)
     prov = provisioning.ensure_provisioning(colab, repo, session)
+    ident = identity.ensure_identity(colab, repo, session, "acquire")
     pulse_result = keepalive.kernel_pulse(colab, repo, session)
     rec["last_pulse_at"] = now_dt.isoformat()
     rec["last_pulse_result"] = pulse_result
@@ -253,7 +260,7 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
     host_changed = keepalive._capture_session_host(repo, rec, "acquire", spool_on_first=True)
     if host_changed:
         records.save_record(repo, rec)
-    out = {"action": "created", "record": rec, "pulse": pulse_result, **ka, **prov}
+    out = {"action": "created", "record": rec, "pulse": pulse_result, **ka, **prov, **ident}
     if host_changed:
         out["host_changed"] = True
         out["host"] = rec["host"]
@@ -506,6 +513,10 @@ def adopt_orphan(colab, repo: Path, session: str, deadline=None, hours: float | 
     records.save_record(repo, rec)
     if keepalive._capture_session_host(repo, rec, "adopted", spool_on_first=False):
         records.save_record(repo, rec)
+    # The restored lease's runtime identity baselines here,
+    # as at any first registration (the result is not
+    # surfaced: the adoption's own output is census-shaped).
+    identity.ensure_identity(colab, repo, session, "adopt")
     if caller and caller != record_caller:
         callers.append_caller_claim(repo, session, caller, "adopt")
     access.clear_unattributed(repo, session)
