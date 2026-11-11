@@ -108,7 +108,9 @@ def test_write_from_file_assembles_payload_and_spec(tmp_path):
     driver = make_fake_repo(tmp_path)
     local = tmp_path / "local.txt"
     local.write_bytes(b"payload content\n")
-    verdict = ok_verdict("write", "/content/work/a.txt")
+    # The stub models the real payload: fs_ops always reports
+    # the landed content's hash, and the driver now verifies it.
+    verdict = ok_verdict("write", "/content/work/a.txt", after_sha256=hashlib.sha256(b"payload content\n").hexdigest())
     r, capture = run_driver(driver, tmp_path, ["write", "/content/work/a.txt", "--from", str(local)], verdict)
     assert r.returncode == 0
     assert r.stdout.decode() == json.dumps(verdict) + "\n"
@@ -120,7 +122,7 @@ def test_write_from_file_assembles_payload_and_spec(tmp_path):
 
 def test_write_from_stdin(tmp_path):
     driver = make_fake_repo(tmp_path)
-    verdict = ok_verdict("write", "/content/b.txt")
+    verdict = ok_verdict("write", "/content/b.txt", after_sha256=hashlib.sha256(b"from stdin\x00bytes").hexdigest())
     r, capture = run_driver(
         driver, tmp_path, ["write", "/content/b.txt", "--stdin"], verdict, stdin=b"from stdin\x00bytes"
     )
@@ -313,8 +315,9 @@ def test_write_over_the_ceiling_refuses_before_the_channel(tmp_path, monkeypatch
     assert r.returncode == 2
     assert b"colab-xfer" in r.stderr
     assert not capture.exists()
+    landed = ok_verdict("write", "/content/a.txt", after_sha256=hashlib.sha256(b"short").hexdigest())
     r, capture = run_driver(
-        driver, tmp_path, ["write", "/content/a.txt", "--stdin"], verdict, stdin=b"short"
+        driver, tmp_path, ["write", "/content/a.txt", "--stdin"], landed, stdin=b"short"
     )
     assert r.returncode == 0
     assert base64.b64decode(captured_spec(capture)["content_b64"]) == b"short"
@@ -434,3 +437,31 @@ def test_payload_read_default_cap_bounds_a_huge_window(tmp_path):
     v = fs_ops.run_spec({"op": "read", "path": str(target), "max_lines": 0, "max_bytes": 0})
     assert v["ok"] is True and v["bytes_after"] == len(blob)
     assert base64.b64decode(v["content_b64"]) == blob
+
+
+def test_refused_attach_produces_no_verdict_and_fails(tmp_path):
+    """The sync-claim gate ANSWERS a refused attach (refusal text
+    + the detached alternative) instead of failing it, so the
+    payload never runs and no verdict exists. The driver must
+    not report success for a plant that wrote nothing: exit 1,
+    the non-landing named (2026-11-11: lanes built hours of
+    work on refused plants that exited 0)."""
+    driver = make_fake_repo(tmp_path)
+    local = tmp_path / "src.txt"
+    local.write_bytes(b"payload")
+    r, _ = run_driver(driver, tmp_path, ["write", "/content/x.txt", "--from", str(local)], None, rc=0)
+    assert r.returncode == 1
+    assert b"did NOT land" in r.stderr
+
+
+def test_write_with_mismatched_landed_hash_fails(tmp_path):
+    """An ok verdict whose after_sha256 is not the local
+    content's hash is not a landed write: the driver verifies
+    the hash the payload reports against the bytes it sent."""
+    driver = make_fake_repo(tmp_path)
+    local = tmp_path / "src.txt"
+    local.write_bytes(b"payload")
+    verdict = ok_verdict("write", "/content/x.txt", after_sha256="00" * 32)
+    r, _ = run_driver(driver, tmp_path, ["write", "/content/x.txt", "--from", str(local)], verdict)
+    assert r.returncode == 1
+    assert b"hash mismatch" in r.stderr

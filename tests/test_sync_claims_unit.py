@@ -11,6 +11,7 @@ no wall clock, no network.
 
 import importlib.util
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
@@ -545,3 +546,81 @@ def test_unmarked_caller_syncs_as_before(tmp_path, monkeypatch):
     verdict = lease_mod.sync_rights(root, SESSION, "beta", now_dt=T0)
     assert verdict["allowed"] is True and verdict["auto_claimed"] is True
     assert verdict["claim"]["caller"] == "beta"
+
+
+def _set_mtime(path, dt):
+    ts = dt.timestamp()
+    os.utime(path, (ts, ts))
+
+
+def _write_lease_record_raw(root, caller="alpha", jobs=()):
+    """The lease record written without save_record's pruning —
+    the shape a record that has not been re-saved since its
+    runs closed still carries on disk."""
+    rec = {
+        "session": SESSION,
+        "caller": caller,
+        "shape": "cpu-highram",
+        "acquired_at": iso(T0),
+        "deadline": iso(T0 + timedelta(hours=8)),
+        "jobs": list(jobs),
+    }
+    path = root / "var" / f"lease-{SESSION}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rec))
+    return rec
+
+
+def test_stale_run_record_is_not_activity(tmp_path, monkeypatch):
+    """Run-record evidence carries a freshness bound: a
+    non-terminal record nothing has re-saved inside the bound
+    is a dead launcher's residue and does not hold its caller
+    active (2026-11-11: the consol lane's dead feat records
+    refused other lanes' sync plants for hours). A freshly
+    tended record of the same shape is activity (control)."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    write_run(root, "run-dead", "beta", state="running")
+    path = root / "results" / "runs" / "run-dead.json"
+    _set_mtime(path, T0 - timedelta(hours=2))
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is True
+    _set_mtime(path, T0 - timedelta(minutes=5))
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "activity"
+
+
+def test_registered_job_with_closed_or_missing_backing_is_not_activity(tmp_path, monkeypatch):
+    """Registrations resolve through the pruned projection: a
+    job id whose backing run is terminal — or has no record at
+    all — is not evidence, however the record carrying it was
+    written. A live backing is (control)."""
+    root = repo(tmp_path, monkeypatch)
+    write_run(root, "run-done", "beta", state="complete")
+    _write_lease_record_raw(root, caller="alpha", jobs=["run-done", "run-ghost"])
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is True
+    write_run(root, "run-live", "beta", state="running")
+    _write_lease_record_raw(root, caller="alpha", jobs=["run-live"])
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "activity"
+    kinds = {e["kind"] for e in verdict["evidence"]}
+    assert "job" in kinds
+
+
+def test_detached_record_older_than_a_session_lifetime_is_not_activity(tmp_path, monkeypatch):
+    """A free detached record stays evidence at most one
+    session lifetime (12 h): nothing outlives the cap of the
+    session it runs on, so an older 'running' detached record
+    is residue, not activity."""
+    root = repo(tmp_path, monkeypatch)
+    save_lease_record(root)
+    rec = detached_rec("d-old")
+    rec["started_at"] = iso(T0 - timedelta(hours=13))
+    lease_mod.syncclaims.write_detached_record(root, rec)
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is True
+    rec["started_at"] = iso(T0 - timedelta(hours=1))
+    lease_mod.syncclaims.write_detached_record(root, rec)
+    verdict = lease_mod.sync_rights(root, SESSION, "alpha", now_dt=T0)
+    assert verdict["allowed"] is False and verdict["blocked_by"] == "activity"

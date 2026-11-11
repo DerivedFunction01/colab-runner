@@ -83,6 +83,35 @@ The runner's own lifecycle verbs ride the same record:
 - Three consecutive poll failures classify the session at the
   reduced read budget (2 × 45 s): confirmed-absent fails the
   run fast with a `--resume` note; unknown never fails the run.
+- A run may pin its session: `--session NAME` (or
+  `$COLAB_RUN_SESSION`) makes the acquire adopt the named lease
+  or fail `pin-unavailable` — a pin never silently substitutes
+  another session and never clears the named record.
+- Adoption reads launch health: the launch path journals every
+  upload/probe/seed/launch outcome to `var/launch-health.jsonl`,
+  and within each caller tier a session whose recent launch
+  operations failed ranks below healthy ones (an all-degraded
+  pool still adopts, flagged on the result). Health reorders
+  placement only; it never reorders caller tiers.
+- A launch is confirmed against the venue: the launch exec's
+  result is checked, then one reader pass looks for the job's
+  footprint (pids, launcher log, checkpoint, or exit stamp —
+  the stamp wrapper opens the log at spawn). A footprint
+  stamps `launch_confirmed_at`; when the channel answers and
+  no footprint exists, the run closes `failed` with
+  `launch_lost` set. When the confirmation read itself can
+  produce no evidence, the record carries `launch_unconfirmed_at`
+  (polling if the venue accepted the launch, `running` if its
+  exec also failed) and reconciles decide: the same
+  launch-lost verdict fires when a reader finds total absence
+  600 s past the launch, and the sweep closes a launched
+  record still sitting in `running` after 20 minutes with no
+  fresher evidence. Every channel call on the launch path is
+  timeout-guarded — `colab()` re-raises timeouts by design,
+  and a timeout is a recorded failure, never a dead launcher
+  stranding the record. `launch_confirmed_at` and
+  `last_evidence_at` on the record are the liveness evidence
+  supervision reads.
 - Pulls are change-detected: the reader payload reports each
   declared output's size/mtime and unchanged outputs are
   skipped; outputs over the 50 MB single-file ceiling move via
@@ -189,9 +218,14 @@ duration. Synchronous use is therefore a claim, not a default
   a record exists, else at `var/sync-claim-<session>.json`;
   both homes are written staged-sibling + rename.
 - Activity is evidence, read per attach: a job registered on
-  the lease record, a non-terminal run record naming its
-  caller, or a channel attach in the caller-claims journal
-  inside `sync_claim.attach_window_minutes` (default 15).
+  the lease record whose backing the pruned projection still
+  counts as live, a non-terminal run record naming its caller
+  whose file has been re-saved inside 65 minutes (a live run
+  is re-saved on every reconcile outcome; older is a dead
+  launcher's residue and holds nobody active), a running
+  detached record inside one 12 h session lifetime, or a
+  channel attach in the caller-claims journal inside
+  `sync_claim.attach_window_minutes` (default 15).
 - `sync_rights` (`sync/lease/syncclaims.py`) is the one gate,
   checked by `bin/colab-sh` before connecting and by the
   probes' driver for its long calls: a live claim held by
@@ -595,6 +629,22 @@ recorded.
   attempts) and resumable in both directions. Tunnel throughput
   is ~1.6 MB/s — split or shrink the payload when the window
   matters.
+- Every transfer phase is bounded and named: the part-hash
+  resume probe (240 s, its timeout caught — no resume
+  information just moves everything), the reassemble/verify
+  and the download split ride the same 3-attempt discipline as
+  the parts, and a phase that exhausts its attempts returns a
+  failure carrying its stage (`verify (reassemble)`, `remote
+  split`, `upload part N`…) — a stall is distinguishable from
+  a slow transfer at the call site, and no timeout can strand
+  a transfer record at "running".
+- `colab-fs` reports only verified landings: a write/patch/
+  delete exits 0 only when the payload's verdict says ok —
+  for a write, only when the verdict's `after_sha256` equals
+  the local content's hash. A refused attach produces no
+  verdict (the gate answers refusals rather than failing
+  them), and no verdict means the op did not land: exit 1
+  with the non-landing named, never a silent success.
 
 ## Orphaned sessions and adoption
 

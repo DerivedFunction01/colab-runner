@@ -35,6 +35,7 @@ usage error.
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,12 +119,18 @@ def run_move(args) -> int:
                    resumed_parts=p["resumed_parts"], moved_parts=p["moved_parts"])
         save_record(rec)
 
-    if args.op == "up":
-        result = transfer.chunked_upload(args.session, Path(args.local), name, progress=progress)
-        moved_key = "uploaded_parts"
-    else:
-        result = transfer.chunked_download(args.session, name, Path(args.local), progress=progress)
-        moved_key = "downloaded_parts"
+    moved_key = "uploaded_parts" if args.op == "up" else "downloaded_parts"
+    try:
+        if args.op == "up":
+            result = transfer.chunked_upload(args.session, Path(args.local), name, progress=progress)
+        else:
+            result = transfer.chunked_download(args.session, name, Path(args.local), progress=progress)
+    except subprocess.TimeoutExpired:
+        # Last-resort net: the transfer library bounds and names
+        # its own phases, but no timeout may ever escape this
+        # verb and strand the record at "running" — the record
+        # is the caller's only progress surface while a move runs.
+        result = {"ok": False, "stage": "timeout", "stderr": "transfer exceeded its subprocess bound"}
     rec.update(
         parts=result.get("parts", rec.get("parts")),
         resumed_parts=result.get("resumed_parts", rec.get("resumed_parts")),

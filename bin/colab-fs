@@ -31,8 +31,15 @@
 #
 # write/patch/delete print the payload's one-line JSON verdict on
 # stdout; read decodes the verdict's content to stdout and puts
-# the verdict on stderr. The exit code is the payload's: 0 ok,
-# 1 not ok, 2 usage error.
+# the verdict on stderr. The exit code is the VERIFIED outcome:
+# 0 only when the payload's verdict says ok — and, for a write,
+# when the verdict's after_sha256 equals the local content's
+# hash. A channel refusal (the sync-claim gate answers a refused
+# attach rather than failing it) produces no verdict at all, and
+# no verdict means the op did NOT land: exit 1 with the reason
+# named. (2026-11-11: refused plants exited 0 with zero files
+# landed, and lanes built hours of work on plants that never
+# happened.) 2 is usage error.
 
 set -u
 
@@ -226,16 +233,61 @@ emit_stream() {
     printf '%s\n' 'COLAB_FS_SPEC_JSON'
 }
 
+verdict_line_of() {
+    # The payload's one verdict line out of whatever the channel
+    # printed: the last line carrying the verdict's "ok" field.
+    printf '%s\n' "$1" | grep '"ok":' | tail -n 1
+}
+
+verdict_field() {
+    printf %s "$1" | sed -n "s/.*\"$2\": *\"\([^\"]*\)\".*/\1/p"
+}
+
 if [ "$op" = read ]; then
     verdict=$("$SH_BIN" -s "$session" < <(emit_stream))
     rc=$?
     printf '%s\n' "$verdict" >&2
     if [ "$rc" = 0 ]; then
+        vline=$(verdict_line_of "$verdict")
+        if [ -z "$vline" ] || ! printf %s "$vline" | grep -q '"ok": *true'; then
+            printf 'colab-fs: read %s on %s returned no ok verdict although the channel exited 0 — treating as failed; nothing was read\n' "$path" "$session" >&2
+            exit 1
+        fi
         content_b64=$(printf %s "$verdict" | sed -n 's/.*"content_b64": *"\([A-Za-z0-9+/=]*\)".*/\1/p')
         printf %s "$content_b64" | base64 -d
     fi
     exit "$rc"
 fi
 
-emit_stream | "$SH_BIN" -s "$session"
-exit $?
+out=$(emit_stream | "$SH_BIN" -s "$session")
+rc=$?
+vline=$(verdict_line_of "$out")
+if [ "$rc" != 0 ] || [ -z "$vline" ] || ! printf %s "$vline" | grep -q '"ok": *true'; then
+    printf '%s\n' "$out"
+    if [ "$rc" = 2 ]; then
+        # The channel's own refusal (the claim gate's exit 2):
+        # terminal, never retried, and the driver's exit stays
+        # 2 so callers can tell refused from failed — with the
+        # non-landing stated, since the refusal text alone
+        # reads like an answer, not a non-write.
+        printf 'colab-fs: %s %s did NOT land on %s — the channel refused the attach (rc 2); nothing was written.\n' "$op" "$path" "$session" >&2
+        exit 2
+    fi
+    printf 'colab-fs: %s %s did NOT land on %s — no ok verdict from the payload (channel rc %s). The channel output above is the whole story: a refused attach writes nothing.\n' "$op" "$path" "$session" "$rc" >&2
+    exit 1
+fi
+if [ "$op" = write ]; then
+    if [ -n "$from_file" ]; then
+        expected_sha=$(sha256sum <"$from_file" | cut -d' ' -f1)
+    else
+        expected_sha=$(printf %s "$content_b64" | base64 -d | sha256sum | cut -d' ' -f1)
+    fi
+    landed_sha=$(verdict_field "$vline" after_sha256)
+    if [ "$landed_sha" != "$expected_sha" ]; then
+        printf '%s\n' "$vline"
+        printf 'colab-fs: write %s on %s landed with a hash mismatch (payload after_sha256 %s, local %s) — treating as not landed\n' "$path" "$session" "$landed_sha" "$expected_sha" >&2
+        exit 1
+    fi
+fi
+printf '%s\n' "$vline"
+exit 0

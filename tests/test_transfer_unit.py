@@ -317,3 +317,48 @@ def test_xfer_refuses_a_remote_path_that_is_not_a_bare_name(tmp_path, monkeypatc
     assert rc == 2
     assert not (tmp_path / "xfers" / "up-5.json").exists()  # refused before any record
     assert fake.upload_calls == []
+
+
+def _timeout_on(marker, fake):
+    """A colab stand-in that raises TimeoutExpired for exec
+    snippets carrying marker and delegates everything else."""
+
+    def call(*args, timeout=3600):
+        if args[0] == "exec":
+            code = Path(args[args.index("-f") + 1]).read_text()
+            if marker in code:
+                raise subprocess.TimeoutExpired("colab", timeout)
+        return fake(*args, timeout=timeout)
+
+    return call
+
+
+def test_verify_phase_timeout_names_its_stage(tmp_path, monkeypatch):
+    """The reassemble/verify exec rides the attempt discipline:
+    a stall there exhausts attempts and reports the phase —
+    never an uncaught timeout, never a stage-less failure
+    (2026-11-11 xfer verify stalls)."""
+    fake, local = harness(tmp_path, monkeypatch)
+    monkeypatch.setattr(xfer, "colab", _timeout_on("# transfer:reassemble", fake))
+    r = xfer.chunked_upload("s", local, "big.bin")
+    assert not r["ok"] and r["stage"] == "verify (reassemble)"
+
+
+def test_part_hash_probe_timeout_just_uploads_everything(tmp_path, monkeypatch):
+    """The resume probe is non-fatal by design: its timeout is
+    caught inside the bound and the transfer proceeds with no
+    resume information instead of stalling in front of a move
+    that has not started."""
+    fake, local = harness(tmp_path, monkeypatch)
+    monkeypatch.setattr(xfer, "colab", _timeout_on("# transfer:part-hashes", fake))
+    r = xfer.chunked_upload("s", local, "big.bin")
+    assert r["ok"] and r["resumed_parts"] == 0 and r["uploaded_parts"] == 4
+    assert fake.remote["big.bin"] == CONTENT
+
+
+def test_split_timeout_names_its_stage(tmp_path, monkeypatch):
+    fake, local = harness(tmp_path, monkeypatch)
+    fake.remote["big.bin"] = CONTENT
+    monkeypatch.setattr(xfer, "colab", _timeout_on("# transfer:split", fake))
+    r = xfer.chunked_download("s", "big.bin", tmp_path / "out.bin")
+    assert not r["ok"] and r["stage"] == "remote split"

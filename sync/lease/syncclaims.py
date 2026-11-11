@@ -35,6 +35,22 @@ DEFAULT_MAX_SYNC_SECONDS = 300
 # hot path stops paying for the journal's whole history (E15).
 JOURNAL_TAIL_BYTES = 256 * 1024
 
+# Run-record activity evidence carries a freshness bound: a
+# live run's record file is re-saved on every reconcile outcome
+# (checkpoint read, poll failure, state change), so a record
+# untouched for this long belongs to a launcher that died
+# without closing it — the dead-"running" family (2026-11-11:
+# the consol lane's dead feat records held their callers
+# "active" for hours and refused other lanes' sync plants).
+# Its caller is not active on its say-so. Registered jobs need
+# no bound here: the pruned projection (records.job_entry)
+# already retires a registration the moment its backing closes.
+RUN_EVIDENCE_STALE_S = 65 * 60
+# A free detached record (one not registered on a lease) stays
+# evidence at most one session lifetime: nothing outlives the
+# 12 h cap of the session it runs on.
+DETACHED_EVIDENCE_STALE_S = 12 * 3600
+
 
 def _now(now_dt: datetime | None) -> datetime:
     return now_dt or datetime.now(timezone.utc)
@@ -75,19 +91,27 @@ def sync_claim_policy(repo: Path) -> dict:
 # --- Active-caller evidence ---------------------------------------------------
 
 
-def _run_records(repo: Path) -> list[dict]:
-    """Every runner record on disk (results/runs/*.json), read
-    tolerantly — the extend guard's activity precedent
-    (sync/extend_guard.py reads the same directory the same way);
-    duplicated here because the guard lives outside the package
-    and the claim check must not depend on its cadence."""
+def _run_records(repo: Path) -> list:
+    """Every runner record on disk (results/runs/*.json) with
+    its file mtime, read tolerantly — the extend guard's
+    activity precedent (sync/extend_guard.py reads the same
+    directory the same way); duplicated here because the guard
+    lives outside the package and the claim check must not
+    depend on its cadence. The mtime rides along because it is
+    the freshness signal active_callers bounds record evidence
+    by: the record file is re-saved on every reconcile outcome,
+    so its mtime is the last moment anything tended the run."""
     out = []
     runs = repo / "results" / "runs"
     if runs.is_dir():
         for path in sorted(runs.glob("*.json")):
             rec = foundation.load_json(path, None)
             if isinstance(rec, dict):
-                out.append(rec)
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                out.append((rec, mtime))
     return out
 
 
@@ -176,13 +200,15 @@ def _journal_tail_lines(path: Path) -> list[str]:
 def active_callers(repo: Path, session: str, now_dt: datetime | None = None) -> dict:
     """The distinct callers with live evidence on one session:
     {caller: [evidence, ...]}. Evidence kinds — a job registered
-    on the lease record, a non-terminal run record naming the
-    caller, a running detached record naming the caller, a
-    channel attach in the caller-claims journal inside the
-    freshness window, or an unexpired long hold on the session's
-    claim. Anything older or weaker is not activity; a caller
-    with no live evidence is not active, however recent their
-    lease is."""
+    on the lease record whose backing the pruned projection
+    still counts as live, a non-terminal run record naming the
+    caller whose file has been re-saved inside the freshness
+    bound, a running detached record naming the caller inside
+    one session lifetime, a channel attach in the caller-claims
+    journal inside the freshness window, or an unexpired long
+    hold on the session's claim. Anything older or weaker is
+    not activity; a caller with no live evidence is not active,
+    however recent their lease is."""
     now = _now(now_dt)
     window_s = sync_claim_policy(repo)["attach_window_minutes"] * 60
     evidence: dict[str, list[dict]] = {}
@@ -192,29 +218,44 @@ def active_callers(repo: Path, session: str, now_dt: datetime | None = None) -> 
             evidence.setdefault(caller, []).append(item)
 
     runs = _run_records(repo)
-    by_run = {r.get("run_id"): r for r in runs if r.get("run_id")}
+    by_run = {r.get("run_id"): r for r, _mtime in runs if r.get("run_id")}
     detached = _detached_records(repo)
     by_detached = {d.get("id"): d for d in detached if d.get("id")}
     rec = records.load_record(repo, session)
     seen_detached: set = set()
     if rec is not None:
         for job_id in rec.get("jobs") or []:
-            if isinstance(job_id, str) and job_id.startswith("detached:"):
+            # Registrations resolve through the pruned
+            # projection (records.job_entry — the one place
+            # that decides what "still running" means): a
+            # registration is evidence only while its backing
+            # record is live; a torn backing stands as unknown,
+            # per the projection's contract. Until this read
+            # went through the projection, a registration whose
+            # run had closed — or never existed — still held
+            # its caller active here.
+            entry = records.job_entry(repo, job_id)
+            if entry is None:
+                continue
+            if entry["kind"] == "detached":
                 det_id = job_id.split(":", 1)[1]
                 det = by_detached.get(det_id) or {}
-                if det.get("state", "running") in NONTERMINAL_DETACHED_STATES:
-                    add(det.get("caller") or rec.get("caller"), {"kind": "detached", "id": det_id})
-                    seen_detached.add(det_id)
-                continue
-            run = by_run.get(job_id) or {}
-            add(run.get("caller") or rec.get("caller"), {"kind": "job", "run_id": job_id})
-    for run in runs:
-        if run.get("session") == session and run.get("state") in NONTERMINAL_RUN_STATES:
+                add(det.get("caller") or rec.get("caller"), {"kind": "detached", "id": det_id})
+                seen_detached.add(det_id)
+            else:
+                run = by_run.get(job_id) or {}
+                add(run.get("caller") or rec.get("caller"), {"kind": "job", "run_id": job_id})
+    for run, mtime in runs:
+        # A non-terminal record is evidence only while it is
+        # fresh: past RUN_EVIDENCE_STALE_S untouched, it is a
+        # dead launcher's residue, not its caller's activity.
+        if run.get("session") == session and run.get("state") in NONTERMINAL_RUN_STATES and now.timestamp() - mtime <= RUN_EVIDENCE_STALE_S:
             add(run.get("caller"), {"kind": "run", "run_id": run.get("run_id"), "state": run.get("state")})
     for det in detached:
         if det.get("id") in seen_detached:
             continue
-        if det.get("session") == session and det.get("state") in NONTERMINAL_DETACHED_STATES:
+        started = _parse(det.get("started_at"))
+        if det.get("session") == session and det.get("state") in NONTERMINAL_DETACHED_STATES and started is not None and (now - started).total_seconds() <= DETACHED_EVIDENCE_STALE_S:
             add(det.get("caller"), {"kind": "detached", "id": det.get("id")})
     # An unexpired long hold is its holder's live evidence until
     # its stated end (the decision-1 amendment): the holder makes

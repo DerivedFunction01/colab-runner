@@ -116,22 +116,31 @@ def _remote_part_hashes(session: str, names: list) -> dict:
     # the cwd) — the same dual-world seam the runner and shell_job
     # use. The upload/download commands keep their /content-
     # absolute remote paths; that is the CLI's own contract.
-    r = _exec_file(session, (
-        "# transfer:part-hashes\n"
-        "import hashlib, json, os\n"
-        "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
-        f"NAMES = {names_json}\n"
-        "out = {}\n"
-        "for name in NAMES:\n"
-        "    p = os.path.join(BASE, name)\n"
-        "    if os.path.exists(p):\n"
-        "        h = hashlib.sha256()\n"
-        "        with open(p, 'rb') as f:\n"
-        "            while c := f.read(1024*1024):\n"
-        "                h.update(c)\n"
-        "        out[name] = h.hexdigest()\n"
-        "print(json.dumps(out))\n"
-    ))
+    # The probe is bounded tighter than the phase execs below
+    # and its timeout is caught: it is a resume optimization,
+    # and a stall here must read as "no resume information"
+    # (upload everything), never as twelve silent minutes in
+    # front of a transfer that has not started (2026-11-11:
+    # xfer verify-phase stalls on a saturated kernel).
+    try:
+        r = _exec_file(session, (
+            "# transfer:part-hashes\n"
+            "import hashlib, json, os\n"
+            "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
+            f"NAMES = {names_json}\n"
+            "out = {}\n"
+            "for name in NAMES:\n"
+            "    p = os.path.join(BASE, name)\n"
+            "    if os.path.exists(p):\n"
+            "        h = hashlib.sha256()\n"
+            "        with open(p, 'rb') as f:\n"
+            "            while c := f.read(1024*1024):\n"
+            "                h.update(c)\n"
+            "        out[name] = h.hexdigest()\n"
+            "print(json.dumps(out))\n"
+        ), timeout=240)
+    except subprocess.TimeoutExpired:
+        return {}
     try:
         return json.loads(r.stdout[r.stdout.index("{"):])
     except (ValueError, json.JSONDecodeError):
@@ -183,7 +192,13 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
             retried += 1
         emit(resumed, uploaded)
     names = json.dumps([m["name"] for m in metas])
-    r = _exec_file(session, (
+    # The verify phase (reassemble + end-to-end hash) rides the
+    # same attempt discipline as the parts: it is idempotent,
+    # and until it did, a stall here was one silent 720 s bound
+    # ending in an uncaught timeout or a stage-less failure —
+    # the caller could not tell a wedged verify from a slow
+    # transfer (2026-11-11).
+    r, _used = _attempt(lambda: _exec_file(session, (
         "# transfer:reassemble\n"
         "import hashlib, json, os\n"
         "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
@@ -196,13 +211,19 @@ def chunked_upload(session: str, local: Path, remote_name: str, progress=None) -
         "            out.write(c); h.update(c)\n"
         "out.close()\n"
         "print(json.dumps({'sha256': h.hexdigest()}))\n"
-    ))
+    )))
     got = None
-    try:
-        got = json.loads(r.stdout[r.stdout.index("{"):])["sha256"]
-    except (ValueError, json.JSONDecodeError, KeyError):
-        pass
-    return {"ok": got == digest, "sha256": digest, "remote_sha256": got,
+    if r is not None:
+        try:
+            got = json.loads(r.stdout[r.stdout.index("{"):])["sha256"]
+        except (ValueError, json.JSONDecodeError, KeyError):
+            pass
+    if got != digest:
+        return {"ok": False, "stage": "verify (reassemble)", "sha256": digest, "remote_sha256": got,
+                "parts": len(metas), "resumed_parts": resumed,
+                "uploaded_parts": uploaded, "retried_parts": retried,
+                "stderr": "" if r is None else (r.stderr or "")[-300:]}
+    return {"ok": True, "sha256": digest, "remote_sha256": got,
             "parts": len(metas), "resumed_parts": resumed,
             "uploaded_parts": uploaded, "retried_parts": retried}
 
@@ -218,7 +239,10 @@ def chunked_download(session: str, remote_name: str, dest: Path, progress=None) 
     "resumed_parts", "moved_parts"} once the remote split reports and
     again after every part lands or is skipped.
     """
-    r = _exec_file(session, (
+    # The split rides the attempt discipline too (idempotent:
+    # it rewrites the same part files): a stall names its phase
+    # instead of raising through the caller.
+    r, _used = _attempt(lambda: _exec_file(session, (
         "# transfer:split\n"
         "import hashlib, json, os\n"
         "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
@@ -237,7 +261,9 @@ def chunked_download(session: str, remote_name: str, dest: Path, progress=None) 
         "        parts.append({'name': name, 'size': len(c), 'sha256': hashlib.sha256(c).hexdigest()})\n"
         "        i += 1\n"
         "print(json.dumps({'size': size, 'sha256': whole.hexdigest(), 'parts': parts}))\n"
-    ))
+    )))
+    if r is None:
+        return {"ok": False, "stage": "remote split", "stdout": "", "stderr": "remote split exec timed out on every attempt"}
     try:
         info = json.loads(r.stdout[r.stdout.index("{"):])
         parts = info["parts"]
