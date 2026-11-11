@@ -113,6 +113,58 @@ def test_finalize_names_a_held_empty_pull_against_remote_content(tmp_path):
     assert out.get("empty_outputs") == ["heartbeat.log"], out
 
 
+def install_stray_job(env, name):
+    """A bare job whose payload writes one declared output to
+    its out dir and the other to its cwd root — the
+    cwd-relative addressing slip behind the 2026-11-11
+    missing-outputs specimens."""
+    root = Path(env["TEST_REPO_ROOT"])
+    jobs_dir = root / "jobs"
+    if jobs_dir.is_symlink():
+        jobs_dir.unlink()
+    job_dir = jobs_dir / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "payload.py").write_text(
+        "import argparse, sys\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "a = ap.parse_args()\n"
+        "out = Path(a.out)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'present.txt').write_text('here\\n')\n"
+        "Path('stray.txt').write_text('stray\\n')\n"
+        "sys.exit(0)\n"
+    )
+    manifest = {"name": name, "script": f"jobs/{name}/payload.py", "args": [], "outputs": ["present.txt", "stray.txt"], "shape": "cpu-highram", "checkpoint_pull_seconds": 1, "timeout": 180}
+    (job_dir / "job.json").write_text(json.dumps(manifest))
+    return job_dir
+
+
+def test_finalize_names_an_output_that_sits_at_the_cwd_root(tmp_path):
+    """Misplaced naming (2026-11-11): a declared output the
+    payload wrote to its cwd root instead of its out dir is
+    reported missing AND named in misplaced_outputs with its
+    path and size, on the record and in the result — and it is
+    named, not pulled: the out-dir contract stands."""
+    env = runner_env(tmp_path)
+    install_stray_job(env, "stray")
+    r = subprocess.run([sys.executable, str(run_bin(env)), "stray"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    assert out.get("missing_outputs") == ["stray.txt"], out
+    misplaced = out.get("misplaced_outputs")
+    assert misplaced and len(misplaced) == 1, out
+    assert misplaced[0]["name"] == "stray.txt" and misplaced[0]["bytes"] == 6
+    assert misplaced[0]["path"].endswith("/stray.txt")
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec.get("misplaced_outputs") == misplaced
+    assert [e["path"] for e in rec["pulled"]] == ["present.txt"]
+    results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
+    assert not (results / "stray.txt").exists()
+
+
 def test_finalize_reports_declared_outputs_that_never_arrived(tmp_path):
     """Declared-vs-pulled accounting (the pull-gap): a payload
     that exits 0 without writing one of its declared outputs

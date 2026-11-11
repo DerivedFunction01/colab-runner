@@ -5,6 +5,7 @@ terminal finalize the foreground poll loop and --poll share.
 """
 
 import hashlib
+import json
 import subprocess
 from datetime import datetime, timezone
 
@@ -132,6 +133,49 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     return rec.get("pulled", [])
 
 
+def misplaced_outputs(session: str, missing: list) -> list:
+    """Where the missing declared outputs actually sit, when
+    they sit at the payload's cwd root: one bounded exec stats
+    each missing name there and returns [{name, path, bytes}]
+    for the ones present. The specimen class (2026-11-11: gate
+    scripts writing cwd-relative paths landed their outputs at
+    /content while their out dirs held only harness files, and
+    the finalize record said only "missing") is usually a
+    lane-script addressing slip, and naming where the file
+    actually is turns a downstream hunt into a one-line fix.
+    Diagnostic only — the out-dir contract stands, a misplaced
+    output is named, never pulled — and a failed probe yields
+    []: the naming must never break a finalize."""
+    if not missing:
+        return []
+    probe = (
+        "import json, os\n"
+        "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
+        f"NAMES = {json.dumps(list(missing))}\n"
+        "found = []\n"
+        "for name in NAMES:\n"
+        "    p = os.path.join(BASE, name)\n"
+        "    if os.path.isfile(p):\n"
+        "        found.append({'name': name, 'path': p, 'bytes': os.path.getsize(p)})\n"
+        "print(json.dumps(found))\n"
+    )
+    try:
+        payload = REPO / "var" / "misplaced-probe.py"
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_text(probe)
+        r = colab("exec", "-s", session, "--timeout", "60", "-f", str(payload), timeout=90)
+    except Exception:  # noqa: BLE001
+        return []
+    if getattr(r, "returncode", 1) != 0:
+        return []
+    try:
+        found = json.loads(r.stdout[r.stdout.index("["):])
+    except (ValueError, json.JSONDecodeError):
+        return []
+    wanted = set(missing)
+    return [e for e in found if isinstance(e, dict) and e.get("name") in wanted]
+
+
 def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before) -> tuple[int, dict]:
     """The terminal tail, shared by the foreground poll loop and
     --poll: final pull, the payload's own exit code, the terminal
@@ -158,6 +202,14 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     missing = [name for name in job.get("outputs", []) if name not in {entry["path"] for entry in pulled}]
     if missing:
         rec["missing_outputs"] = missing
+    # Misplaced naming: a missing output that sits at the
+    # payload's cwd root is named with its path and size beside
+    # the shortfall — the usual cause is a payload writing
+    # cwd-relative paths instead of its out dir, and the record
+    # should say so rather than leaving the hunt downstream.
+    misplaced = misplaced_outputs(session, missing) if missing else []
+    if misplaced:
+        rec["misplaced_outputs"] = misplaced
     # Empty-output accounting (the reversed polarity of the
     # missing case): an output can be present in the pull and
     # still be wrong — 0 bytes where the reader sizes the remote
@@ -190,6 +242,8 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
         result = {"run_id": rec["run_id"], "state": "complete", "pulled": pulled}
     if missing:
         result["missing_outputs"] = missing
+    if misplaced:
+        result["misplaced_outputs"] = misplaced
     if empty:
         result["empty_outputs"] = empty
     return (1 if result["state"] == "failed" else 0), result
