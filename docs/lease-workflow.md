@@ -131,6 +131,16 @@ The runner's own lifecycle verbs ride the same record:
   `missing_outputs` and in the run's result — the payload's
   exit code stays the outcome truth, but a short pull is
   never silent.
+- Pulls are truth-checked: a download that fails, or that
+  lands a size different from the reader's stat for that
+  output, is not a pull — no entry is certified, the stored
+  stat stays unset so the next cadence retries, and the
+  mismatch is noted as `last_pull_error`. A channel that
+  reports success and delivers nothing therefore cannot
+  certify a completed job's outputs as 0-byte artifacts;
+  any already-held 0-byte entry is named in the record's
+  `empty_outputs` at finalize when the final reader state
+  sizes the remote file above 0.
 
 Jobs are shape-addressed, not session-pinned: acquire picks
 the shape's shared session, whichever one is live. A job whose

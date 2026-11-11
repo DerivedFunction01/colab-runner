@@ -486,8 +486,28 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
                 rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
                 staging.unlink(missing_ok=True)
                 continue
+            except (SystemExit, OSError) as exc:
+                # The download channel refusing or failing is a
+                # failed pull, never a landed one: whatever file
+                # the attempt left behind is not the output.
+                rec["last_pull_error"] = f"checkpoint pull of {name} failed at {now()}: {exc}"
+                staging.unlink(missing_ok=True)
+                continue
             if staging.exists():
                 entry = {"path": name, "bytes": staging.stat().st_size, "sha256": hashlib.sha256(staging.read_bytes()).hexdigest(), "route": "single"}
+                if stat is not None and entry["bytes"] != stat["size"]:
+                    # Pull truthfulness: a landed size that
+                    # disagrees with the reader's stat for the
+                    # output is not a pull — a failed or partial
+                    # download must not be certified as the
+                    # artifact (2026-11-11: a completed job's
+                    # 1,762-byte heartbeat was pulled as a 0-byte
+                    # entry and the run read complete on it). The
+                    # stored stat stays unset, so the next cadence
+                    # retries instead of skipping on a false match.
+                    rec["last_pull_error"] = f"pull of {name} landed {entry['bytes']} bytes against a remote size of {stat['size']} at {now()}"
+                    staging.unlink(missing_ok=True)
+                    continue
         if entry is None:
             continue
         if dest.exists() and 0 < dest.stat().st_size > entry["bytes"]:
@@ -543,6 +563,21 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     missing = [name for name in job.get("outputs", []) if name not in {entry["path"] for entry in pulled}]
     if missing:
         rec["missing_outputs"] = missing
+    # Empty-output accounting (the reversed polarity of the
+    # missing case): an output can be present in the pull and
+    # still be wrong — 0 bytes where the reader sizes the remote
+    # file above 0. With the pull-side size cross-check this is
+    # belt-and-braces, but the terminal record names it rather
+    # than reading clean (2026-11-11: a completed job's heartbeat
+    # and checkpoint pulled as 0-byte entries).
+    final_stats = (reader_state or {}).get("outputs") or {}
+    empty = [
+        entry["path"]
+        for entry in pulled
+        if entry["bytes"] == 0 and (final_stats.get(entry["path"]) or {}).get("size", 0) > 0
+    ]
+    if empty:
+        rec["empty_outputs"] = empty
     exit_code = (reader_state.get("checkpoint") or {}).get("exit_code")
     if exit_code is None:
         exit_code = reader_state.get("exit_stamp")
@@ -560,6 +595,8 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
         result = {"run_id": rec["run_id"], "state": "complete", "pulled": pulled}
     if missing:
         result["missing_outputs"] = missing
+    if empty:
+        result["empty_outputs"] = empty
     return (1 if result["state"] == "failed" else 0), result
 
 

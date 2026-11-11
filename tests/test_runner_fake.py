@@ -986,6 +986,81 @@ def install_partial_job(env, name):
     return job_dir
 
 
+def _truncating_download_wrapper(tmp_path):
+    """A COLAB_BIN wrapper whose downloads report success and
+    deliver an empty file — the s4diag2 manufacture (2026-11-11:
+    a completed job's 1,762-byte heartbeat and 38-byte checkpoint
+    were pulled as 0-byte entries and the run read complete)."""
+    wrapper = tmp_path / "truncating_colab.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "rc = subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode\n"
+        "if 'download' in args and rc == 0:\n"
+        "    Path(args[-1]).write_bytes(b'')\n"
+        "sys.exit(rc)\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_a_download_that_delivers_empty_is_not_a_pull(tmp_path):
+    """Pull truthfulness (2026-11-11): when the channel delivers
+    fewer bytes than the reader sizes the remote output at, the
+    pull is refused — no entry is certified, the error names the
+    mismatch, and the shortfall surfaces at finalize as missing
+    or empty, never as a clean complete on 0-byte artifacts."""
+    env = runner_env(tmp_path)
+    env.update(COLAB_BIN=str(_truncating_download_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE))
+    r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    surfaced = set(out.get("missing_outputs", [])) | set(out.get("empty_outputs", []))
+    assert "heartbeat.log" in surfaced, out
+    assert "checkpoint.json" in surfaced, out
+    for entry in rec.get("pulled", []):
+        if entry["bytes"] == 0:
+            assert entry["path"] in set(rec.get("empty_outputs", [])), f"a 0-byte pull of {entry['path']} was certified silently"
+    assert "landed 0 bytes against a remote size of" in (rec.get("last_pull_error") or ""), rec.get("last_pull_error")
+    results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
+    assert not list(results.glob("*.pulling")), "a refused pull left a staging file behind"
+
+
+def test_finalize_names_a_held_empty_pull_against_remote_content(tmp_path):
+    """The belt (2026-11-11): a record already holding a 0-byte
+    pulled entry (landed before the size cross-check existed)
+    whose remote output has content is named in empty_outputs
+    at finalize — the terminal record never reads clean over a
+    pulled-but-empty artifact."""
+    env = runner_env(tmp_path)
+    first = _fire_smoke(env)
+    runs = runs_dir(env)
+    first_rec = json.loads((runs / f"{first['run_id']}.json").read_text())
+    seeded_id = "seeded-empty-20261111T000000Z"
+    seeded = runs / f"{seeded_id}.json"
+    seeded.write_text(json.dumps({
+        "run_id": seeded_id,
+        "job": "smoke",
+        "session": first_rec["session"],
+        "state": "polling",
+        "started_at": "2026-11-11T00:00:00+00:00",
+        "remote_out": first_rec["remote_out"],
+        "pulled": [{"path": "heartbeat.log", "bytes": 0, "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "route": "single"}],
+    }))
+    env.update(COLAB_BIN=str(_truncating_download_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE))
+    r = run_verb(env, "--poll", seeded_id)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rec = json.loads(seeded.read_text())
+    assert rec["state"] == "complete", rec
+    assert rec.get("empty_outputs") == ["heartbeat.log"], rec.get("empty_outputs")
+    out = json.loads(r.stdout)
+    assert out.get("empty_outputs") == ["heartbeat.log"], out
+
+
 def test_finalize_reports_declared_outputs_that_never_arrived(tmp_path):
     """Declared-vs-pulled accounting (the pull-gap): a payload
     that exits 0 without writing one of its declared outputs
