@@ -81,6 +81,25 @@ DEFAULT_IDENTITY = Path.home() / ".ssh" / "id_ed25519"
 SSH_HOST = "root@colab-runtime"
 PROXY_SUFFIXES = "google.com,googleapis.com,googleusercontent.com,colab.dev"
 
+# Local-state helpers and refusal text live in sibling modules
+# (consolidation Lane B step 5) and are bound here under their
+# existing names: this module's surface — everything the suite
+# and callers address as colab_sh.<name> — is unchanged.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _sh_refusal import _evidence_text, _is_busy, detached_alternative, refusal_message  # noqa: E402
+from _sh_state import (  # noqa: E402
+    LIVENESS_CACHE_TTL_S,
+    MIRROR_FRESH_S,
+    _CACHE_KEY,
+    _lease_module,
+    _liveness_cache_read,
+    _liveness_cache_write,
+    _mirror_fresh,
+    _var_dir,
+    resolve_session,
+    restore_transient,
+)
+
 
 def proxy_env(env: dict) -> dict:
     """Return env with the Colab proxy-bypass suffixes appended."""
@@ -137,32 +156,6 @@ def build_stdin(script: str, env_pairs: list) -> str:
     return script
 
 
-def resolve_session(flag: str | None) -> str | None:
-    """-s flag, then $COLAB_SH_SESSION, then the most recently
-    used lease record — the core's own definition (records
-    .load_record), the one every other consumer resolves by.
-    The retired single-record var/lease.json is never read (E9):
-    a copy resurrected by a transient restore would name a stale
-    session."""
-    if flag:
-        return flag
-    if os.environ.get("COLAB_SH_SESSION"):
-        return os.environ["COLAB_SH_SESSION"]
-    try:
-        rec = _lease_module().load_record(REPO)
-    except Exception:  # noqa: BLE001
-        return None
-    return rec.get("session") if rec else None
-
-
-def _lease_module():
-    if str(REPO) not in sys.path:
-        sys.path.insert(0, str(REPO))
-    from sync import lease
-
-    return lease
-
-
 def live_state(session: str, attempts: int | None = None, timeout: int = 120) -> str:
     """The target's server-side tri-state (alive/absent/unknown),
     read through the lease machinery's own funnel (bin/colab-run)
@@ -184,62 +177,6 @@ def live_state(session: str, attempts: int | None = None, timeout: int = 120) ->
 ASYNC_READ_ATTEMPTS = 2
 ASYNC_READ_TIMEOUT_S = 45
 
-# Rapid successive attaches reuse a short-TTL liveness cache
-# (E4): a burst of small ops pays one dial, not one per op. The
-# cache lives in the session's liveness file (var/liveness-
-# <session>.json — the checker's file; the wrapper keeps one key
-# of its own in it and preserves the rest, written with the same
-# staged-sibling discipline the checker uses). Only a just-dialed
-# "alive" is ever cached, and only inside the TTL: a stale or
-# absent entry always falls back to the dial. That bounds the
-# minting window the connect guard exists to close to the TTL.
-LIVENESS_CACHE_TTL_S = 60
-_CACHE_KEY = "colab_sh_cache"
-
-
-def _var_dir() -> Path:
-    return Path(os.environ.get("COLAB_RUNNER_VAR", REPO / "var"))
-
-
-def _liveness_cache_read(session: str) -> bool:
-    """True when the cache holds a fresh dialed-alive verdict."""
-    try:
-        data = json.loads((_var_dir() / f"liveness-{session}.json").read_text())
-        entry = data.get(_CACHE_KEY) or {}
-        if entry.get("state") != "alive":
-            return False
-        at = datetime.fromisoformat(entry["at"])
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - at).total_seconds() <= LIVENESS_CACHE_TTL_S
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _liveness_cache_write(session: str) -> None:
-    """Record a just-dialed alive verdict in the liveness file.
-    Best-effort: a lost cache write costs one dial, never more."""
-    try:
-        path = _var_dir() / f"liveness-{session}.json"
-        try:
-            data = json.loads(path.read_text())
-            if not isinstance(data, dict):
-                data = {}
-        except Exception:  # noqa: BLE001
-            data = {}
-        data[_CACHE_KEY] = {"state": "alive", "at": datetime.now(timezone.utc).isoformat()}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-        try:
-            tmp.write_text(json.dumps(data, indent=1))
-            os.replace(tmp, path)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def liveness(session: str, *, async_path: bool) -> str:
     """The connect guard's read: cache first (a fresh dialed-alive
     verdict), else the dial — at the standard budget on the sync
@@ -254,43 +191,6 @@ def liveness(session: str, *, async_path: bool) -> str:
     if state == "alive":
         _liveness_cache_write(session)
     return state
-
-
-# The mirror restore is a subprocess every attach used to pay
-# (E4). The wrapper keeps its own freshness stamp in var/ and
-# skips the restore while the last successful one is fresh.
-MIRROR_FRESH_S = 300
-
-
-def _mirror_fresh() -> bool:
-    try:
-        at = datetime.fromisoformat((_var_dir() / "mirror-restore.stamp").read_text().strip())
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - at).total_seconds() <= MIRROR_FRESH_S
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def restore_transient() -> None:
-    """Restore transient state on entry (wrapper parity),
-    best-effort — skipped while the last restore is fresh."""
-    if _mirror_fresh():
-        return
-    try:
-        r = subprocess.run(
-            [sys.executable, str(REPO / "ops" / "mirror_transient.py"), "restore"],
-            capture_output=True, timeout=120,
-        )
-    except Exception:  # noqa: BLE001
-        return
-    if r.returncode == 0:
-        try:
-            path = _var_dir() / "mirror-restore.stamp"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(datetime.now(timezone.utc).isoformat())
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def orphan_advisory(session: str) -> None:
@@ -356,65 +256,6 @@ def sync_gate(session: str, caller: str | None) -> dict | None:
     return None if verdict.get("allowed") else verdict
 
 
-def _evidence_text(verdict: dict) -> str:
-    parts = []
-    for item in verdict.get("evidence") or []:
-        kind = item.get("kind")
-        if kind == "claim":
-            parts.append(f"claim claimed at {item.get('claimed_at')}")
-        elif kind == "run":
-            parts.append(f"run {item.get('run_id')} ({item.get('state')})")
-        elif kind == "job":
-            parts.append(f"job {item.get('run_id')} registered on the lease record")
-        elif kind == "detached":
-            parts.append(f"detached launch {item.get('id')} running")
-        elif kind == "long-hold":
-            parts.append(f"long hold until {item.get('until')}")
-        elif kind == "active-caller":
-            parts.append(f"caller {item.get('caller')} marked active in config/callers.json")
-        elif kind == "attach":
-            parts.append(f"attach via {item.get('seam')} at {item.get('ts')}")
-    return "; ".join(parts) or "no detail"
-
-
-def detached_alternative(args, session: str, caller: str | None, script_args: list) -> str:
-    """The --detach form of the caller's own refused command: the
-    async route that stays open to every caller."""
-    parts = ["colab-sh", "--detach", "-s", session]
-    if caller:
-        parts += ["--caller", caller]
-    if args.dir != "/content":
-        parts += ["--dir", args.dir]
-    for kv in args.env:
-        parts += ["--env", kv]
-    if args.file:
-        parts += ["-f", args.file]
-        if script_args:
-            parts += ["--", *script_args]
-    elif args.command:
-        parts += ["--", *args.command]
-    else:
-        parts += ["<your-script-on-stdin>"]
-    return " ".join(shlex.quote(p) if any(c in p for c in " <>") else p for p in parts)
-
-
-def refusal_message(session: str, caller: str | None, verdict: dict, alternative: str) -> str:
-    who = f"caller {caller!r}" if caller else "an unattributed caller"
-    if verdict.get("blocked_by") == "error":
-        head = f"the sync-claim check failed ({verdict.get('error')}); refusing — fail closed"
-    elif verdict.get("blocked_by") == "active-caller":
-        head = "this caller is marked active in the caller registry — active callers launch detached; synchronous ops are not allowed for them"
-    elif verdict.get("blocked_by") == "claim":
-        head = f"the sync claim is held by {verdict.get('holder')!r} until {verdict.get('expires_at')}"
-    else:
-        head = f"caller {verdict.get('holder')!r} is active on this session and synchronous use is off while multiple threads are active"
-    return (
-        f"colab-sh: synchronous attach to session {session!r} refused for {who} — {head} "
-        f"(evidence: {_evidence_text(verdict)}).\n"
-        f"Detached alternative (open to all callers): {alternative}"
-    )
-
-
 # --- Duration cap and busy translation (E3) --------------------------------------
 # The claim governs admission; the cap governs duration. Both are
 # local reads, evaluated before any dial (E15): a refusal must be
@@ -427,16 +268,6 @@ def sync_cap_seconds() -> float:
         return float(_lease_module().sync_claim_policy(REPO)["max_sync_seconds"])
     except Exception:  # noqa: BLE001
         return 300.0
-
-
-def _is_busy(proc) -> bool:
-    """A bridge-busy (429-class) failure: ssh's generic 255 with
-    the bridge's busy answer in its output. Anything else is a
-    real result and propagates untouched."""
-    if proc is None or proc.returncode != 255:
-        return False
-    text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
-    return "429" in text or "too many requests" in text.lower()
 
 
 def busy_message(session: str) -> str:

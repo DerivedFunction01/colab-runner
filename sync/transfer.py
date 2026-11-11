@@ -24,9 +24,9 @@ record per move.
 """
 
 import hashlib
+import importlib.util as _ilu
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -36,6 +36,22 @@ CHUNK = 32 * 1024 * 1024
 PART_ATTEMPTS = 3
 PART_BACKOFF_S = 5
 REPO = Path(__file__).resolve().parent.parent
+
+# The CLI funnel — resolution ($COLAB_BIN, else the uv tool venv,
+# else PATH, else ~/.local/bin/colab), the NO_PROXY environment,
+# and the guarded invocation — is sync/cli.py's, the one
+# implementation every consumer loads (consolidation Lane B
+# step 5; this module used to carry its own unguarded copies).
+# The names stay bound on this module because its callers and
+# tests address them here — and because this module's internals
+# call the bare name, so a test's fake binds exactly here.
+_cli_spec = _ilu.spec_from_file_location("cli", Path(__file__).resolve().parent / "cli.py")
+cli = _ilu.module_from_spec(_cli_spec)
+_cli_spec.loader.exec_module(cli)
+
+colab = cli.colab
+colab_bin = cli.colab_bin
+colab_env = cli.colab_env
 
 # Launch-health journal (written by the runner's launch path,
 # sync/lease/health.py owns the shape): the trailing window and
@@ -86,28 +102,6 @@ def _session_degraded(session: str) -> bool:
         (last_fail and (last_ok is None or last_fail > last_ok))
         or fails_since_ok >= HEALTH_FAILURE_CLUSTER
     )
-
-
-def colab_bin() -> str:
-    env_bin = os.environ.get("COLAB_BIN")
-    if env_bin:
-        return env_bin
-    venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
-    if venv_bin.exists():
-        return str(venv_bin)
-    return shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
-
-
-def colab_env() -> dict:
-    env = dict(os.environ)
-    for key in ("NO_PROXY", "no_proxy"):
-        suffix = "google.com,googleapis.com,googleusercontent.com,colab.dev"
-        env[key] = f"{env[key]},{suffix}" if env.get(key) else suffix
-    return env
-
-
-def colab(*args: str, timeout: int = 3600) -> subprocess.CompletedProcess:
-    return subprocess.run([colab_bin(), "--auth", "oauth2", *args], capture_output=True, text=True, timeout=timeout, env=colab_env())
 
 
 def sha256_file(p: Path) -> str:

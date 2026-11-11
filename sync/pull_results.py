@@ -9,8 +9,8 @@ With --session, files are first fetched with `colab download`.
 
 import argparse
 import hashlib
+import importlib.util
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -33,18 +33,22 @@ def main() -> int:
     manifest = json.loads(Path(args.manifest).read_text())
     dest = Path(args.dest)
     dest.mkdir(parents=True, exist_ok=True)
-    colab = None
+    cli = None
     if args.session:
-        import shutil
-
-        venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
-        colab = str(venv_bin) if venv_bin.exists() else shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
+        # The CLI funnel is sync/cli.py's, the one implementation
+        # every consumer loads (consolidation Lane B step 5; this
+        # script used to carry its own inline resolution). Loaded
+        # only on the --session path, so manifest verification
+        # against already-downloaded files never touches it.
+        spec = importlib.util.spec_from_file_location("cli", Path(__file__).resolve().parent / "cli.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
 
     results, bad = [], False
     for entry in manifest["files"]:
         local = dest / Path(entry["path"]).name
-        if colab:
-            r = subprocess.run([colab, "--auth", "oauth2", "download", "-s", args.session, entry["path"], str(local)], capture_output=True, text=True)
+        if cli:
+            r = cli.colab("download", "-s", args.session, entry["path"], str(local))
             if r.returncode != 0:
                 results.append({"path": entry["path"], "ok": False, "error": "download failed"})
                 bad = True

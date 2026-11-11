@@ -4,6 +4,7 @@ Every driver refuses to run before the operator's one-time OAuth login exists:
 these probes burn compute units and must never trigger a login themselves.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -11,16 +12,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-TOKEN = Path.home() / ".config" / "colab-cli" / "token.json"
 
+# The CLI funnel — resolution, the NO_PROXY environment, and the
+# guarded invocation — is sync/cli.py's, the one implementation
+# every consumer loads (consolidation Lane B step 5; this module
+# used to carry its own unguarded copies). The names stay bound
+# here because the founding probes import them from this module.
+_cli_spec = importlib.util.spec_from_file_location("cli", REPO / "sync" / "cli.py")
+cli = importlib.util.module_from_spec(_cli_spec)
+_cli_spec.loader.exec_module(cli)
 
-def colab_bin() -> str:
-    import shutil
-
-    venv_bin = Path.home() / ".local" / "share" / "uv" / "tools" / "google-colab-cli" / "bin" / "colab"
-    if venv_bin.exists():
-        return str(venv_bin)
-    return shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
+TOKEN = cli.TOKEN
+colab_bin = cli.colab_bin
+colab_env = cli.colab_env
 
 
 def require_login(probe: str) -> None:
@@ -36,17 +40,15 @@ def require_login(probe: str) -> None:
         raise SystemExit(2)
 
 
-def colab_env() -> dict:
-    import os
-
-    env = dict(os.environ)
-    for key in ("NO_PROXY", "no_proxy"):
-        suffix = "google.com,googleapis.com,googleusercontent.com,colab.dev"
-        env[key] = f"{env[key]},{suffix}" if env.get(key) else suffix
-    return env
-
-
 def colab(*args: str, timeout: int = 18000, check: bool = False) -> subprocess.CompletedProcess:
+    # The invocation stays this module's own (the gate wrapper
+    # plus a direct subprocess.run through the module's
+    # subprocess — the seam the driver tests patch); only the
+    # resolution (colab_bin / colab_env, bound from sync/cli.py
+    # above) is single-sourced. Delegating the call itself to
+    # cli.colab would add the funnel's stored-token guard and
+    # change the check=True failure shape — a behaviour change,
+    # not a migration.
     _sync_gate(args)
     return subprocess.run(
         [colab_bin(), "--auth", "oauth2", *args],

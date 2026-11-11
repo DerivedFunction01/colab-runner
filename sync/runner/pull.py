@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""The pull path: declared-output downloads at every checkpoint
+cadence and once more as the authoritative final pull, plus the
+terminal finalize the foreground poll loop and --poll share.
+"""
+
+import hashlib
+import subprocess
+from datetime import datetime, timezone
+
+from .foundation import REPO, colab, now, transfer
+from .records import mark_terminal
+
+# E6: the file channel's measured single-file reliability ceiling
+# (AGENTS.md, file channel) — a declared output larger than this
+# moves by the chunked route, never as one download.
+SINGLE_FILE_CEILING_BYTES = 50 * 1024 * 1024
+
+
+def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict | None = None) -> list:
+    """Download the declared outputs to results/<run_id>/.
+
+    Runs at every checkpoint cadence while the job runs — the
+    manifest's checkpoint_pull_seconds is a pull cadence, not
+    only a poll cadence (2026-11-07: the venue relay starved
+    because outputs landed only at completion, so a 12 h job's
+    log never reached the local reader waiting on it) — and once
+    more after the loop as the authoritative final pull. A failed
+    or timed-out download is noted on the record and never breaks
+    the poll loop; a missing remote file (the job has not written
+    it yet) simply pulls nothing.
+
+    Change detection (E6): the reader reports each output's
+    size/mtime; an output whose stat still equals the stat its
+    last successful pull recorded is skipped — a long job's
+    stable outputs are no longer re-moved whole at every cadence.
+    An output above the single-file ceiling moves via
+    transfer.chunked_download (32 MB parts, whole-file SHA-256
+    verified) instead of one plain download.
+
+    Entries accumulate on the record (rec["pulled"], one per
+    path, latest pull winning) and the accumulated list is what
+    this returns: with the skip above, a per-call list would
+    leave the terminal record reporting only the outputs the
+    final call happened to move — usually none.
+
+    Shrink guard: every pull lands on a staging sibling first,
+    and when the new content would replace a non-empty held
+    file with FEWER bytes, the held copy is rotated aside under
+    a stamped sibling name before the staging file moves in,
+    with the rotation noted on the pull entry and the record.
+    A remote output that restarts smaller must not silently
+    erase the history already pulled (2026-11-08: after a
+    wrapper resume, the venue keeper's pulled log shrank to its
+    first line and the accumulated record was gone — the
+    forensic read had to fall back to the venue-side lease
+    log). Equal-or-growing pulls keep the single-file behavior.
+    """
+    pulled_now = []
+    stats = (reader_state or {}).get("outputs") or {}
+    stored = rec.setdefault("output_stats", {})
+    for name in job.get("outputs", []):
+        dest = REPO / "results" / rec["run_id"] / name
+        stat = stats.get(name)
+        if stat is not None and stored.get(name) == stat and dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = dest.with_name(dest.name + ".pulling")
+        entry = None
+        if stat is not None and stat["size"] > SINGLE_FILE_CEILING_BYTES:
+            res = transfer.chunked_download(session, f"{remote_out}/{name}", staging)
+            if not res.get("ok"):
+                rec["last_pull_error"] = f"chunked pull of {name} failed at {now()}: {res.get('stage', 'unknown stage')}"
+                staging.unlink(missing_ok=True)
+                continue
+            entry = {"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "chunked"}
+        else:
+            try:
+                colab("download", "-s", session, f"/content/{remote_out}/{name}", str(staging), timeout=600)
+            except subprocess.TimeoutExpired:
+                rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
+                staging.unlink(missing_ok=True)
+                continue
+            except (SystemExit, OSError) as exc:
+                # The download channel refusing or failing is a
+                # failed pull, never a landed one: whatever file
+                # the attempt left behind is not the output.
+                rec["last_pull_error"] = f"checkpoint pull of {name} failed at {now()}: {exc}"
+                staging.unlink(missing_ok=True)
+                continue
+            if staging.exists():
+                entry = {"path": name, "bytes": staging.stat().st_size, "sha256": hashlib.sha256(staging.read_bytes()).hexdigest(), "route": "single"}
+                if stat is not None and entry["bytes"] != stat["size"]:
+                    # Pull truthfulness: a landed size that
+                    # disagrees with the reader's stat for the
+                    # output is not a pull — a failed or partial
+                    # download must not be certified as the
+                    # artifact (2026-11-11: a completed job's
+                    # 1,762-byte heartbeat was pulled as a 0-byte
+                    # entry and the run read complete on it). The
+                    # stored stat stays unset, so the next cadence
+                    # retries instead of skipping on a false match.
+                    rec["last_pull_error"] = f"pull of {name} landed {entry['bytes']} bytes against a remote size of {stat['size']} at {now()}"
+                    staging.unlink(missing_ok=True)
+                    continue
+        if entry is None:
+            continue
+        if dest.exists() and 0 < dest.stat().st_size > entry["bytes"]:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            rotated = dest.with_name(f"{name}.rotated-{stamp}")
+            suffix = 2
+            while rotated.exists():
+                rotated = dest.with_name(f"{name}.rotated-{stamp}-{suffix}")
+                suffix += 1
+            dest.rename(rotated)
+            entry["rotated"] = {"to": rotated.name, "bytes": rotated.stat().st_size}
+            rec["last_pull_rotation"] = f"{name} rotated to {rotated.name} at {now()}"
+        staging.replace(dest)
+        pulled_now.append(entry)
+        if stat is not None:
+            stored[name] = stat
+    if pulled_now:
+        rec["last_checkpoint_pull_at"] = now()
+        # Accumulate into the record's pulled list, one entry
+        # per path, latest pull winning: the terminal record
+        # and the printed result report every output the run
+        # landed, whichever cadence moved it.
+        by_path = {entry["path"]: entry for entry in rec.get("pulled", [])}
+        for entry in pulled_now:
+            by_path[entry["path"]] = entry
+        rec["pulled"] = list(by_path.values())
+    return rec.get("pulled", [])
+
+
+def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before) -> tuple[int, dict]:
+    """The terminal tail, shared by the foreground poll loop and
+    --poll: final pull, the payload's own exit code, the terminal
+    record + its one outbox event. Returns (exit_code, result).
+
+    The payload's checkpoint exit_code is the truth about the
+    outcome (2026-11-05: a job-zero build whose init_venv.py
+    failed recorded "complete" with a clean-looking pull; only a
+    human reading the pulled report saw assertions_passed:
+    false). Jobs whose checkpoints carry no exit_code fall back
+    to the launch wrapper's exit stamp — the same truth for
+    payloads that never write a checkpoint. Outputs are pulled
+    regardless — reports and
+    verdicts land locally either way."""
+    pulled = pull_outputs(rec, job, session, remote_out, reader_state)
+    # Declared-vs-pulled accounting: a payload can exit 0 with
+    # declared artifacts unwritten (or written outside its out
+    # dir), and until this was computed the run read "complete"
+    # with a short pull and no signal anywhere — the absence
+    # was discovered by hand, downstream (2026-11-11: heartbeat
+    # and checkpoint arrive at cadence, gate artifacts never
+    # do). The payload's exit code stays the outcome truth;
+    # the shortfall is recorded and returned, not fatal.
+    missing = [name for name in job.get("outputs", []) if name not in {entry["path"] for entry in pulled}]
+    if missing:
+        rec["missing_outputs"] = missing
+    # Empty-output accounting (the reversed polarity of the
+    # missing case): an output can be present in the pull and
+    # still be wrong — 0 bytes where the reader sizes the remote
+    # file above 0. With the pull-side size cross-check this is
+    # belt-and-braces, but the terminal record names it rather
+    # than reading clean (2026-11-11: a completed job's heartbeat
+    # and checkpoint pulled as 0-byte entries).
+    final_stats = (reader_state or {}).get("outputs") or {}
+    empty = [
+        entry["path"]
+        for entry in pulled
+        if entry["bytes"] == 0 and (final_stats.get(entry["path"]) or {}).get("size", 0) > 0
+    ]
+    if empty:
+        rec["empty_outputs"] = empty
+    exit_code = (reader_state.get("checkpoint") or {}).get("exit_code")
+    if exit_code is None:
+        exit_code = reader_state.get("exit_stamp")
+    try:
+        usage_after = colab("usage", timeout=120).stdout.strip()
+    except subprocess.TimeoutExpired:
+        # Accounting context only: a usage read that times out
+        # must never strand a run at its finalize step.
+        usage_after = ""
+    if exit_code not in (None, 0):
+        mark_terminal(rec, "failed", finished_at=now(), error=f"job payload exited {exit_code}", pulled=pulled, usage_before=usage_before, usage_after=usage_after)
+        result = {"run_id": rec["run_id"], "state": "failed", "error": rec["error"], "pulled": pulled}
+    else:
+        mark_terminal(rec, "complete", finished_at=now(), pulled=pulled, usage_before=usage_before, usage_after=usage_after)
+        result = {"run_id": rec["run_id"], "state": "complete", "pulled": pulled}
+    if missing:
+        result["missing_outputs"] = missing
+    if empty:
+        result["empty_outputs"] = empty
+    return (1 if result["state"] == "failed" else 0), result
