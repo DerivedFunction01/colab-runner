@@ -39,7 +39,7 @@ space_json() {
 JSON
 }
 
-CLIENT_FILES="index.html theme.css app.css app.js orphans.js colab-icon.svg"
+CLIENT_FILES="index.html theme.css app.css app.js logs.js controls.js poll.js theme.js orphans.js colab-icon.svg"
 # Generated icon PNGs (ui/make-icon-png.sh) ship when they exist; the
 # SVG is the tracked source and the only required icon file.
 OPTIONAL_CLIENT_FILES="colab-icon-192.png colab-icon-512.png colab-icon-180.png"
@@ -70,13 +70,6 @@ if [ "$CHECK" -eq 1 ]; then
       *) echo "check: DRIFTED client/$base (deployed, not a repo source)"; DRIFT=1 ;;
     esac
   done
-  if [ ! -f "$RUNTIME/brief/artifact-brief.md" ]; then
-    echo "check: MISSING brief/artifact-brief.md (not deployed)"; DRIFT=1
-  elif cmp -s "$HERE/artifact-brief.md" "$RUNTIME/brief/artifact-brief.md"; then
-    echo "check: in sync  brief/artifact-brief.md"
-  else
-    echo "check: DRIFTED brief/artifact-brief.md"; DRIFT=1
-  fi
   if [ ! -f "$RUNTIME/space.json" ]; then
     echo "check: MISSING space.json (not deployed)"; DRIFT=1
   elif space_json | cmp -s - "$RUNTIME/space.json"; then
@@ -93,7 +86,7 @@ if [ "$CHECK" -eq 1 ]; then
 fi
 
 step "deploy — sync artifact sources to $RUNTIME"
-mkdir -p "$RUNTIME/client" "$RUNTIME/brief"
+mkdir -p "$RUNTIME/client"
 for f in $CLIENT_FILES; do
   cp "$HERE/static/$f" "$RUNTIME/client/"
 done
@@ -102,9 +95,8 @@ for f in $OPTIONAL_CLIENT_FILES; do
     cp "$HERE/static/$f" "$RUNTIME/client/"
   fi
 done
-cp "$HERE/artifact-brief.md" "$RUNTIME/brief/"
 space_json > "$RUNTIME/space.json"
-echo "deploy: sources synced (client/, brief/, space.json)"
+echo "deploy: sources synced (client/, space.json)"
 
 step "publish — builder pass over the runtime space"
 if command -v "$HATCHLET" >/dev/null 2>&1; then
@@ -118,8 +110,8 @@ NOT published. Run the builder pass with the artifact tool:
   goal_id goal_e56641726a1f (the builder assigned slug colab-lease-2);
   later updates: artifact.edit on slug colab-lease-2. Either way the
   deployed source in the runtime dir (LEASE_UI_RUNTIME_DIR) is the input
-  (client/ is the design source; brief/artifact-brief.md points to
-  the data-plane contract in ui/README.md).
+  (client/ is the design source; the data-plane contract lives in
+  ui/README.md).
 EOF
   exit 4
 fi

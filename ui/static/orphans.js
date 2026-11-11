@@ -5,9 +5,9 @@
  * evidence source, the conflicts the derivation found, the
  * evidenced shape or the candidate list — and Adopt posts to the
  * core's adopt verb through the panel endpoint. Rendering lives
- * here rather than in app.js (which is over the fleet's file-size
- * cap; its split is a separate lane): this module loads after
- * app.js and uses its helpers and the merged state S; app.js's
+ * here rather than in app.js: this module loads after the app.js
+ * split (app.js, logs.js, controls.js, poll.js, theme.js) and
+ * uses app.js's helpers and the merged state S; poll.js's
  * renderSections calls renderOrphans when the orphans or specs
  * portion lands. */
 

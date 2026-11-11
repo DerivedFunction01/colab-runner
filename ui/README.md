@@ -50,7 +50,13 @@ Then open <http://127.0.0.1:8793>. Or run the server directly:
 - Outbox events: `{seq, ts, kind, detail}` with kinds `lease-started`,
   `lease-start-failed`, `lease-stopped`, `grant-started`, `grant-ended`.
   Single writer: this server.
-- `ui/static/` — one page, no build step, no external assets. The theme
+- `ui/static/` — one page, no build step, no external assets. The
+  page's scripts are plain modules loaded in order: `app.js` (core
+  state and helpers, the served-contract tables, the lease-section
+  renderers), `logs.js` (logs form model and view), `controls.js`
+  (start controls), `poll.js` (portion polling and the render
+  dispatch), `theme.js` (theme and the bootstrap), `orphans.js`
+  (orphan cards). The theme
   (`theme.css`) mirrors the workbench viewer's design tokens
   (`--wb-*`: olive palette, surfaces, accent, radius, font stacks) so
   the page reads as a sibling of the workbench.
@@ -150,8 +156,7 @@ surface; this localhost page remains the local one. Redeploy with
 the runtime dir (`$LEASE_UI_RUNTIME_DIR`) → publish step (builder pass via
 the hatchlet CLI when present, otherwise the script prints the exact
 builder request and exits 4, workbench-style). The data-plane
-contract is the section above; `ui/artifact-brief.md` is a pointer
-retained because deploy syncs it into the runtime `brief/`.
+contract is the section above.
 `bash ui/deploy.sh check` is the read-only drift check: it compares
 the repo's artifact sources against the deployed copies and exits 3
 on any drift (modified, missing, or deployed-but-not-a-repo-source),
