@@ -389,6 +389,33 @@ def test_xfer_status_reads_the_record_and_needs_no_session(tmp_path, monkeypatch
     assert verb.main(["status", "no-such-id"]) == 2
 
 
+def test_xfer_status_exit_code_carries_the_record_state(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    xfers = tmp_path / "xfers"
+    xfers.mkdir(parents=True, exist_ok=True)
+    for xfer_id, state in (("st-failed", "failed"), ("st-running", "running"), ("st-starting", "starting")):
+        (xfers / f"{xfer_id}.json").write_text(json.dumps({"xfer_id": xfer_id, "state": state}))
+    # A poller keying on the exit code alone must never read a
+    # failed or still-running move as a success.
+    assert verb.main(["status", "st-failed"]) == 1
+    capsys.readouterr()
+    assert verb.main(["status", "st-running"]) == 3
+    capsys.readouterr()
+    assert verb.main(["status", "st-starting"]) == 3
+    capsys.readouterr()
+
+
+def test_xfer_move_prints_a_one_line_verdict_to_stderr(tmp_path, monkeypatch, capsys):
+    fake, local = verb_harness(tmp_path, monkeypatch)
+    assert verb.main(["up", "-s", "s", str(local), "big.bin", "--id", "up-verdict"]) == 0
+    err = capsys.readouterr().err
+    assert f"up complete big.bin sha256 {sha(CONTENT)}" in err
+    fake.fail_uploads["big.bin.part-001"] = 99
+    assert verb.main(["up", "-s", "s", str(local), "big.bin", "--id", "up-verdict-fail"]) == 1
+    err = capsys.readouterr().err
+    assert "up FAILED big.bin" in err and "upload part 1" in err
+
+
 def test_xfer_refuses_a_remote_path_that_is_not_a_bare_name(tmp_path, monkeypatch, capsys):
     fake, local = verb_harness(tmp_path, monkeypatch)
     rc = verb.main(["up", "-s", "s", str(local), "sub/dir.bin", "--id", "up-5"])

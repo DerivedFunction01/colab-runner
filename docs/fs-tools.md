@@ -119,4 +119,10 @@ The record makes a move pollable (`colab-xfer status <id>` prints
 it without touching a session) and continuable: re-invoking the
 move with the same `--id` updates the same record while the parts
 resume by hash. The verb prints the final record and exits 0 on
-complete, 1 on a failed move, 2 on usage errors.
+complete, 1 on a failed move, 2 on usage errors; `status` exits
+with the record's state (0 complete, 1 failed, 3 still in
+flight, 2 no such record), and every move closes with a one-line
+verdict on stderr — complete with the hash, or FAILED with the
+stage — because the record's own verdict fields sit at its top
+while its hash fields sit at its end, so a trimmed capture of
+the record alone can read as a success-shaped null.

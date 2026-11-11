@@ -27,9 +27,19 @@ The caller claim resolves exactly as the other wrappers' does:
 --caller over $COLAB_CALLER, validated against the caller registry
 before anything starts, and stamped on the record.
 
-Exit codes: 0 = the move completed (or the status record was
-found), 1 = the move failed (the record carries the stage), 2 =
-usage error.
+Exit codes: for a move, 0 = completed, 1 = failed (the record
+carries the stage), 2 = usage error. For status, the exit code
+carries the record's state: 0 = complete, 1 = failed, 3 = still
+in flight (starting/running), 2 = no such record.
+
+Every move also prints a one-line verdict to stderr (complete
+with the hash, or FAILED with the stage). The record's verdict
+fields sit at its top and its hash fields at its end, so a
+trimmed capture of the printed record alone can read as a
+success-shaped null — the stderr line and the exit code are the
+surfaces that survive trimming (2026-11-11: the oa18 specimen,
+three failed ember attempts read as successes from a
+tail-trimmed capture).
 """
 
 import argparse
@@ -152,6 +162,10 @@ def run_move(args) -> int:
     rec["finished_at"] = now()
     save_record(rec)
     print(json.dumps(rec, indent=2))
+    if result.get("ok"):
+        print(f"colab-xfer: {args.op} complete {name} sha256 {rec.get('sha256')}", file=sys.stderr)
+    else:
+        print(f"colab-xfer: {args.op} FAILED {name} stage {result.get('stage')}", file=sys.stderr)
     return 0 if result.get("ok") else 1
 
 
@@ -161,7 +175,15 @@ def run_status(args) -> int:
         print(f"colab-xfer: no transfer record {args.xfer_id!r}", file=sys.stderr)
         return 2
     print(json.dumps(rec, indent=2))
-    return 0
+    # The exit code carries the state, so a poller keying on it
+    # cannot read a failed or still-running move as a success
+    # (the pre-2026-11-11 shape exited 0 for any record found).
+    state = rec.get("state")
+    if state == "complete":
+        return 0
+    if state == "failed":
+        return 1
+    return 3
 
 
 def main(argv=None) -> int:
