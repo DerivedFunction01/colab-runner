@@ -4,6 +4,8 @@ Binding rules for anyone (human or agent) working in this repo. This file is the
 
 Supervision rules: the generic text lives in the spec-driven starter (spec-driven-starter, `docs/supervision-rules.md`) — read it at task start. Its mid-task-binding classes ride inline as the synced block below; the rest of this file is this repo's own contract.
 
+- **Venue-keyed from the start (owner ruling, 2026-11-12):** when this runner is genericized, venue adapters coexist — the core, the contract, lease records, and the panel are venue-keyed, holding SSH-to-local, GitHub Codespaces, Amazon EC2, and Colab as venue kinds at once, with placement operating across a mixed fleet. Colab is the only implemented adapter and the only venue in use; no other adapter is commissioned. Until the genericization build (sequenced in the superapp goal), the binding near-term rule is negative: nothing new may deepen a single-venue assumption — a lease record, panel view, or funnel rule that cannot name its venue is a defect against this constraint.
+
 <!-- spec-sync:supervision-rules -->
 ## Supervision rules — the inline class
 
