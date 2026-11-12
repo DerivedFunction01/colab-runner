@@ -212,3 +212,17 @@ def test_sweep_orphans_a_starting_record_on_a_dead_session(tmp_path):
     r = run_verb(env, "--sweep")
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(p.read_text())["state"] == "orphaned"
+
+
+def test_launch_record_carries_its_final_phase(tmp_path):
+    """Launch-phase stamps (2026-11-12): a completed launch's
+    record ends at launch_phase "launched" — the stamps exist
+    so a record stranded at "starting" by a killed launcher
+    names the phase it died in (uploading / launching), after
+    two plant launches stranded with no trace of how far the
+    launch got."""
+    env = runner_env(tmp_path)
+    out = _fire_smoke(env)
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec["state"] == "complete"
+    assert rec.get("launch_phase") == "launched", rec.get("launch_phase")

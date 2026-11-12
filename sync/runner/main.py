@@ -308,6 +308,18 @@ def main() -> int:
         # slot (the runner invokes it), so scoping is safe;
         # manifest uploads keep their contract names by contrast.
         remote_script = f"{run_id}-{script.name}"
+        # Launch-phase stamps (2026-11-12): the window from the
+        # record's creation to the state=running save below is
+        # minutes of CLI round trips on a loaded session
+        # (usage, uploads with verify probes, the seed), and a
+        # launcher killed inside it — a caller's client timeout
+        # is the recurring case — stranded its record at
+        # "starting" with no trace of how far it got, so a slow
+        # launch and a dead one read identically. The phase is
+        # stamped as the launch advances; a stranded record
+        # names its phase.
+        rec["launch_phase"] = "uploading"
+        save_record(rec)
         err = upload_one(session, script, remote_script, run_id)
         if err is not None:
             rec.update(state="failed", error=f"runner script upload: {err}")
@@ -402,7 +414,7 @@ def main() -> int:
         # Per-run: a fixed dir leaks the previous run's heartbeat tail,
         # checkpoint, and outputs into this run's completion check.
         remote_out = f"{job_name}-out-{run_id}"
-        rec.update(state="running", remote_out=remote_out, extra_args=extra_args)
+        rec.update(state="running", remote_out=remote_out, extra_args=extra_args, launch_phase="launching")
         save_record(rec)
         # Detached launch (default pending the kill-matrix verdict): a short
         # exec starts the job under nohup; the CLI is never the job's lifeline.
@@ -455,6 +467,7 @@ def main() -> int:
         footprint = bool(cstate) and bool(cstate.get("job_pids") or cstate.get("exit_stamp") is not None or cstate.get("job_log_tail") or cstate.get("checkpoint"))
         if footprint:
             rec["state"] = "polling"
+            rec["launch_phase"] = "launched"
             rec["launch_confirmed_at"] = now()
             rec["last_evidence_at"] = rec["launch_confirmed_at"]
             # A confirmed launch is this attempt's truth: a
