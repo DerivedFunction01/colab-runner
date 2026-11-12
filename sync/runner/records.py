@@ -9,17 +9,67 @@ appends to the UI outbox.
 
 import json
 import os
+import time
+from datetime import datetime
 from pathlib import Path
 
 from .foundation import REPO, RUNS, now
 
 
 def save_record(rec: dict) -> None:
+    # Shape uniformity (2026-11-12): last_evidence_at exists
+    # on every record from its first save — initialized to
+    # the record's birth, so a never-collected record's
+    # evidence age reads as its whole life (the orphan
+    # signal the restart-reconciliation sweep keys on)
+    # instead of the field being absent and indistinguishable
+    # from a reader's bug. Successful session reads are its
+    # only later writers; a failed read never freshens it.
+    if not rec.get("last_evidence_at") and rec.get("started_at"):
+        rec["last_evidence_at"] = rec["started_at"]
     RUNS.mkdir(parents=True, exist_ok=True)
     (RUNS / f"{rec['run_id']}.json").write_text(json.dumps(rec, indent=2))
 
 
 TERMINAL_STATES = ("complete", "failed", "orphaned")
+
+# A non-terminal record whose collector has not touched it
+# in this bound reads as unattended (collector_stale) —
+# the display bound; the scheduler's restart sweep applies
+# its own longer escalation bound to the same stamps.
+COLLECTOR_STALE_S = 600
+
+
+def stamp_collector(rec: dict, caller: "str | None" = None) -> None:
+    """One collector touch: the launching poll loop, a --poll
+    reconcile, a finalize — every process that works the
+    record toward its terminal state stamps when it touched
+    the record and, when it knows its name, who it is. A
+    record frozen after its collector's death (the VM
+    restart class) is then self-describing: who was
+    collecting, and when they stopped."""
+    rec["collector_at"] = now()
+    if caller:
+        rec["collector"] = caller
+
+
+def collector_stale(rec: dict, at: "float | None" = None) -> bool:
+    """Derived, never stored: a non-terminal record is
+    collector-stale when its freshest collector stamp
+    (collector_at, falling back through last_evidence_at
+    to started_at for pre-cure records) is older than
+    COLLECTOR_STALE_S. Staleness names ATTENDANCE only —
+    the job's truth stays session-side, resolved by a poll."""
+    if rec.get("state") in TERMINAL_STATES:
+        return False
+    stamp = rec.get("collector_at") or rec.get("last_evidence_at") or rec.get("started_at")
+    if not stamp:
+        return False
+    try:
+        epoch = datetime.fromisoformat(str(stamp)).timestamp()
+    except ValueError:
+        return False
+    return (time.time() if at is None else at) - epoch > COLLECTOR_STALE_S
 
 
 def load_run_record(run_id: str) -> dict | None:

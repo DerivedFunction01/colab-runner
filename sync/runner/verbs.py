@@ -15,7 +15,7 @@ from pathlib import Path
 from .foundation import REPO, RUNS, TOKEN, lease, mirror, now
 from .pull import finalize_run, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
-from .records import TERMINAL_STATES, load_run_record, mark_terminal, save_record
+from .records import TERMINAL_STATES, collector_stale, load_run_record, mark_terminal, save_record, stamp_collector
 from .sweep import orphan_sweep
 
 
@@ -119,16 +119,17 @@ def poll_run(run_id: str) -> int:
     poll_timeout = int(os.environ.get("COLAB_RUN_POLL_TIMEOUT_S", "300"))
     state, poll_error = read_reader(session, reader, poll_timeout)
     if state is None:
-        if register_poll_failure(rec, session, poll_error) == "failed":
+        if register_poll_failure(rec, session, poll_error, collector=os.environ.get("COLAB_CALLER")) == "failed":
             close_out_lease(rec)
             print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
             return 1
-        print(json.dumps({"run_id": run_id, "state": rec["state"]}, indent=2))
+        print(json.dumps({"run_id": run_id, "state": rec["state"], "collector_stale": collector_stale(rec)}, indent=2))
         return 3
     rec["poll_failures"] = 0
     done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
     rec["last_checkpoint_units"] = done_units
     rec["last_evidence_at"] = now()
+    stamp_collector(rec, os.environ.get("COLAB_CALLER"))
     save_record(rec)
     if job.get("outputs"):
         pull_outputs(rec, job, session, remote_out, state)
@@ -159,11 +160,12 @@ def poll_run(run_id: str) -> int:
     except (KeyError, ValueError):
         past_deadline = False
     if complete or past_deadline:
+        stamp_collector(rec, os.environ.get("COLAB_CALLER"))
         rc, result = finalize_run(rec, job, session, remote_out, state, rec.get("usage_before"))
         close_out_lease(rec)
         print(json.dumps(result, indent=2))
         return rc
-    print(json.dumps({"run_id": run_id, "state": rec["state"]}, indent=2))
+    print(json.dumps({"run_id": run_id, "state": rec["state"], "collector_stale": collector_stale(rec), "collector": rec.get("collector")}, indent=2))
     return 3
 
 
@@ -188,6 +190,6 @@ def wait_run(run_id: str, max_seconds: int) -> int:
             return 1
         remaining = end - time.time()
         if remaining <= 0:
-            print(json.dumps({"run_id": run_id, "state": state}))
+            print(json.dumps({"run_id": run_id, "state": state, "collector_stale": collector_stale(rec or {}), "collector": (rec or {}).get("collector")}))
             return 3
         time.sleep(min(2, remaining))

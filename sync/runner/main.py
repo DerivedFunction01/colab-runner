@@ -17,7 +17,7 @@ from .foundation import REPO, RUNS, TOKEN, colab, git_identity, lease, mirror, n
 from .launch import orphan_notes, upload_one
 from .pull import finalize_run, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
-from .records import load_run_record, mark_terminal, save_record
+from .records import load_run_record, mark_terminal, save_record, stamp_collector
 from .sweep import orphan_sweep
 from .verbs import plant_git_identity, poll_run, wait_run
 
@@ -470,6 +470,7 @@ def main() -> int:
             rec["launch_phase"] = "launched"
             rec["launch_confirmed_at"] = now()
             rec["last_evidence_at"] = rec["launch_confirmed_at"]
+            stamp_collector(rec, rec.get("caller"))
             # A confirmed launch is this attempt's truth: a
             # prior attempt's launch_lost / error (a resume
             # carries both on the record) die in this same
@@ -503,6 +504,7 @@ def main() -> int:
             rec["state"] = "polling"
             rec["launch_unconfirmed_at"] = now()
             rec["last_poll_error"] = _confirm_error
+            stamp_collector(rec, rec.get("caller"))
             save_record(rec)
         else:
             # The launch exec itself failed AND the confirmation
@@ -513,6 +515,7 @@ def main() -> int:
             # closes it if nothing ever confirms.
             rec["launch_unconfirmed_at"] = now()
             rec["last_poll_error"] = _confirm_error
+            stamp_collector(rec, rec.get("caller"))
             save_record(rec)
         if detach_flag:
             # E5: launch exactly as the foreground form, write
@@ -547,13 +550,14 @@ def main() -> int:
             # completed); E11 bounds the count and classifies it.
             state, poll_error = read_reader(session, reader, poll_timeout)
             if state is None:
-                if register_poll_failure(rec, session, poll_error) == "failed":
+                if register_poll_failure(rec, session, poll_error, collector=rec.get("caller")) == "failed":
                     print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                     return 1
                 continue
             done_units = (state.get("checkpoint") or {}).get("completed_units", 0)
             rec["last_checkpoint_units"] = done_units
             rec["last_evidence_at"] = now()
+            stamp_collector(rec, rec.get("caller"))
             rec["poll_failures"] = 0
             save_record(rec)
             if job.get("outputs"):
@@ -585,6 +589,7 @@ def main() -> int:
                 mark_terminal(rec, "failed", error=(f"job exited before completing; remote log tail: {tail}")[-500:])
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
+        stamp_collector(rec, rec.get("caller"))
         rc, result = finalize_run(rec, job, session, remote_out, state, usage_before)
         print(json.dumps(result, indent=2))
         return rc

@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 
-from runner_harness import FAKE, _fire_smoke, run_bin, runner_env, runs_dir  # noqa: F401
+from runner_harness import FAKE, _detach_smoke, _fire_smoke, run_bin, runner_env, runs_dir  # noqa: F401
 
 
 def _noop_launch_wrapper(tmp_path):
@@ -73,3 +73,20 @@ def test_resume_after_launch_lost_clears_the_stale_verdict(tmp_path):
     assert rec.get("launch_confirmed_at"), "the resumed launch never confirmed"
     assert "launch_lost" not in rec, "the confirmed launch left the prior attempt's launch_lost standing"
     assert "error" not in rec, "the confirmed launch left the prior attempt's error standing"
+
+
+def test_detached_record_carries_collector_and_evidence_from_launch(tmp_path):
+    """Collector self-description (2026-11-12): from its
+    first saves, a record names who is collecting it
+    (collector = the launching caller), when they last
+    touched it (collector_at), and carries last_evidence_at
+    — the field exists on every run path, so the scheduler's
+    restart sweep never reads an absent field as a frozen
+    one (the s2form specimen carried none at all)."""
+    env = runner_env(tmp_path)
+    out = _detach_smoke(env)
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec["state"] == "polling"
+    assert rec.get("last_evidence_at"), "no evidence stamp on a launched record"
+    assert rec.get("collector") == rec.get("caller")
+    assert rec.get("collector_at"), "no collector heartbeat on a launched record"

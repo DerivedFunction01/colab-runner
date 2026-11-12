@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .foundation import REPO, colab, lease, now
-from .records import mark_terminal, save_record
+from .records import mark_terminal, save_record, stamp_collector
 
 # E11: consecutive poll failures before the poller classifies the
 # session. The classification itself uses the reap pass's reduced
@@ -129,7 +129,7 @@ def read_reader(session: str, reader: Path, poll_timeout: int) -> tuple[dict | N
         return None, f"checkpoint poll returned no readable state at {now()}"
 
 
-def register_poll_failure(rec: dict, session: str, error: str) -> str:
+def register_poll_failure(rec: dict, session: str, error: str, collector: "str | None" = None) -> str:
     """Count one consecutive poll failure (E11) and, at the
     bound, classify the session at the reap pass's reduced read
     budget. Confirmed absent fails the run fast — the payload
@@ -140,6 +140,10 @@ def register_poll_failure(rec: dict, session: str, error: str) -> str:
     this failure ended the run, else "continue"."""
     rec["last_poll_error"] = error
     rec["poll_failures"] = int(rec.get("poll_failures") or 0) + 1
+    # A failed read is still a collector touch (the collector
+    # is attending; the channel is not answering) — it stamps
+    # collector_at but never last_evidence_at.
+    stamp_collector(rec, collector)
     save_record(rec)
     if rec["poll_failures"] < POLL_FAILURE_BOUND:
         return "continue"

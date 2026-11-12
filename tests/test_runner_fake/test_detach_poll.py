@@ -178,3 +178,51 @@ def test_pull_routes_an_oversize_output_through_the_chunked_transfer(tmp_path):
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     pulled = {p["path"]: p for p in rec["pulled"]}
     assert pulled["unit-0.bin"]["route"] == "chunked"
+
+
+def test_poll_reconciles_a_foreground_shaped_record(tmp_path):
+    """The resolution seam is launch-form-agnostic (2026-11-12
+    commission): a "polling" record whose launcher died — the
+    foreground form, no detached_launch marker — reconciles
+    through --poll exactly like a detached one, because the
+    payload is nohup-detached session-side either way. The
+    two VM-restart specimens (p2f5form3, critic-union2) were
+    this shape; one --poll per record is the whole cure."""
+    env = runner_env(tmp_path)
+    out = _detach_smoke(env)
+    path = runs_dir(env) / f"{out['run_id']}.json"
+    rec = json.loads(path.read_text())
+    rec.pop("detached_launch", None)  # the foreground shape
+    path.write_text(json.dumps(rec))
+    rc = 3
+    deadline = time.time() + 180
+    while rc == 3 and time.time() < deadline:
+        rc = run_verb(env, "--poll", out["run_id"]).returncode
+    assert rc == 0
+    rec = json.loads(path.read_text())
+    assert rec["state"] == "complete"
+    assert rec.get("collector_at"), "the reconciling polls never stamped their touches"
+    assert rec.get("last_evidence_at"), "the record carries no evidence stamp"
+
+
+def test_wait_reports_collector_staleness_from_the_record(tmp_path):
+    """--wait's still-running read names attendance: a record
+    whose collector stamps are fresh reports
+    collector_stale false; the same record with its stamps
+    aged past the bound (the dead-collector case) reports
+    true — derived from the record alone, no channel use."""
+    env = runner_env(tmp_path)
+    out = _detach_smoke(env)
+    path = runs_dir(env) / f"{out['run_id']}.json"
+    r = run_verb(env, "--wait", out["run_id"], "--max", "0")
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert json.loads(r.stdout)["collector_stale"] is False
+    rec = json.loads(path.read_text())
+    old = "2026-11-12T00:00:00+00:00"
+    rec["started_at"] = old
+    rec["last_evidence_at"] = old
+    rec.pop("collector_at", None)
+    path.write_text(json.dumps(rec))
+    r = run_verb(env, "--wait", out["run_id"], "--max", "0")
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert json.loads(r.stdout)["collector_stale"] is True
