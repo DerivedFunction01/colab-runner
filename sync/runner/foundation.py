@@ -32,6 +32,7 @@ cli = _load.sync("cli")
 lease = _load.sync("lease")
 repo_registry = _load.sync("repo_registry")
 transfer = _load.sync("transfer")
+git_identity = _load.sync("git_identity")
 
 # The funnel, re-exported under the names this module's consumers
 # (bin/colab-lease & friends historically, the test suites) use.

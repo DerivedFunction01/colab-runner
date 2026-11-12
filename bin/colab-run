@@ -4,6 +4,14 @@ pull results, stop the session on every exit path.
 
 Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [--session NAME] [-- <job args>...]
        colab-run --poll RUN_ID | --wait RUN_ID [--max SECONDS] | --sweep
+       colab-run plant-git-identity --session NAME --repo ID_OR_PATH --tree SESSION_TREE [--caller TAG]
+plant-git-identity sets the source repo's configured git
+identity (its repo-local user.name/user.email) repo-locally in
+a session tree formed outside the seed path, reads it back,
+and records the plant on its own run record — beside the key
+plant, so a session-side commit carries the repo's identity,
+never the forming shell's inheritance. Seeded trees are
+planted by the seed itself (the record's bundle_seed entry).
 --session NAME (or $COLAB_RUN_SESSION) pins the run to the named
 lease: it adopts that session or fails pin-unavailable — never a
 silent substitution. A launch is confirmed against the venue:

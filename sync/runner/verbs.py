@@ -9,13 +9,71 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 from .foundation import REPO, RUNS, TOKEN, lease, mirror, now
 from .pull import finalize_run, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
 from .records import TERMINAL_STATES, load_run_record, mark_terminal, save_record
 from .sweep import orphan_sweep
+
+
+def plant_git_identity(session: str, repo_ref: str, tree: str, caller: "str | None") -> int:
+    """The plant verb, beside the key plant: set the source
+    repo's configured git identity repo-locally in a session
+    tree formed outside the seed path (a key clone, a branch
+    transport), read it back, and record the plant on its own
+    run record. Exit 0 planted, 1 the plant or its readback
+    failed on the session, 2 no complete identity is
+    configured at the source repo (nothing is planted)."""
+    from .foundation import colab, git_identity, repo_registry
+
+    local_path = None
+    if Path(repo_ref).expanduser().is_dir():
+        local_path = str(Path(repo_ref).expanduser())
+    else:
+        try:
+            registry = repo_registry.load_local_registry(REPO)
+            _repo_id, entry = repo_registry.get_entry(registry, repo_ref)
+            local_path = entry["local_path"]
+        except (ValueError, KeyError) as exc:
+            print(f"colab-run plant-git-identity: cannot resolve repo {repo_ref!r}: {exc}", file=sys.stderr)
+            return 2
+    identity = git_identity.repo_identity(local_path)
+    if identity is None:
+        print(f"colab-run plant-git-identity: no complete repo-local identity (user.name + user.email) configured at {local_path} — nothing planted", file=sys.stderr)
+        return 2
+    run_id = datetime.now(timezone.utc).strftime("plant-git-identity-%Y%m%dT%H%M%SZ")
+    rec = {
+        "run_id": run_id,
+        "job": "plant-git-identity",
+        "session": session,
+        "caller": caller,
+        "tree": tree,
+        "repo": repo_ref,
+        "local_path": local_path,
+        "git_identity": identity,
+        "state": "starting",
+        "started_at": now(),
+    }
+    save_record(rec)
+    payload = REPO / "var" / f"plant-git-identity-{run_id}.py"
+    payload.parent.mkdir(parents=True, exist_ok=True)
+    payload.write_text(git_identity.plant_payload(tree, identity["name"], identity["email"]))
+    try:
+        r = colab("exec", "-s", session, "--timeout", "120", "-f", str(payload), timeout=150)
+        verdict = git_identity.parse_plant_output(getattr(r, "stdout", "") or "")
+    except Exception as exc:  # the exec itself failed: the record says so
+        verdict = {"planted": False, "error": f"exec failed: {exc}"[:300]}
+    rec["plant"] = verdict
+    rec["state"] = "complete" if verdict and verdict.get("planted") else "failed"
+    if rec["state"] != "complete" and not (verdict and verdict.get("error")):
+        rec["error"] = "plant readback did not match the source identity"
+    rec["finished_at"] = now()
+    save_record(rec)
+    print(json.dumps(rec, indent=2))
+    return 0 if rec["state"] == "complete" else 1
 
 
 def close_out_lease(rec: dict) -> None:

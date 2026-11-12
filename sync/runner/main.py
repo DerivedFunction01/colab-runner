@@ -13,13 +13,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .foundation import REPO, RUNS, TOKEN, colab, lease, mirror, now, repo_registry, transfer
+from .foundation import REPO, RUNS, TOKEN, colab, git_identity, lease, mirror, now, repo_registry, transfer
 from .launch import orphan_notes, upload_one
 from .pull import finalize_run, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
 from .records import load_run_record, mark_terminal, save_record
 from .sweep import orphan_sweep
-from .verbs import poll_run, wait_run
+from .verbs import plant_git_identity, poll_run, wait_run
 
 
 def main() -> int:
@@ -56,6 +56,15 @@ def main() -> int:
                 print("colab-run --wait: --max must be an integer number of seconds", file=sys.stderr)
                 return 2
         return wait_run(core_args[idx + 1], max_seconds)
+    if "plant-git-identity" in core_args:
+        def _flag(name: str) -> "str | None":
+            return core_args[core_args.index(name) + 1] if name in core_args and core_args.index(name) + 1 < len(core_args) else None
+
+        _session, _repo, _tree = _flag("--session"), _flag("--repo"), _flag("--tree")
+        if not (_session and _repo and _tree):
+            print("usage: colab-run plant-git-identity --session NAME --repo ID_OR_PATH --tree SESSION_TREE [--caller TAG]", file=sys.stderr)
+            return 2
+        return plant_git_identity(_session, _repo, _tree, _flag("--caller") or os.environ.get("COLAB_CALLER"))
     # Flags travel in pairs and may sit on either side of the job
     # name — extract them first and take the first remaining token
     # as the job. (Job-first-only parsing read a leading --caller
@@ -203,8 +212,14 @@ def main() -> int:
             print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
             return 1
         seed_manifest = json.loads(bundle.stdout)
-        seed_ctx = {"repo": seed_repo_id, "dest": seed_dest, "clone_url": seed_entry["clone_url"], "bundle_path": Path(seed_manifest["bundle"]), "manifest": seed_manifest}
-        rec["bundle_seed"] = {"repo": seed_repo_id, "dest": seed_dest, "sha256": seed_manifest["sha256"], "bytes": seed_manifest["bytes"], "snapshot_commit": seed_manifest["snapshot_commit"], "tree": seed_manifest["tree"]}
+        # The git identity plant: the seeded tree carries the
+        # source repo's own configured identity (its repo-local
+        # user.name/user.email), never the forming shell's
+        # inheritance. No complete pair at the source → no
+        # plant, and the record says so.
+        seed_identity = git_identity.repo_identity(seed_entry["local_path"])
+        seed_ctx = {"repo": seed_repo_id, "dest": seed_dest, "clone_url": seed_entry["clone_url"], "bundle_path": Path(seed_manifest["bundle"]), "manifest": seed_manifest, "git_identity": seed_identity}
+        rec["bundle_seed"] = {"repo": seed_repo_id, "dest": seed_dest, "sha256": seed_manifest["sha256"], "bytes": seed_manifest["bytes"], "snapshot_commit": seed_manifest["snapshot_commit"], "tree": seed_manifest["tree"], "git_identity": seed_identity}
         save_record(rec)
     try:
         usage_before = colab("usage", timeout=120).stdout.strip()
@@ -342,10 +357,16 @@ def main() -> int:
                 save_record(rec)
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
+            _ident = seed_ctx.get("git_identity")
+            _ident_args = (
+                f",'--user-name',{_ident['name']!r},'--user-email',{_ident['email']!r}"
+                if _ident
+                else ""
+            )
             seed_remote = REPO / "var" / f"seed-{run_id}.py"
             seed_remote.write_text(
                 "import subprocess\n"
-                f"r = subprocess.run(['python3','apply_bundle_remote.py','{seed_ctx['bundle_path'].name}','{seed_ctx['dest']}','--origin-url','{seed_ctx['clone_url']}'], capture_output=True, text=True)\n"
+                f"r = subprocess.run(['python3','apply_bundle_remote.py','{seed_ctx['bundle_path'].name}','{seed_ctx['dest']}','--origin-url','{seed_ctx['clone_url']}'{_ident_args}], capture_output=True, text=True)\n"
                 "print(r.stdout); print(r.stderr[-500:])\n"
             )
             try:
@@ -363,6 +384,18 @@ def main() -> int:
                 print(json.dumps({"run_id": run_id, "state": "failed", "error": rec["error"]}, indent=2))
                 return 1
             lease.append_launch_outcome(REPO, session, "seed", True, seed_ctx["dest"])
+            # The plant's readback verdict rides the apply's
+            # JSON; record it beside the intended pair so the
+            # record distinguishes planted from merely meant.
+            for _line in reversed(seed_out.splitlines()):
+                try:
+                    _apply = json.loads(_line)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(_apply, dict) and "applied" in _apply:
+                    rec["bundle_seed"]["git_identity_result"] = _apply.get("git_identity")
+                    save_record(rec)
+                    break
             seeded = True
         # Relative to the session working dir (/content on a real Colab VM;
         # the fake CLI's sandbox root under test) so the same code runs both.
