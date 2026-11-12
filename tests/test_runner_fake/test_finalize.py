@@ -142,24 +142,83 @@ def install_stray_job(env, name):
 
 
 def test_finalize_names_an_output_that_sits_at_the_cwd_root(tmp_path):
-    """Misplaced naming (2026-11-11): a declared output the
+    """Misplaced naming + guarded collection (2026-11-11
+    naming; 2026-11-12 collection): a declared output the
     payload wrote to its cwd root instead of its out dir is
-    reported missing AND named in misplaced_outputs with its
-    path and size, on the record and in the result — and it is
-    named, not pulled: the out-dir contract stands."""
+    named in misplaced_outputs with its path and size — and,
+    being FRESH (written during this run, judged against the
+    run's own started stamp), it is also collected through the
+    pull: it lands in the results, joins the pulled list with
+    route "misplaced", and leaves missing_outputs. Five
+    consumer runs lost or hand-recovered verdicts to the
+    named-never-pulled shape before the collection landed."""
     env = runner_env(tmp_path)
     install_stray_job(env, "stray")
     r = subprocess.run([sys.executable, str(run_bin(env)), "stray"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["state"] == "complete"
-    assert out.get("missing_outputs") == ["stray.txt"], out
+    assert not out.get("missing_outputs"), out
     misplaced = out.get("misplaced_outputs")
     assert misplaced and len(misplaced) == 1, out
     assert misplaced[0]["name"] == "stray.txt" and misplaced[0]["bytes"] == 6
     assert misplaced[0]["path"].endswith("/stray.txt")
+    assert misplaced[0]["fresh"] is True and misplaced[0]["collected"] is True
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec.get("misplaced_outputs") == misplaced
+    assert not rec.get("missing_outputs"), rec
+    by_path = {e["path"]: e for e in rec["pulled"]}
+    assert set(by_path) == {"present.txt", "stray.txt"}
+    assert by_path["stray.txt"]["route"] == "misplaced" and by_path["stray.txt"]["bytes"] == 6
+    results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
+    assert (results / "stray.txt").read_text() == "stray\n"
+
+
+def install_stale_stray_job(env, name):
+    """A bare job whose payload back-dates its cwd-root output
+    by an hour — the shape of an earlier run's leftover sitting
+    at the root when a later run declares the same name."""
+    root = Path(env["TEST_REPO_ROOT"])
+    job_dir = root / "jobs" / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "payload.py").write_text(
+        "import argparse, os, sys, time\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "a = ap.parse_args()\n"
+        "out = Path(a.out)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'present.txt').write_text('here\\n')\n"
+        "p = Path('stray.txt')\n"
+        "p.write_text('stale\\n')\n"
+        "old = time.time() - 3600\n"
+        "os.utime(p, (old, old))\n"
+        "sys.exit(0)\n"
+    )
+    manifest = {"name": name, "script": f"jobs/{name}/payload.py", "args": [], "outputs": ["present.txt", "stray.txt"], "shape": "cpu-highram", "checkpoint_pull_seconds": 1, "timeout": 180}
+    (job_dir / "job.json").write_text(json.dumps(manifest))
+    return job_dir
+
+
+def test_finalize_names_but_never_collects_a_stale_root_output(tmp_path):
+    """The freshness guard: a root file older than the run is
+    an earlier run's leftover — it is named in
+    misplaced_outputs with collected False, stays in
+    missing_outputs, and is NOT delivered as this run's
+    output. An unguarded collect would certify a prior run's
+    artifact as this run's result."""
+    env = runner_env(tmp_path)
+    install_stale_stray_job(env, "stalestray")
+    r = subprocess.run([sys.executable, str(run_bin(env)), "stalestray"], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "complete"
+    assert out.get("missing_outputs") == ["stray.txt"], out
+    misplaced = out.get("misplaced_outputs")
+    assert misplaced and len(misplaced) == 1, out
+    assert misplaced[0]["fresh"] is False and misplaced[0]["collected"] is False
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert [e["path"] for e in rec["pulled"]] == ["present.txt"]
     results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
     assert not (results / "stray.txt").exists()

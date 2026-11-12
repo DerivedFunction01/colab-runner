@@ -133,30 +133,45 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     return rec.get("pulled", [])
 
 
-def misplaced_outputs(session: str, missing: list) -> list:
+# Freshness skew for misplaced collection: a root file whose
+# mtime is within this many seconds BEFORE the run's started
+# stamp still counts as written during the run (fs
+# granularity, and the started stamp is taken locally a few
+# seconds before the payload's first write).
+MISPLACED_SKEW_S = 120
+
+
+def misplaced_outputs(session: str, missing: list, started_epoch: "float | None" = None) -> list:
     """Where the missing declared outputs actually sit, when
     they sit at the payload's cwd root: one bounded exec stats
-    each missing name there and returns [{name, path, bytes}]
-    for the ones present. The specimen class (2026-11-11: gate
-    scripts writing cwd-relative paths landed their outputs at
-    /content while their out dirs held only harness files, and
-    the finalize record said only "missing") is usually a
-    lane-script addressing slip, and naming where the file
-    actually is turns a downstream hunt into a one-line fix.
-    Diagnostic only — the out-dir contract stands, a misplaced
-    output is named, never pulled — and a failed probe yields
-    []: the naming must never break a finalize."""
+    each missing name there and returns [{name, path, bytes,
+    mtime, fresh}] for the ones present. The specimen class
+    (2026-11-11: gate scripts writing cwd-relative paths
+    landed their outputs at /content while their out dirs held
+    only harness files, and the finalize record said only
+    "missing") is usually a lane-script addressing slip, and
+    naming where the file actually is turns a downstream hunt
+    into a one-line fix. Freshness is judged session-side
+    against the run's own start (its record's started stamp,
+    passed in as an epoch): a file this run wrote is fresh, a
+    leftover from an earlier run is stale — the root
+    accumulates strays across runs, and the distinction is
+    what finalize's collection rides. No started stamp, no
+    freshness: the entry is named only. A failed probe yields
+    []: the probe must never break a finalize."""
     if not missing:
         return []
     probe = (
         "import json, os\n"
         "BASE = '/content' if os.getcwd() == '/content' else os.getcwd()\n"
         f"NAMES = {json.dumps(list(missing))}\n"
+        f"ref = {started_epoch!r}\n"
         "found = []\n"
         "for name in NAMES:\n"
         "    p = os.path.join(BASE, name)\n"
         "    if os.path.isfile(p):\n"
-        "        found.append({'name': name, 'path': p, 'bytes': os.path.getsize(p)})\n"
+        "        st = os.stat(p)\n"
+        f"        found.append({{'name': name, 'path': p, 'bytes': st.st_size, 'mtime': st.st_mtime, 'fresh': ref is not None and st.st_mtime >= ref - {MISPLACED_SKEW_S}}})\n"
         "print(json.dumps(found))\n"
     )
     try:
@@ -190,6 +205,76 @@ def misplaced_outputs(session: str, missing: list) -> list:
     return [e for e in found if isinstance(e, dict) and e.get("name") in wanted]
 
 
+def collect_misplaced(rec: dict, session: str, misplaced: list) -> list:
+    """Pull the FRESH misplaced outputs into results/<run_id>/,
+    under the same truthfulness rules as the out-dir pull
+    (staging sibling, landed size must equal the probed size,
+    shrink rotation, one record entry per path). Stale
+    entries — leftovers an earlier run wrote — are never
+    collected: delivering a prior run's file as this run's
+    output would be a silent wrong result, strictly worse
+    than a named absence. Returns the new pull entries
+    (route "misplaced"); each collected entry is flagged on
+    its misplaced entry in place."""
+    collected = []
+    for entry in misplaced:
+        entry["collected"] = False
+        if not entry.get("fresh"):
+            continue
+        name = entry["name"]
+        dest = REPO / "results" / rec["run_id"] / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = dest.with_name(dest.name + ".pulling")
+        new_entry = None
+        if entry["bytes"] > SINGLE_FILE_CEILING_BYTES:
+            res = transfer.chunked_download(session, name, staging)
+            if res.get("ok"):
+                new_entry = {"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "misplaced-chunked"}
+            else:
+                rec["last_pull_error"] = f"misplaced pull of {name} failed at {now()}: chunked stage {res.get('stage', 'unknown stage')}"
+                staging.unlink(missing_ok=True)
+                continue
+        else:
+            try:
+                # Addressed at the session root, as the out-dir
+                # pull addresses its files (/content/<name>):
+                # the probed path is where the probe found the
+                # file, the download speaks session paths.
+                colab("download", "-s", session, f"/content/{name}", str(staging), timeout=600)
+            except Exception as exc:  # noqa: BLE001 — a failed pull is a noted absence, never a landed file
+                rec["last_pull_error"] = f"misplaced pull of {name} failed at {now()}: {exc}"
+                staging.unlink(missing_ok=True)
+                continue
+            if staging.exists():
+                landed = staging.stat().st_size
+                if landed != entry["bytes"]:
+                    rec["last_pull_error"] = f"misplaced pull of {name} landed {landed} bytes against a probed size of {entry['bytes']} at {now()}"
+                    staging.unlink(missing_ok=True)
+                    continue
+                new_entry = {"path": name, "bytes": landed, "sha256": hashlib.sha256(staging.read_bytes()).hexdigest(), "route": "misplaced"}
+        if new_entry is None:
+            continue
+        if dest.exists() and 0 < dest.stat().st_size > new_entry["bytes"]:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            rotated = dest.with_name(f"{name}.rotated-{stamp}")
+            suffix = 2
+            while rotated.exists():
+                rotated = dest.with_name(f"{name}.rotated-{stamp}-{suffix}")
+                suffix += 1
+            dest.rename(rotated)
+            new_entry["rotated"] = {"to": rotated.name, "bytes": rotated.stat().st_size}
+            rec["last_pull_rotation"] = f"{name} rotated to {rotated.name} at {now()}"
+        staging.replace(dest)
+        entry["collected"] = True
+        collected.append(new_entry)
+    if collected:
+        by_path = {e["path"]: e for e in rec.get("pulled", [])}
+        for e in collected:
+            by_path[e["path"]] = e
+        rec["pulled"] = list(by_path.values())
+    return collected
+
+
 def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before) -> tuple[int, dict]:
     """The terminal tail, shared by the foreground poll loop and
     --poll: final pull, the payload's own exit code, the terminal
@@ -214,16 +299,30 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     # do). The payload's exit code stays the outcome truth;
     # the shortfall is recorded and returned, not fatal.
     missing = [name for name in job.get("outputs", []) if name not in {entry["path"] for entry in pulled}]
+    # Misplaced naming + guarded collection: a missing output
+    # that sits at the payload's cwd root is named with its
+    # path and size beside the shortfall — the usual cause is
+    # a payload writing cwd-relative paths instead of its out
+    # dir. A FRESH one (written during this run, judged
+    # against the run's own started stamp) is also collected
+    # through the pull: five consumer runs on 2026-11-12 lost
+    # or hand-recovered verdicts to cwd-root writes, one
+    # outright. A STALE one — an earlier run's leftover — is
+    # named only, never delivered as this run's output.
+    started_epoch = None
+    try:
+        started_epoch = datetime.fromisoformat(str(rec.get("started_at"))).timestamp()
+    except (TypeError, ValueError):
+        started_epoch = None
+    misplaced = misplaced_outputs(session, missing, started_epoch) if missing else []
+    if misplaced:
+        collected = collect_misplaced(rec, session, misplaced)
+        if collected:
+            pulled = rec.get("pulled", [])
+            missing = [name for name in missing if name not in {e["path"] for e in collected}]
+        rec["misplaced_outputs"] = misplaced
     if missing:
         rec["missing_outputs"] = missing
-    # Misplaced naming: a missing output that sits at the
-    # payload's cwd root is named with its path and size beside
-    # the shortfall — the usual cause is a payload writing
-    # cwd-relative paths instead of its out dir, and the record
-    # should say so rather than leaving the hunt downstream.
-    misplaced = misplaced_outputs(session, missing) if missing else []
-    if misplaced:
-        rec["misplaced_outputs"] = misplaced
     # Empty-output accounting (the reversed polarity of the
     # missing case): an output can be present in the pull and
     # still be wrong — 0 bytes where the reader sizes the remote

@@ -8,6 +8,16 @@ heartbeat_job.py are the reference implementations; the workload payloads
 (facade_battery_job, facade_memory_profiler, fixture_gathering_job) take
 the contract from here instead of each re-implementing it.
 
+Declared outputs (the manifest's "outputs") belong in the out dir: that
+is the directory the pull reads. A declared output written to the
+payload's cwd root instead is caught at finalize — the run record names
+it in misplaced_outputs, and when the file was written during this run
+(judged by mtime against the run's started stamp) it is collected into
+the results like an out-dir output; an older file at the root is an
+earlier run's leftover and is named only, never delivered as this run's
+output. Writing to the out dir remains the contract; the root collection
+is the safety net, not a second address to write to.
+
 This module rides beside the payload that imports it: a manifest that
 launches an importing payload lists snippets/job_harness.py among its
 uploads, so the two land side by side in /content on the VM (and sit
