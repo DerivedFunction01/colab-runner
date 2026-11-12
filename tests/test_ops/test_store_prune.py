@@ -52,7 +52,11 @@ def _plan_paths(root: Path) -> set:
 def test_records_and_in_flight_work_are_never_candidates(tmp_path):
     root = _sandbox(tmp_path)
     _record(root, "runs", "run-live.json", {"state": "polling", "session": "s1"})
-    _record(root, "runs", "run-done.json", {"state": "complete", "session": "s1"})
+    _record(root, "runs", "run-done.json", {"state": "complete", "session": "s1", "last_evidence_at": "2026-11-09T00:00:00+00:00"})
+    done_rec = root / "results" / "runs" / "run-done.json"
+    old = time.time() - 3 * 3600
+    os.utime(done_rec, (old, old))  # terminal AND cold: past the output grace
+    _record(root, "runs", "run-fresh.json", {"state": "complete", "session": "s1"})  # terminal but fresh: a collector may be mid-verdict
     _record(root, "xfers", "up-1.json", {
         "state": "complete", "remote_name": "done.bundle",
         "started_at": "2026-11-12T00:00:00+00:00", "finished_at": "2026-11-12T00:01:00+00:00",
@@ -62,11 +66,13 @@ def test_records_and_in_flight_work_are_never_candidates(tmp_path):
     _write(root / "var" / "fresh.bundle", age_s=60)           # under the floor: kept
     _write(root / "var" / "stray.bundle.part-000", age_s=60)  # fresh staging: kept
     _write(root / "results" / "run-live" / "out.bin")         # in flight: kept
-    _write(root / "results" / "run-done" / "out.bin")         # terminal payload: prunable
+    _write(root / "results" / "run-done" / "out.bin")         # terminal + cold payload: prunable
+    _write(root / "results" / "run-fresh" / "out.bin")        # terminal but inside the grace: kept
     chosen = _plan_paths(root)
     assert "var/done.bundle.part-000" in chosen
     assert "var/old.bundle" in chosen
     assert "results/run-done" in chosen
+    assert "results/run-fresh" not in chosen, "the prune swept a fresh terminal run's outputs (the M1 mid-collection specimen)"
     assert "var/fresh.bundle" not in chosen
     assert "var/stray.bundle.part-000" not in chosen
     assert "results/run-live" not in chosen

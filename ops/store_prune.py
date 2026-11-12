@@ -18,7 +18,8 @@ in order:
      record-less parts past the resume window (24 h) — a
      failed transfer's parts are resume state, kept a day;
   4. results/<run-id>/ payload dirs of terminal runs;
-  5. gate scratch bundles/patches in ~/workspace/tmp-gate.
+  5. gate scratch bundles/patches in the workspace's
+     tmp-gate directory.
 
 Never touched: run and transfer RECORDS (results/runs,
 results/xfers — metadata and verdicts are the evidence the
@@ -51,6 +52,14 @@ BUNDLE_AGE_FLOOR_S = 2 * 3600
 RESUME_WINDOW_S = 24 * 3600
 FRESH_XFER_S = 3600
 SCRATCH_AGE_FLOOR_S = 3600
+# A completed run's outputs are at their hottest while its
+# collector assembles the verdict from them (2026-11-12: a
+# prune pass swept an M1 gate's outputs mid-collection).
+# Terminal alone is not cold: a run's payload dir is a
+# candidate only once its last activity — collector
+# heartbeat first, the record's own stamps as fallback —
+# is older than this grace.
+OUTPUT_GRACE_S = 2 * 3600
 
 
 def _epoch(iso) -> float:
@@ -150,17 +159,23 @@ def plan(target_free_gb: float) -> tuple[list, dict]:
             manifest = Path(str(bundle) + ".manifest.json")
             if manifest.exists():
                 add(2, manifest, "snapshot bundles past the age floor")
-    terminal_dirs = set()
+    terminal_cold = set()
+    all_record_stems = {p.stem for p in (RESULTS / "runs").glob("*.json")}
     for path in (RESULTS / "runs").glob("*.json"):
         try:
             rec = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if rec.get("state") in ("complete", "failed", "orphaned"):
-            terminal_dirs.add(path.stem)
+        if rec.get("state") not in ("complete", "failed", "orphaned"):
+            continue
+        activity = path.stat().st_mtime
+        for key in ("collector_at", "last_evidence_at", "finished_at"):
+            activity = max(activity, _epoch(rec.get(key)))
+        if now - activity > OUTPUT_GRACE_S:
+            terminal_cold.add(path.stem)
     for entry in RESULTS.iterdir():
         if entry.is_dir() and entry.name not in ("runs", "xfers"):
-            if entry.name in terminal_dirs or now - entry.stat().st_mtime > RESUME_WINDOW_S:
+            if entry.name in terminal_cold or (entry.name not in all_record_stems and now - entry.stat().st_mtime > RESUME_WINDOW_S):
                 add(4, entry, "payload dirs of terminal runs")
     if TMP_GATE.exists():
         for scratch in list(TMP_GATE.glob("*.bundle")) + list(TMP_GATE.glob("*.patch")):
