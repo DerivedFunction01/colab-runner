@@ -287,6 +287,50 @@ def test_finalize_flags_a_root_output_contended_by_a_live_co_tenant(tmp_path):
     assert (results / "present.txt").exists()
 
 
+def test_finalize_collects_despite_a_dead_co_tenant_with_no_finished_stamp(tmp_path):
+    """Refinement specimen (routed 2026-11-12 from Lane 10A's
+    collision verification): the co-tenant record is the
+    lane's own first attempt — failed and terminal, but with
+    no finished_at stamped, so the guard priced its window
+    end as NOW and refused the re-run's fresh root output as
+    contended with the dead run, 82 minutes after the dead
+    run's last evidence. A terminal run's window ends at its
+    evidence, never at now: the re-run's output collects.
+    The setup runs the job once, then rewrites its record
+    into the specimen's exact shape (failed, finished_at
+    removed, evidence stamps aged) before the re-run."""
+    import time as _time
+    from datetime import datetime, timezone
+
+    env = runner_env(tmp_path)
+    install_stray_job(env, "retrylane")
+    r1 = subprocess.run([sys.executable, str(run_bin(env)), "retrylane"], capture_output=True, text=True, env=env, timeout=300)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    first_run = json.loads(r1.stdout)["run_id"]
+    runs = runs_dir(env)
+    dead_path = runs / f"{first_run}.json"
+    dead = json.loads(dead_path.read_text())
+    now = _time.time()
+    dead["state"] = "failed"
+    dead.pop("finished_at", None)
+    dead["started_at"] = datetime.fromtimestamp(now - 7200, tz=timezone.utc).isoformat()
+    dead["last_evidence_at"] = datetime.fromtimestamp(now - 3600, tz=timezone.utc).isoformat()
+    dead["collector_at"] = dead["last_evidence_at"]
+    dead_path.write_text(json.dumps(dead))
+    r2 = subprocess.run([sys.executable, str(run_bin(env)), "retrylane"], capture_output=True, text=True, env=env, timeout=300)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    out = json.loads(r2.stdout)
+    assert out["state"] == "complete"
+    misplaced = out.get("misplaced_outputs")
+    assert misplaced and len(misplaced) == 1, out
+    entry = misplaced[0]
+    assert entry["name"] == "stray.txt" and entry["fresh"] is True
+    assert entry.get("contended") is not True and entry["collected"] is True, entry
+    assert "stray.txt" not in (out.get("missing_outputs") or []), out
+    results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
+    assert (results / "stray.txt").exists()
+
+
 def install_sleepy_mapped_job(env, name):
     """The sleepy co-tenant with MAPPED outputs ({"local",
     "remote"} entries instead of plain names) — the manifest

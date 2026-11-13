@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 
 from .foundation import REPO, RUNS, colab, now, transfer
-from .records import mark_terminal
+from .records import TERMINAL_STATES, mark_terminal
 
 # E6: the file channel's measured single-file reliability ceiling
 # (AGENTS.md, file channel) — a declared output larger than this
@@ -348,7 +348,18 @@ def flag_contended_misplaced(rec: dict, session: str, misplaced: list) -> None:
             start = _epoch(other.get("started_at"))
             if start is None:
                 continue
-            end = _epoch(other.get("finished_at")) or now_epoch
+            if other.get("state") in TERMINAL_STATES:
+                # A terminal run's window is closed: it ends at
+                # its evidence — finished_at, else the freshest
+                # collector evidence, else its start — never at
+                # now. The open-ended price let a lane's own dead
+                # first attempt (failed, no finished_at stamped)
+                # refuse its re-run's fresh outputs as contended
+                # over an hour after the dead run's last evidence
+                # (2026-11-12, Lane 10A specimen).
+                end = _epoch(other.get("finished_at")) or _epoch(other.get("last_evidence_at")) or _epoch(other.get("collector_at")) or start
+            else:
+                end = now_epoch
             if start - MISPLACED_SKEW_S <= entry["mtime"] <= end + MISPLACED_SKEW_S:
                 entry["contended"] = True
                 entry["contended_with"] = other.get("run_id")
