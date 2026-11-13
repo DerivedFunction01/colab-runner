@@ -608,7 +608,11 @@ def main() -> int:
                 pull_outputs(rec, job, session, remote_out, state)
                 save_record(rec)
             log = state.get("heartbeat_tail") or []
-            if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None:
+            # The checkpoint exit_code leg mirrors --poll's: a
+            # payload whose checkpoint is its last act while its
+            # process lingers has already decided its outcome,
+            # and finalize reads that code as authoritative.
+            if any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None or (state.get("checkpoint") or {}).get("exit_code") is not None:
                 break
             if not state.get("job_pids") and not state.get("job_log_tail") and state.get("exit_stamp") is None and not state.get("checkpoint") and _launch_age_s(rec) > _absence_grace_s():
                 # Total absence past the grace bound: no process,

@@ -138,7 +138,15 @@ def poll_run(run_id: str) -> int:
         pull_outputs(rec, job, session, remote_out, state)
         save_record(rec)
     log = state.get("heartbeat_tail") or []
-    complete = any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None
+    # The checkpoint's exit_code is a terminal leg of its own:
+    # finalize treats it as the authoritative outcome, and a
+    # payload that writes its checkpoint as its last act while
+    # its process lingers (a booted server holding the process
+    # open) never produces a wrapper stamp or a 'complete'
+    # line — without this leg such runs polled as "still
+    # running" forever after their outcome was already written
+    # (2026-11-12 specimens: exit_code 0 and 92 alike).
+    complete = any("complete" in ln for ln in log) or (job.get("units") and done_units >= job["units"]) or state.get("exit_stamp") is not None or (state.get("checkpoint") or {}).get("exit_code") is not None
     if not complete and not state.get("job_pids") and not state.get("job_log_tail") and state.get("exit_stamp") is None and not state.get("checkpoint") and _launch_age_s(rec) > _absence_grace_s():
         # Total absence past the grace bound: the launch never
         # landed, and the record closes as launch-lost instead
