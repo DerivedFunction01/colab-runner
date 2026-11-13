@@ -103,6 +103,25 @@ def test_acquire_never_clears_record_on_unconfirmed_absence(repo, tmp_path, monk
     assert lease.load_record(repo, "standard") is None
 
 
+def test_pin_on_unconfirmed_absence_refuses_as_pin_unavailable(repo, tmp_path, monkeypatch):
+    """A pin named the record: the pin check's read flickers
+    unknown, the candidate loop's read lands absent — an
+    unconfirmed absence refuses with the pin's own verdict (and
+    the record intact), never the creation gate's."""
+    seed_record(repo)
+    calls = {"n": 0}
+
+    def flicker(colab, session, *a, **k):
+        calls["n"] += 1
+        return "unknown" if calls["n"] == 1 else "absent"
+
+    monkeypatch.setattr(lease.sessions, "session_state", flicker)
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW, prefer_session="standard")
+    assert out["action"] == "pin-unavailable"
+    assert "unconfirmed" in out["reason"]
+    assert lease.load_record(repo, "standard") is not None
+
+
 # --- Concurrent leases (profile retirement) ------------------------------------
 # Use is shared, capacity is per request: any caller's acquire may
 # use (ride) a live lease at the shape, whoever created it — the

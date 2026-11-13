@@ -147,6 +147,11 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
                 since = foundation.absent_since(repo, session)
                 if since is None or (now_dt - since).total_seconds() < foundation.ABSENT_CONFIRM_S:
                     foundation.stamp_absent(repo, session, since or now_dt, now_dt)
+                    if prefer_session is not None and session == prefer_session:
+                        # A pin asked for this record by name: the
+                        # honest refusal is the pin's, not the
+                        # creation gate the fall-through reaches.
+                        return {"action": "pin-unavailable", "session": prefer_session, "reason": "named session is absent (absence unconfirmed)", "record": cand}
                     continue
                 foundation.clear_absent_stamp(repo, session)
             sessions.stop_session_safe(colab, session)  # expired or confirmed dead: clear before recreating
