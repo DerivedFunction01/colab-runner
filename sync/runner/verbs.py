@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .foundation import REPO, RUNS, TOKEN, lease, mirror, now
-from .pull import finalize_run, pull_outputs
+from .pull import finalize_run, normalize_manifest_outputs, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
 from .records import TERMINAL_STATES, collector_stale, load_run_record, mark_terminal, save_record, stamp_collector
 from .sweep import orphan_sweep
@@ -105,6 +105,9 @@ def poll_run(run_id: str) -> int:
         print(f"colab-run --poll: no job manifest at {manifest_path}", file=sys.stderr)
         return 2
     job = json.loads(manifest_path.read_text())
+    # Same load-time normalization the launch performs, so a
+    # mapped-outputs manifest polls and pulls by plain names.
+    normalize_manifest_outputs(job)
     orphan_sweep()
     rec = load_run_record(run_id) or rec
     if rec.get("state") in TERMINAL_STATES:

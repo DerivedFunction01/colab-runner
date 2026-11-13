@@ -245,6 +245,38 @@ def _manifest_outputs(job_name) -> list:
     return _output_names(manifest.get("outputs"))
 
 
+def normalize_manifest_outputs(job) -> None:
+    """Reduce a loaded manifest's declared outputs to plain
+    local names, in place, once at load — so every downstream
+    consumer (finalize, pull, the launch advisory) sees the
+    string contract whether the manifest declared plain names
+    or mapped entries. Mapped outputs carry no pull semantics
+    of their own (no consumer ever implemented the remote /
+    archive fields); the local name is the whole contract."""
+    if isinstance(job.get("outputs"), list):
+        job["outputs"] = _output_names(job["outputs"])
+
+
+def manifest_shape_error(job) -> "str | None":
+    """A loud-refusal verdict for the manifest fields that have
+    no tolerance semantics: uploads and args are consumed as
+    plain strings (a path to upload, an argv entry to quote),
+    and a mapped entry there crashed a launch mid-flight in
+    the wild (2026-11-12, dict-shaped uploads). Returns an
+    error naming the field and the offending entry, or None
+    when the shapes are the contract's."""
+    for field in ("uploads", "args"):
+        entries = job.get(field)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            return f"manifest {field} must be a list of strings, got {type(entries).__name__}"
+        for entry in entries:
+            if not isinstance(entry, str):
+                return f"manifest {field} entry is not a string: {entry!r}"
+    return None
+
+
 def _session_records(session: str, exclude_run_id: str) -> list:
     """Every other run record on the session (any state), read
     best-effort: a corrupt or vanishing neighbour record is

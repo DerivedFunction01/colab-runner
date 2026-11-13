@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .foundation import REPO, RUNS, TOKEN, colab, git_identity, lease, mirror, now, repo_registry, transfer
 from .launch import orphan_notes, upload_one
-from .pull import finalize_run, output_name_overlaps, pull_outputs
+from .pull import finalize_run, manifest_shape_error, normalize_manifest_outputs, output_name_overlaps, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
 from .records import load_run_record, mark_terminal, save_record, stamp_collector
 from .sweep import orphan_sweep
@@ -109,6 +109,18 @@ def main() -> int:
         print(f"no job manifest at {manifest_path}", file=sys.stderr)
         return 2
     job = json.loads(manifest_path.read_text())
+    # Manifest shape, settled once at load, before any session
+    # work: outputs normalize to plain local names (mapped
+    # entries tolerated), while uploads / args entries that are
+    # not plain strings refuse the launch loudly, naming the
+    # field and the entry — the shapes have no tolerance
+    # semantics, and discovering that mid-launch cost a
+    # consumer a crashed run (2026-11-12).
+    shape_err = manifest_shape_error(job)
+    if shape_err:
+        print(f"colab-run: job {job_name}: {shape_err}", file=sys.stderr)
+        return 2
+    normalize_manifest_outputs(job)
     # Caller claim: flag over the manifest's caller key over
     # $COLAB_CALLER; a presented but unregistered claim is refused
     # at claim time, before anything starts.
