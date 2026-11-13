@@ -5,7 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, catalog, gate as _mod_gate, sessions, records as _mod_records, spend as _mod_spend, access, keepalive, grants, orphans, bridge, syncclaims, provisioning, identity, reconcile
+from . import foundation, catalog, gate as _mod_gate, sessions, records as _mod_records, spend as _mod_spend, access, keepalive, grants, listeners, orphans, bridge, syncclaims, provisioning, identity, reconcile
 
 _extend_guard_spec = _ilu.spec_from_file_location("colab_extend_guard", Path(__file__).resolve().parent.parent / "extend_guard.py")
 extend_guard = _ilu.module_from_spec(_extend_guard_spec)
@@ -379,6 +379,21 @@ def state_orphans(colab, repo: Path, now_dt: datetime | None = None) -> dict:
     return {"orphans": out}
 
 
+def state_listeners(repo: Path, now_dt: datetime | None = None) -> dict:
+    """Portion: the per-session listener census, keyed by
+    session — each lease's stamped census with its suspect
+    derivation (listeners module). A pure local read of the
+    collection duty's stamps: the portion never probes, so a
+    session with no stamp yet serves its honest empty."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    out = {}
+    for rec in _mod_records.all_records(repo):
+        session = rec.get("session")
+        if session:
+            out[session] = listeners.listeners_state(repo, rec, now_dt)
+    return {"listeners": out}
+
+
 def state_torn_records(repo: Path) -> dict:
     """Portion: the torn-record findings (E1) — lease-record
     files whose contents cannot yield a record, served by
@@ -404,4 +419,5 @@ def state(colab, repo: Path) -> dict:
     out.update(state_orphans(colab, repo))
     out.update(state_torn_records(repo))
     out.update(state_extend_guard(repo))
+    out.update(state_listeners(repo))
     return out

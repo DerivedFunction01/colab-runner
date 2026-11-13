@@ -12,7 +12,7 @@ function renderSections(names) {
   // section (controls read records + specs, leases read specs for
   // labels) simply re-renders when the other portion arrives.
   if (names.includes("budget")) renderBudget();
-  if (names.includes("records") || names.includes("specs")) {
+  if (names.includes("records") || names.includes("specs") || names.includes("listeners")) {
     renderLeases();
     renderAccess();
     renderControls();
@@ -42,7 +42,7 @@ for (const name of Object.keys(PARTS)) {
 
 function mergeParts() {
   const merged = {};
-  for (const name of ["records", "specs", "budget", "grant", "orphans"]) {
+  for (const name of ["records", "specs", "budget", "grant", "orphans", "listeners"]) {
     if (partState[name].data) Object.assign(merged, partState[name].data);
   }
   S = merged;

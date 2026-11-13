@@ -257,12 +257,17 @@ def test_state_portions_and_composition(tmp_path, monkeypatch):
     orphans = lease_mod.state_orphans(fake, repo)
     assert orphans == {"orphans": []}  # both fake sessions hold records
 
+    listeners = lease_mod.state_listeners(repo)
+    assert set(listeners) == {"listeners"}
+    assert set(listeners["listeners"]) == {r["record"]["session"] for r in records["records"]}
+
     composed = lease_mod.state(fake, repo)
     # The fake's help output parses as no catalog, so the specs
     # portion's catalog_error rides the composed payload exactly as
     # it did before the split.
-    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access", "extend_guard", "orphans", "torn_records"}
+    assert set(composed) == {"records", "grant", "specs", "budget", "envelope", "bridge", "catalog_error", "session_gate", "access", "extend_guard", "orphans", "torn_records", "listeners"}
     assert composed["orphans"] == orphans["orphans"]
+    assert composed["listeners"] == listeners["listeners"]
     assert composed["catalog_error"] == specs["catalog_error"]
     assert composed["records"] == records["records"]
     assert composed["budget"] == budget["budget"]

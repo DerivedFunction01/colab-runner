@@ -495,6 +495,17 @@ function wireExtendPickers(container) {
   });
 }
 
+function listenerLines(session) {
+  // The listeners portion is keyed by session and served ready
+  // (suspect derivation included); the card names each listener
+  // and flags suspects — honest absence (no census yet, or a
+  // census with no listeners) renders no line at all.
+  const census = (S && S.listeners && S.listeners[session]) || null;
+  if (!census) return "";
+  if (census.error) return `<p class="kvline">Listeners <b>census failed</b></p>`;
+  return (census.listeners || []).map((l) => `<p class="kvline">Port <b>${esc(String(l.port))}</b> · pid ${esc(String(l.pid))} · <span class="mono">${esc(l.cwd || "—")}</span>${(l.suspect || []).length ? ` <span class="chip warn">suspect: ${esc(l.suspect.join(", "))}</span>` : ""}</p>`).join("");
+}
+
 function renderLeases() {
   const records = (S && S.records) || [];
   const box = $("lease-cards");
@@ -512,6 +523,7 @@ function renderLeases() {
       <p class="kvline">Deadline <b>${esc(fmtTime(rec.deadline))}</b> · session <span class="mono">${esc(rec.session || "—")}</span>${rec.caller ? ` · Caller <b>${esc(rec.caller)}</b>` : ""}</p>
       <p class="kvline">Heartbeat <b>${age == null ? "unknown" : `${Math.round(age)}s ago`}</b> · Pulse <b>${esc(pulse || "—")}</b> · Burn <b>${esc(burn)}</b></p>
       ${entry.sync_claim ? `<p class="kvline">Sync claim <b>${esc(entry.sync_claim.caller || "—")}</b> · until <b>${esc(fmtTime(entry.sync_claim.expires_at))}</b></p>` : ""}
+      ${listenerLines(session)}
       <button type="button" class="danger" data-stop="${esc(session)}">Terminate</button>
       <button type="button" class="ghost" data-xtoggle="${esc(session)}">Extend</button>
       <button type="button" class="ghost" data-stoggle="${esc(session)}">Shorten</button>
@@ -648,5 +660,6 @@ const PARTS = {
   budget: { url: "/api/state/budget", cadence: 30000 },
   grant: { url: "/api/state/grant", cadence: 60000 },
   orphans: { url: "/api/state/orphans", cadence: 15000 },
+  listeners: { url: "/api/state/listeners", cadence: 60000 },
   logs: { url: "/api/outbox?after=0", cadence: 15000 },
 };

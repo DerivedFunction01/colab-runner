@@ -44,7 +44,7 @@ FAILURE_ACTIONS = {"refused-budget", "create-failed", "lease-disabled", "error",
 BUDGET_CAP_FIELDS = {"daily_cu_budget": "--daily", "monthly_cu_budget": "--monthly", "standing_daily_cu_cap": "--standing-daily"}
 CORE_TIMEOUT_S = 1800
 
-STATE_PARTS = ("records", "specs", "budget", "grant", "meta", "orphans")
+STATE_PARTS = ("records", "specs", "budget", "grant", "meta", "orphans", "listeners")
 
 
 def lease_bin() -> str:

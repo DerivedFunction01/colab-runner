@@ -3,7 +3,7 @@ import fcntl
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from . import foundation, sessions, records, spend, access, keepalive, grants, renewal, lifecycle, identity
+from . import foundation, sessions, records, spend, access, keepalive, grants, listeners, renewal, lifecycle, identity
 
 def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, now_dt: datetime) -> dict:
     """One record's reap: the pre-two-tier reap logic (hard deadline,
@@ -155,6 +155,15 @@ def _reap_pass(colab, repo: Path, now_dt: datetime | None = None) -> dict:
         if keepalive._capture_session_host(repo, rec, "reconcile", spool_on_first=False):
             records.save_record(repo, rec)
     results = [{"session": rec.get("session"), **_reap_record(colab, repo, cfg, rec, grant, now_dt)} for rec in recs]
+    # Listener census (standing hygiene, 2026-11-12): throttled
+    # per session inside maybe_collect; the collector stamps its
+    # own failures and never raises, and this guard keeps even a
+    # collector defect out of the reap's path.
+    for rec in recs:
+        try:
+            listeners.maybe_collect(colab, repo, rec, now_dt)
+        except Exception:  # noqa: BLE001
+            pass
     top = results[0] if len(results) == 1 else None
     if top is None:
         for action in _REAP_PRIORITY:

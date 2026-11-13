@@ -299,13 +299,14 @@ def main() -> int:
             "grant": lease.state_grant,
             "meta": lease.state_meta,
             "orphans": lease.state_orphans,
+            "listeners": lambda colab, repo: lease.state_listeners(repo),
         }
         if not rest:
             result = lease.state(cr.colab, REPO)
         elif len(rest) == 2 and rest[0] == "--part" and rest[1] in portions:
             result = portions[rest[1]](cr.colab, REPO)
         else:
-            print("colab-lease: state takes [--part records|specs|budget|grant|meta|orphans]", file=sys.stderr)
+            print("colab-lease: state takes [--part records|specs|budget|grant|meta|orphans|listeners]", file=sys.stderr)
             return 2
     elif cmd == "budget-caps":
         updates = {}

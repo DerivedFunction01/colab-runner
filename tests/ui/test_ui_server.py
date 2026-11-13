@@ -570,6 +570,29 @@ def test_state_orphans_part_served(ui):
     assert "state --part orphans" in ui.invocations()
 
 
+def test_state_listeners_part_served(ui):
+    """The listener census rides its own portion, keyed by
+    session, suspects derived by the core."""
+    data = ui.get_json("/api/state/listeners")
+    census = data["listeners"]["amber-otter-42"]
+    assert census["listeners"][0]["port"] == 3273
+    assert census["listeners"][0]["suspect"] == ["deleted-cwd", "predates-lease"]
+    assert "state --part listeners" in ui.invocations()
+
+
+def test_frontend_polls_listeners_and_renders_them():
+    """app.js polls the listeners portion and the lease card
+    renders the served census fields; poll.js merges the
+    portion into S and re-renders leases when it lands."""
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    assert "/api/state/listeners" in js
+    assert "listenerLines" in js
+    for field in ("port", "pid", "cwd", "suspect"):
+        assert field in js, field
+    poll = (REPO / "ui" / "static" / "poll.js").read_text()
+    assert '"listeners"' in poll
+
+
 def test_state_orphans_failure_is_isolated(tmp_path):
     server = UiServer(tmp_path, extra_env={"STUB_LEASE_FAIL": "state:orphans"})
     try:

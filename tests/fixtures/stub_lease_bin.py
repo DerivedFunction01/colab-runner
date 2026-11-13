@@ -53,6 +53,18 @@ ORPHAN = {
 }
 
 
+LISTENERS = {
+    SESSION: {
+        "at": "2026-11-01T00:05:00+00:00",
+        "age_s": 300,
+        "error": None,
+        "listeners": [
+            {"port": 3273, "pid": 947, "cwd": "/content/sp-s4draw/apps/web (deleted)", "cmd": "next-server", "started_at": "2026-10-31T23:00:00+00:00", "suspect": ["deleted-cwd", "predates-lease"]},
+        ],
+    }
+}
+
+
 def record(session, shape="cpu-highram"):
     return {
         "session": session,
@@ -147,6 +159,7 @@ def main(argv):
             "session_gate": {"enabled": True, "agent_classes": ["high_ram"], "bypass_actors": ["panel"], "infra_actor": "standing"},
             "bridge": None,
             "orphans": [dict(ORPHAN)],
+            "listeners": LISTENERS,
         }
         if part is not None:
             slices = {
@@ -156,6 +169,7 @@ def main(argv):
                 "grant": {"grant": out["grant"], "envelope": out["envelope"]},
                 "meta": {"bridge": out["bridge"]},
                 "orphans": {"orphans": out["orphans"]},
+                "listeners": {"listeners": out["listeners"]},
             }
             out = slices[part]
     elif cmd == "acquire":
