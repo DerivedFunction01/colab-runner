@@ -68,6 +68,17 @@ client type. The panel's re-auth cadence is read from it.
   auth-required result (rc 3, empty stdout) and drops a marker at
   `var/auth-required.json`, cleared by the next healthy call. Inert
   under `COLAB_BIN` (test fakes are not credential flows).
+- The same funnel snapshots the session binding (`sessions.json`,
+  landed 2026-11-13): the CLI rewrites it non-atomically on
+  ordinary calls, and a write denied after the truncate left it at
+  0 bytes — every recorded session read absent and the fleet
+  blinded while its lease records stayed correct. A call that
+  leaves the binding missing or unparseable gets the snapshot
+  restored atomically; a binding that still parses (even `{}`) is
+  the CLI's own view and is never overridden. The mirror's
+  never-capture-empty guard counts an unparseable canonical as
+  empty, so a torn binding can no longer overwrite its last good
+  mirror copy either.
 - `sync/lease/sessions.py`: `session_state` treats a prompt-carrying list as
   unknown, never absent; `acquire` branches on the tri-state and
   never stops/deletes/recreates on unknown (`acquire-unknown`);

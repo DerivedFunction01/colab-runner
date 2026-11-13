@@ -144,11 +144,19 @@ def capture(item: dict) -> str:
         # A live binding clobbered to {} by a CLI side effect must not
         # overwrite the last good mirror copy (observed 2026-10-29: a
         # `colab run` emptied sessions.json while its assignment lived on).
-        try:
-            if json.loads(canonical.read_text()) in ({}, []) and json.loads(mirror.read_text()) not in ({}, []):
-                return "mirror-nonempty-kept"
-        except Exception:
-            pass
+        # An unparseable file counts as empty on both sides: the
+        # 2026-11-13 loss was a 0-byte canonical, which raised in
+        # json.loads, fell through the old guard's except, and was
+        # captured over the last good mirror in the same minute.
+
+        def _is_empty(path: Path) -> bool:
+            try:
+                return json.loads(path.read_text()) in ({}, [])
+            except Exception:  # noqa: BLE001
+                return True
+
+        if _is_empty(canonical) and not _is_empty(mirror):
+            return "mirror-nonempty-kept"
     if mirror.exists():
         if item["rule"] == "newest-wins" and mirror.stat().st_mtime > canonical.stat().st_mtime:
             return "mirror-newer-kept"

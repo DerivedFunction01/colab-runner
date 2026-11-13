@@ -19,6 +19,28 @@ def report_for(result, item_id):
     return next(r for r in json.loads(result.stdout) if r["id"] == item_id)
 
 
+def test_capture_keeps_mirror_when_canonical_is_torn(tmp_path):
+    """2026-11-13: the flap truncated the canonical sessions.json
+    to 0 bytes; json.loads raised on it, the never-capture-empty
+    guard fell through, and the capture overwrote the last good
+    mirror in the same minute. A torn (unparseable) canonical
+    counts as empty: the good mirror is kept, byte for byte —
+    and the same holds for the older {} clobber shape."""
+    home = tmp_path / "home"
+    canonical = home / ".config" / "colab-cli" / "sessions.json"
+    canonical.parent.mkdir(parents=True)
+    mirror = home / "state" / "transient" / "colab-cli" / "sessions.json"
+    mirror.parent.mkdir(parents=True)
+    good = '{"sess-one": {"name": "sess-one", "endpoint": "m-hm-test"}}'
+    mirror.write_text(good)
+    canonical.write_bytes(b"")
+    assert report_for(run_mirror("capture", home), "colab-sessions")["capture"] == "mirror-nonempty-kept"
+    assert mirror.read_text() == good
+    canonical.write_text("{}")
+    assert report_for(run_mirror("capture", home), "colab-sessions")["capture"] == "mirror-nonempty-kept"
+    assert mirror.read_text() == good
+
+
 def test_capture_restore_and_newer_canonical_wins(tmp_path):
     home = tmp_path / "home"
     token = home / ".config" / "colab-cli" / "token.json"

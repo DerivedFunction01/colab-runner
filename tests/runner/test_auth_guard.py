@@ -47,19 +47,35 @@ case "$FAKE_MODE" in
   hang)
     printf '%s' '{"refresh_token": "stub15chars000"}' > "$HOME/.config/colab-cli/token.json"
     sleep 30 ;;
+  bind-truncate)
+    : > "$HOME/.config/colab-cli/sessions.json"
+    echo "Current balance: 100 compute units"
+    exit 0 ;;
+  bind-delete)
+    rm -f "$HOME/.config/colab-cli/sessions.json"
+    echo "Current balance: 100 compute units"
+    exit 0 ;;
+  bind-rewrite)
+    printf '%s' '{"other-session": {"name": "other-session"}}' > "$HOME/.config/colab-cli/sessions.json"
+    echo "Current balance: 100 compute units"
+    exit 0 ;;
   healthy)
     echo "Current balance: 100 compute units"
     exit 0 ;;
 esac
 """
 
+BINDING = '{"dawn-test-1": {"name": "dawn-test-1", "endpoint": "m-hm-test"}}'
 
-def setup_env(tmp_path, mode, token_text):
+
+def setup_env(tmp_path, mode, token_text, binding_text=None):
     home = tmp_path / "home"
     token = home / ".config" / "colab-cli" / "token.json"
     token.parent.mkdir(parents=True)
     if token_text is not None:
         token.write_text(token_text)
+    if binding_text is not None:
+        (home / ".config" / "colab-cli" / "sessions.json").write_text(binding_text)
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     fake = fakebin / "colab"
@@ -109,6 +125,36 @@ def test_timed_out_flow_still_restores_token(tmp_path):
     out = run_driver(env, driver, timeout_s=2)
     assert out["raised"] == "TimeoutExpired"
     assert token.read_text() == VALID_TOKEN
+
+
+def test_binding_truncated_by_call_is_restored(tmp_path):
+    """2026-11-13: the CLI rewrites sessions.json non-atomically;
+    a write denied after the truncate left 0 bytes and every
+    recorded session read absent. The funnel restores its
+    snapshot whenever a call leaves the binding unparseable."""
+    env, driver, _token, _marker, _log = setup_env(tmp_path, "bind-truncate", VALID_TOKEN, BINDING)
+    out = run_driver(env, driver)
+    assert out["rc"] == 0
+    sessions = tmp_path / "home" / ".config" / "colab-cli" / "sessions.json"
+    assert sessions.read_text() == BINDING
+
+
+def test_binding_deleted_by_call_is_restored(tmp_path):
+    env, driver, _token, _marker, _log = setup_env(tmp_path, "bind-delete", VALID_TOKEN, BINDING)
+    out = run_driver(env, driver)
+    assert out["rc"] == 0
+    sessions = tmp_path / "home" / ".config" / "colab-cli" / "sessions.json"
+    assert sessions.read_text() == BINDING
+
+
+def test_binding_rewritten_valid_is_the_clis_own_view(tmp_path):
+    """A rewrite that still parses is the CLI's validated view
+    (it drops entries it rejects): the guard never overrides it."""
+    env, driver, _token, _marker, _log = setup_env(tmp_path, "bind-rewrite", VALID_TOKEN, BINDING)
+    out = run_driver(env, driver)
+    assert out["rc"] == 0
+    sessions = tmp_path / "home" / ".config" / "colab-cli" / "sessions.json"
+    assert json.loads(sessions.read_text()) == {"other-session": {"name": "other-session"}}
 
 
 def test_healthy_call_clears_marker(tmp_path):

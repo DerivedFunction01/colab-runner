@@ -95,6 +95,62 @@ def _atomic_write_token(data: bytes) -> None:
     os.replace(tmp, TOKEN)
 
 
+SESSIONS = Path.home() / ".config" / "colab-cli" / "sessions.json"
+
+
+def _binding_bytes() -> bytes | None:
+    try:
+        return SESSIONS.read_bytes()
+    except OSError:
+        return None
+
+
+def _binding_snapshot(data: bytes | None) -> bytes | None:
+    """The binding is worth guarding only in its healthy shape: a
+    non-empty JSON object. Anything else (missing, torn, an empty
+    object) is already the damaged state — no snapshot, no restore."""
+    if not data:
+        return None
+    try:
+        parsed = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(parsed, dict) and parsed else None
+
+
+def _binding_clobbered(snapshot: bytes | None) -> bool:
+    """A call clobbered the binding when a healthy snapshot existed
+    and the file is now missing or unparseable (2026-11-13: the
+    write-denial flap truncated sessions.json to 0 bytes under a
+    CLI rewrite — every recorded session read absent and the
+    fleet blinded while its lease records stayed correct). A
+    file that still parses — even {} after the last session
+    stops — is the CLI's own view and is never overridden."""
+    if snapshot is None:
+        return False
+    data = _binding_bytes()
+    if data is None:
+        return True
+    try:
+        json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return True
+    return False
+
+
+def _restore_binding(snapshot: bytes | None) -> None:
+    """Restore a clobbered binding atomically; never raise — a
+    failed restore must not break the call it guards."""
+    try:
+        if _binding_clobbered(snapshot):
+            tmp = SESSIONS.with_name(SESSIONS.name + ".tmp")
+            tmp.write_bytes(snapshot)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, SESSIONS)
+    except OSError:
+        pass
+
+
 def _note_auth_required(reason: str) -> None:
     try:
         var = _var_dir()
@@ -133,6 +189,13 @@ def colab(*args: str, timeout: int = 18000) -> subprocess.CompletedProcess:
     - turns any call whose output carries the auth prompt into an
       auth-required result (rc 3, empty stdout), so downstream reads
       see "unknown", never junk data.
+    - snapshots the session binding (sessions.json) the same way:
+      the CLI rewrites it non-atomically on ordinary calls, so a
+      write denied after the truncate leaves 0 bytes and every
+      recorded session reads absent (2026-11-13). A call that
+      leaves the binding missing or unparseable gets the snapshot
+      restored; a binding that still parses is the CLI's own view
+      and is never overridden.
     Inert under COLAB_BIN: the test fakes are not credential flows."""
     cmd = [colab_bin(), "--auth", "oauth2", *args]
     if os.environ.get("COLAB_BIN"):
@@ -140,20 +203,25 @@ def colab(*args: str, timeout: int = 18000) -> subprocess.CompletedProcess:
     snapshot = _token_bytes()
     if not _token_valid(snapshot):
         return _auth_blocked(cmd, "stored token missing or invalid; re-authorization required (no CLI call made)")
+    binding_snapshot = _binding_snapshot(_binding_bytes())
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=colab_env(), stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         if not _token_valid(_token_bytes()):
             _atomic_write_token(snapshot)
             _note_auth_required("CLI call timed out after overwriting the token; snapshot restored")
+        _restore_binding(binding_snapshot)
         raise
     if AUTH_PROMPT in (result.stdout + result.stderr):
         if not _token_valid(_token_bytes()):
             _atomic_write_token(snapshot)
+        _restore_binding(binding_snapshot)
         return _auth_blocked(cmd, "CLI entered its interactive login flow")
     if not _token_valid(_token_bytes()):
         _atomic_write_token(snapshot)
+        _restore_binding(binding_snapshot)
         return _auth_blocked(cmd, "CLI call overwrote the stored token; snapshot restored")
+    _restore_binding(binding_snapshot)
     if result.returncode == 0:
         _clear_auth_required()
     return result
