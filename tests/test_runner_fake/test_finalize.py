@@ -224,6 +224,123 @@ def test_finalize_names_but_never_collects_a_stale_root_output(tmp_path):
     assert not (results / "stray.txt").exists()
 
 
+def install_sleepy_stray_job(env, name):
+    """A job that declares stray.txt but never writes it, and
+    sleeps — a live co-tenant whose execution window covers
+    another lane's root write of the same name."""
+    root = Path(env["TEST_REPO_ROOT"])
+    jobs_dir = root / "jobs"
+    if jobs_dir.is_symlink():
+        jobs_dir.unlink()
+    job_dir = jobs_dir / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "payload.py").write_text(
+        "import argparse, sys, time\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "a = ap.parse_args()\n"
+        "out = Path(a.out)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'present.txt').write_text('here\\n')\n"
+        "time.sleep(120)\n"
+        "sys.exit(0)\n"
+    )
+    manifest = {"name": name, "script": f"jobs/{name}/payload.py", "args": [], "outputs": ["present.txt", "stray.txt"], "shape": "cpu-highram", "checkpoint_pull_seconds": 1, "timeout": 300}
+    (job_dir / "job.json").write_text(json.dumps(manifest))
+    return job_dir
+
+
+def test_finalize_flags_a_root_output_contended_by_a_live_co_tenant(tmp_path):
+    """Cross-lane collision guard (defect routed 2026-11-12:
+    two lanes' drives on one session both wrote a generic
+    drive-result name cwd-relative, and the first finalize
+    collected the other lane's content — fresh, right-sized,
+    wrong run). With a live co-tenant declaring the same name
+    and executing when the root file was written, attribution
+    is genuinely ambiguous: the entry is flagged contended,
+    NOT collected, and stays in missing_outputs — named for
+    the owning lane to disambiguate instead of silently
+    delivered. The second lane's launch also carries the
+    output-name warning naming the first run."""
+    env = runner_env(tmp_path)
+    install_sleepy_stray_job(env, "lanea")
+    install_stray_job(env, "laneb")
+    ra = subprocess.run([sys.executable, str(run_bin(env)), "lanea", "--detach"], capture_output=True, text=True, env=env, timeout=300)
+    assert ra.returncode == 0, ra.stdout + ra.stderr
+    lanea_run = json.loads(ra.stdout)["run_id"]
+    rb = subprocess.run([sys.executable, str(run_bin(env)), "laneb"], capture_output=True, text=True, env=env, timeout=300)
+    assert rb.returncode == 0, rb.stdout + rb.stderr
+    out = json.loads(rb.stdout)
+    assert out["state"] == "complete"
+    warnings = out.get("output_name_warnings") or json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text()).get("output_name_warnings")
+    assert warnings and any(w["name"] == "stray.txt" and w["shared_with"] == lanea_run for w in warnings), out
+    assert "stray.txt" in (out.get("missing_outputs") or []), out
+    misplaced = out.get("misplaced_outputs")
+    assert misplaced and len(misplaced) == 1, out
+    entry = misplaced[0]
+    assert entry["name"] == "stray.txt" and entry["fresh"] is True
+    assert entry["contended"] is True and entry["contended_with"] == lanea_run
+    assert entry["collected"] is False
+    results = Path(env["TEST_REPO_ROOT"]) / "results" / out["run_id"]
+    assert not (results / "stray.txt").exists()
+    assert (results / "present.txt").exists()
+
+
+def install_sleepy_mapped_job(env, name):
+    """The sleepy co-tenant with MAPPED outputs ({"local",
+    "remote"} entries instead of plain names) — the manifest
+    shape that crashed the first overlap implementation when
+    a consumer launch hashed the raw dict entries."""
+    root = Path(env["TEST_REPO_ROOT"])
+    jobs_dir = root / "jobs"
+    if jobs_dir.is_symlink():
+        jobs_dir.unlink()
+    job_dir = jobs_dir / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "payload.py").write_text(
+        "import argparse, sys, time\n"
+        "from pathlib import Path\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('--out', required=True)\n"
+        "a = ap.parse_args()\n"
+        "out = Path(a.out)\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "(out / 'present.txt').write_text('here\\n')\n"
+        "time.sleep(120)\n"
+        "sys.exit(0)\n"
+    )
+    manifest = {"name": name, "script": f"jobs/{name}/payload.py", "args": [], "outputs": [{"local": "present.txt", "remote": "/content/x/present.txt"}, {"local": "stray.txt", "remote": "/content/x/stray.txt"}], "shape": "cpu-highram", "checkpoint_pull_seconds": 1, "timeout": 300}
+    (job_dir / "job.json").write_text(json.dumps(manifest))
+    return job_dir
+
+
+def test_launch_overlap_check_tolerates_mapped_manifest_outputs(tmp_path):
+    """Regression (defect routed 2026-11-12, hours after the
+    overlap check first ran live): a neighbour manifest
+    declaring mapped outputs crashed a consumer's launch
+    client-side (TypeError: unhashable type 'dict') — an
+    advisory check must never break the launch it rides on.
+    With the mapped co-tenant live, the plain job launches,
+    its warning names the shared local name, and finalize
+    still flags the root file contended."""
+    env = runner_env(tmp_path)
+    install_sleepy_mapped_job(env, "lanem")
+    install_stray_job(env, "laneb")
+    ra = subprocess.run([sys.executable, str(run_bin(env)), "lanem", "--detach"], capture_output=True, text=True, env=env, timeout=300)
+    assert ra.returncode == 0, ra.stdout + ra.stderr
+    lanem_run = json.loads(ra.stdout)["run_id"]
+    rb = subprocess.run([sys.executable, str(run_bin(env)), "laneb"], capture_output=True, text=True, env=env, timeout=300)
+    assert rb.returncode == 0, rb.stdout + rb.stderr
+    out = json.loads(rb.stdout)
+    assert out["state"] == "complete"
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    warnings = rec.get("output_name_warnings")
+    assert warnings and any(w["name"] == "stray.txt" and w["shared_with"] == lanem_run for w in warnings), rec
+    misplaced = out.get("misplaced_outputs")
+    assert misplaced and misplaced[0]["contended"] is True and misplaced[0]["collected"] is False, out
+
+
 def test_finalize_reports_declared_outputs_that_never_arrived(tmp_path):
     """Declared-vs-pulled accounting (the pull-gap): a payload
     that exits 0 without writing one of its declared outputs

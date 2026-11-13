@@ -7,9 +7,10 @@ terminal finalize the foreground poll loop and --poll share.
 import hashlib
 import json
 import subprocess
+import time
 from datetime import datetime, timezone
 
-from .foundation import REPO, colab, now, transfer
+from .foundation import REPO, RUNS, colab, now, transfer
 from .records import mark_terminal
 
 # E6: the file channel's measured single-file reliability ceiling
@@ -205,6 +206,123 @@ def misplaced_outputs(session: str, missing: list, started_epoch: "float | None"
     return [e for e in found if isinstance(e, dict) and e.get("name") in wanted]
 
 
+def _epoch(value) -> "float | None":
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _output_names(entries) -> list:
+    """Declared-output entries reduced to the local names the
+    outputs land under. Manifests declare two shapes: plain
+    names, and mapped objects ({"local": name, "remote":
+    path, ...}) — the local name is the basename a payload
+    writes and the pull lands, so it is the name that can
+    collide at a shared root. Any other shape is skipped: an
+    advisory accounting must degrade, never crash (first
+    version hashed the raw entries and a mapped neighbour
+    manifest crashed a consumer's launch client-side,
+    2026-11-12)."""
+    names = []
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, str):
+                names.append(entry)
+            elif isinstance(entry, dict) and isinstance(entry.get("local"), str):
+                names.append(entry["local"])
+    return names
+
+
+def _manifest_outputs(job_name) -> list:
+    """A job's declared output names from its manifest, []
+    when the manifest cannot be read — an unreadable neighbour
+    job must never break this run's finalize or launch."""
+    try:
+        manifest = json.loads((REPO / "jobs" / str(job_name) / "job.json").read_text())
+    except Exception:  # noqa: BLE001
+        return []
+    return _output_names(manifest.get("outputs"))
+
+
+def _session_records(session: str, exclude_run_id: str) -> list:
+    """Every other run record on the session (any state), read
+    best-effort: a corrupt or vanishing neighbour record is
+    skipped, never fatal to this run's accounting."""
+    others = []
+    try:
+        paths = sorted(RUNS.glob("*.json"))
+    except OSError:
+        return others
+    for path in paths:
+        try:
+            other = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(other, dict) and other.get("run_id") != exclude_run_id and other.get("session") == session:
+            others.append(other)
+    return others
+
+
+def output_name_overlaps(session: str, run_id: str, outputs: list) -> list:
+    """Launch-time naming risk: this job's declared basenames
+    that a LIVE run on the same session also declares, as
+    [{name, shared_with}]. Declared outputs pulled from the
+    per-run out dir can never collide — but a payload writing
+    a declared name cwd-relative lands it at the session's
+    shared root, where two live writers of one generic name
+    interleave silently. The warning names the risk at launch,
+    while a rename is still cheap; it blocks nothing."""
+    own = _output_names(outputs)
+    if not own:
+        return []
+    warnings = []
+    for other in _session_records(session, run_id):
+        try:
+            if other.get("state") in ("complete", "failed", "orphaned"):
+                continue
+            shared = set(own) & set(_manifest_outputs(other.get("job")))
+        except Exception:  # noqa: BLE001 — advisory: a malformed neighbour record degrades to no warning, never a launch failure
+            continue
+        for name in sorted(shared):
+            warnings.append({"name": name, "shared_with": other.get("run_id")})
+    return warnings
+
+
+def flag_contended_misplaced(rec: dict, session: str, misplaced: list) -> None:
+    """Attribution guard on the misplaced fallback (defect
+    routed 2026-11-12: two lanes' drives on one session both
+    wrote drive-result.json cwd-relative; the first finalize
+    collected the OTHER lane's content — fresh, correctly
+    sized, wrong run). A fresh root file is attributable to
+    this run only when no other run on the session both
+    declares the name and was executing when the file was
+    written (its window, skew-tolerant, holds the mtime).
+    A contended entry is flagged in place and never
+    auto-collected: the bytes stay named on the record for
+    the owning lane to disambiguate, where a silent delivery
+    would have certified the wrong lane's result."""
+    fresh = [e for e in misplaced if e.get("fresh") and e.get("mtime") is not None]
+    if not fresh:
+        return
+    others = _session_records(session, rec.get("run_id"))
+    if not others:
+        return
+    now_epoch = time.time()
+    for entry in fresh:
+        for other in others:
+            if entry["name"] not in _manifest_outputs(other.get("job")):
+                continue
+            start = _epoch(other.get("started_at"))
+            if start is None:
+                continue
+            end = _epoch(other.get("finished_at")) or now_epoch
+            if start - MISPLACED_SKEW_S <= entry["mtime"] <= end + MISPLACED_SKEW_S:
+                entry["contended"] = True
+                entry["contended_with"] = other.get("run_id")
+                break
+
+
 def collect_misplaced(rec: dict, session: str, misplaced: list) -> list:
     """Pull the FRESH misplaced outputs into results/<run_id>/,
     under the same truthfulness rules as the out-dir pull
@@ -219,6 +337,11 @@ def collect_misplaced(rec: dict, session: str, misplaced: list) -> list:
     collected = []
     for entry in misplaced:
         entry["collected"] = False
+        if entry.get("contended"):
+            # Attribution is genuinely ambiguous (two live
+            # writers, one shared name): named on the record,
+            # never delivered as this run's output.
+            continue
         if not entry.get("fresh"):
             continue
         name = entry["name"]
@@ -316,6 +439,7 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
         started_epoch = None
     misplaced = misplaced_outputs(session, missing, started_epoch) if missing else []
     if misplaced:
+        flag_contended_misplaced(rec, session, misplaced)
         collected = collect_misplaced(rec, session, misplaced)
         if collected:
             pulled = rec.get("pulled", [])

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .foundation import REPO, RUNS, TOKEN, colab, git_identity, lease, mirror, now, repo_registry, transfer
 from .launch import orphan_notes, upload_one
-from .pull import finalize_run, pull_outputs
+from .pull import finalize_run, output_name_overlaps, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
 from .records import load_run_record, mark_terminal, save_record, stamp_collector
 from .sweep import orphan_sweep
@@ -517,6 +517,27 @@ def main() -> int:
             rec["last_poll_error"] = _confirm_error
             stamp_collector(rec, rec.get("caller"))
             save_record(rec)
+        def _name_warnings() -> list:
+            # Output-name risk, named at launch while a rename
+            # is still cheap: a declared basename a live run on
+            # this session also declares is safe in the per-run
+            # out dirs, but two payloads writing it cwd-relative
+            # share the session root and interleave silently
+            # (defect routed 2026-11-12). Advisory only — it
+            # blocks nothing; finalize's contention guard is
+            # the backstop. The computation is guarded at every
+            # level: a warning that can raise is a gate.
+            try:
+                found = output_name_overlaps(session, run_id, job.get("outputs", []))
+            except Exception:  # noqa: BLE001
+                return []
+            if found:
+                rec["output_name_warnings"] = found
+                save_record(rec)
+                for warning in found:
+                    print(f"warning: output name {warning['name']!r} is also declared by live run {warning['shared_with']} on {session} — if both payloads write it cwd-relative, the root copy is unattributable and finalize will flag it contended rather than collect it", file=sys.stderr)
+            return found
+
         if detach_flag:
             # E5: launch exactly as the foreground form, write
             # the record, return. usage_before is stamped now —
@@ -529,8 +550,19 @@ def main() -> int:
             rec["detached_launch"] = True
             rec["usage_before"] = usage_before
             save_record(rec)
-            print(json.dumps({"run_id": run_id, "session": session, "state": rec["state"]}, indent=2))
+            # The launch result prints BEFORE any advisory
+            # pass runs (commission supplement, 2026-11-12:
+            # the overlap crash's worst property was eating the
+            # run_id — a lane that loses its launcher before the
+            # print cannot even name the run it must adopt).
+            # Warnings follow on the record and stderr only —
+            # the launch object stays the sole stdout object,
+            # exactly as before the check existed, so a consumer
+            # parsing stdout whole is untouched.
+            print(json.dumps({"run_id": run_id, "session": session, "state": rec["state"]}, indent=2), flush=True)
+            _name_warnings()
             return 0
+        _name_warnings()
         deadline = time.time() + job.get("timeout", 18000)
         cadence = job.get("checkpoint_pull_seconds", 300)
         # A checkpoint poll that outlives its subprocess timeout
