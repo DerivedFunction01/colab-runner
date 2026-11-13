@@ -18,7 +18,7 @@ from .launch import orphan_notes, upload_one
 from .pull import finalize_run, manifest_shape_error, normalize_manifest_outputs, output_name_overlaps, pull_outputs
 from .reader import _absence_grace_s, _launch_age_s, read_reader, register_poll_failure, write_reader
 from .records import load_run_record, mark_terminal, save_record, stamp_collector
-from .sweep import orphan_sweep
+from .sweep import collect_stale_detached, orphan_sweep
 from .verbs import plant_git_identity, poll_run, wait_run
 
 
@@ -32,6 +32,9 @@ def main() -> int:
     if "--sweep" in core_args:
         findings, live_ok = orphan_sweep()
         print(json.dumps({"findings": findings, "live_list_unreadable": not live_ok}, indent=2))
+        return 0
+    if "--collect-stale" in core_args:
+        print(json.dumps(collect_stale_detached(), indent=2))
         return 0
     if "--poll" in core_args:
         idx = core_args.index("--poll")

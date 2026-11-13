@@ -5,11 +5,15 @@ died mid-launch (stale "running"), and launches that died
 before landing (stale "starting").
 """
 
+import contextlib
+import io
 import json
+import os
+import time
 from datetime import datetime, timezone
 
 from .foundation import REPO, RUNS, colab, lease, now
-from .records import emit_terminal_event, mark_terminal, save_record
+from .records import TERMINAL_STATES, collector_stale, emit_terminal_event, mark_terminal, save_record
 
 # A record still in "running" (the pre-confirmation state) this
 # long after its start, with no fresher evidence, had its
@@ -106,3 +110,89 @@ def orphan_sweep() -> tuple[list[dict], bool]:
                 mark_terminal(rec, "failed", launch_lost=True, error=f"record still 'starting' {int(age // 60)} min after its freshest stamp: the launcher died before the launch landed; relaunch with --resume {rec['run_id']} to retry")
                 findings.append({"run_id": rec["run_id"], "job": rec["job"], "action": "marked failed (launch-lost): stale 'starting' record whose launcher died pre-launch; relaunch with --resume RUN_ID"})
     return findings, True
+
+
+# The standing collector. A detached run collects only when
+# someone polls it, and a consumer that waits on the record
+# file instead wedges silently — the record reads "polling"
+# forever over a finished run (formation-laneb-scoped,
+# 2026-11-13: its gate completed session-side in a minute and
+# the record sat uncollected for 36+ minutes until an
+# unrelated boot reconcile noticed). The lease reap cycle is
+# the runner's standing heartbeat, so this pass rides it (and
+# the --collect-stale verb): stale detached records get the
+# same poll the verb runs. Caps keep one pass bounded — a
+# poll costs a reader exec plus any pull it lands.
+COLLECT_PASS_MAX = 3
+COLLECT_PASS_BUDGET_S = 240
+COLLECTOR_CALLER = "collector-sweep"
+
+
+def _evidence_epoch(rec: dict) -> float:
+    stamp = rec.get("collector_at") or rec.get("last_evidence_at") or rec.get("started_at")
+    try:
+        return datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def collect_stale_detached(budget_s: int = COLLECT_PASS_BUDGET_S, max_records: int = COLLECT_PASS_MAX) -> dict:
+    """One bounded collection pass over stale detached records.
+
+    Candidates: non-terminal, detached_launch, collector-stale
+    at the standing 600 s bound — stalest first. Each is driven
+    through poll_run under the collector-sweep attribution
+    (stdout captured; the outcome is read back from the
+    record: finalized = now terminal, attended = the collector
+    stamp advanced). Per-record non-raising: one bad record
+    never stops the pass, and a pass failure never breaks the
+    reap duty that hosts it."""
+    from .verbs import poll_run  # lazy: verbs imports this module
+
+    summary: dict = {"checked": 0, "attended": [], "finalized": [], "errors": [], "capped": False}
+    if not RUNS.exists():
+        return summary
+    candidates = []
+    for f in sorted(RUNS.glob("*.json")):
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if rec.get("detached_launch") is not True or rec.get("state") in TERMINAL_STATES:
+            continue
+        if collector_stale(rec):
+            candidates.append(rec)
+    candidates.sort(key=_evidence_epoch)
+    summary["checked"] = len(candidates)
+    started = time.monotonic()
+    previous_caller = os.environ.get("COLAB_CALLER")
+    os.environ["COLAB_CALLER"] = COLLECTOR_CALLER
+    processed = 0
+    try:
+        for rec in candidates:
+            if processed >= max_records or time.monotonic() - started > budget_s:
+                summary["capped"] = True
+                break
+            processed += 1
+            run_id = str(rec.get("run_id"))
+            before = rec.get("collector_at")
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    poll_run(run_id)
+            except Exception as exc:  # noqa: BLE001 — isolation per record
+                summary["errors"].append({"run_id": run_id, "error": type(exc).__name__})
+                continue
+            try:
+                after = json.loads((RUNS / f"{run_id}.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if after.get("state") in TERMINAL_STATES:
+                summary["finalized"].append(run_id)
+            elif after.get("collector_at") != before:
+                summary["attended"].append(run_id)
+    finally:
+        if previous_caller is None:
+            os.environ.pop("COLAB_CALLER", None)
+        else:
+            os.environ["COLAB_CALLER"] = previous_caller
+    return summary

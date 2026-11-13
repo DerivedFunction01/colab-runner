@@ -3,7 +3,7 @@
 pull results, stop the session on every exit path.
 
 Usage: colab-run <job-name> [--resume RUN_ID] [--caller TAG] [--seed] [--detach] [--session NAME] [-- <job args>...]
-       colab-run --poll RUN_ID | --wait RUN_ID [--max SECONDS] | --sweep
+       colab-run --poll RUN_ID | --wait RUN_ID [--max SECONDS] | --sweep | --collect-stale
        colab-run plant-git-identity --session NAME --repo ID_OR_PATH --tree SESSION_TREE [--caller TAG]
 plant-git-identity sets the source repo's configured git
 identity (its repo-local user.name/user.email) repo-locally in

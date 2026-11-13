@@ -419,6 +419,16 @@ def main() -> int:
         result = {"action": "request-cleared" if had else "no-demand"}
     else:
         result = lease.reap(cr.colab, REPO)
+        # The standing collector rides the reap cycle: stale
+        # detached run records get the poll their consumer
+        # never ran. Guarded — a collection failure reports in
+        # the result and never breaks the reap duty itself.
+        try:
+            import _load as _bin_load
+
+            result["collect"] = _bin_load.sync("runner").sweep.collect_stale_detached()
+        except Exception as exc:  # noqa: BLE001
+            result["collect"] = {"error": type(exc).__name__}
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
     return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed", "adopt-has-record", "adopt-absent", "adopt-unknown", "adopt-deadline-past", "adopt-deadline-shortens", "adopt-no-deadline", "adopt-shape-ambiguous", "adopt-shape-unknown", "adopt-shape-conflict", "adopt-bridge-managed", "adopt-handover-pending", "shorten-no-lease", "shorten-unknown", "shorten-standing-managed", "shorten-not-earlier", "shorten-deadline-past", "shorten-no-target", "sync-claim-refused-claim", "sync-claim-refused-activity", "sync-claim-unattributed", "sync-release-refused") else 1
