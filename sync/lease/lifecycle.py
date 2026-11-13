@@ -136,6 +136,19 @@ def acquire(colab, repo: Path, shape_id: str, now_dt: datetime | None = None, ho
         # lease is left for its owner and the reaper — using a
         # session never destroys someone else's record.
         if cand.get("caller") in (caller, None):
+            if state == "absent" and now_dt < foundation.parse_dt(cand["deadline"]):
+                # The reap's confirmation discipline, shared
+                # stamp: an unconfirmed absence clears nothing —
+                # the candidate is skipped with its record
+                # intact (2026-11-13: one unpinned fire cleared
+                # every panel record that flickered). An expired
+                # candidate needs no confirmation: its deadline
+                # is record-local truth, not a reading.
+                since = foundation.absent_since(repo, session)
+                if since is None or (now_dt - since).total_seconds() < foundation.ABSENT_CONFIRM_S:
+                    foundation.stamp_absent(repo, session, since or now_dt, now_dt)
+                    continue
+                foundation.clear_absent_stamp(repo, session)
             sessions.stop_session_safe(colab, session)  # expired or confirmed dead: clear before recreating
             if sessions.session_state(colab, session) == "alive":
                 # The stop did not take: keep the record of a session that

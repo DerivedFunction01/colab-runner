@@ -114,10 +114,13 @@ def test_reap_covers_concurrent_leases_independently(tmp_path, monkeypatch):
     out = lease_mod.reap(fake, repo, now_dt=PNOW)
     assert {r["session"]: r["action"] for r in out["records"]} == {"one": "kept", "two": "released-deadline"}
     assert lease_mod.load_record(repo, "one") is not None
-    # A confirmed-dead second session is cleared, the first untouched.
+    # A dead second session is cleared only once its absence
+    # sustains past the confirmation window, the first untouched.
     lease_mod.save_record(repo, {"shape": "cpu", "session": "two", "acquired_at": PNOW.isoformat(), "deadline": (PNOW + timedelta(hours=8)).isoformat(), "last_used_at": PNOW.isoformat(), "jobs": []})
     fake.alive.discard("two")
     out = lease_mod.reap(fake, repo, now_dt=PNOW)
+    assert {r["session"]: r["action"] for r in out["records"]} == {"one": "kept", "two": "kept-absent-unconfirmed"}
+    out = lease_mod.reap(fake, repo, now_dt=PNOW + timedelta(seconds=lease_mod.ABSENT_CONFIRM_S + 1))
     assert {r["session"]: r["action"] for r in out["records"]} == {"one": "kept", "two": "cleared-dead"}
 
 

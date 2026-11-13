@@ -3,6 +3,7 @@ concurrent-lease rules, with stub colab callables (no
 subprocess)."""
 
 import json
+from datetime import timedelta
 
 from unit_harness import HELP_TEXT, NOW, _acquire_stub, _auto_stub, cp, gate_permissive, lease, repo, seed_record  # noqa: F401
 
@@ -80,6 +81,26 @@ def test_acquire_never_destroys_record_on_unreadable_sessions(repo, tmp_path, mo
     assert kept is not None
     assert kept["deadline"] == rec["deadline"]
     assert kept["acquired_at"] == rec["acquired_at"]
+
+
+def test_acquire_never_clears_record_on_unconfirmed_absence(repo, tmp_path, monkeypatch):
+    """The 2026-11-13 record losses, pinned: a candidate whose
+    only fault is an absent reading with its deadline ahead is
+    skipped, never stopped or deleted — the absence must first
+    sustain past the confirmation window (the reap's discipline,
+    one shared stamp). Once confirmed, clearing proceeds."""
+    seed_record(repo)
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW)
+    assert out["action"] == "created"
+    assert out["record"]["session"] != "standard"
+    assert lease.load_record(repo, "standard") is not None
+    stamp = lease.foundation.absent_stamp_path(repo, "standard")
+    data = json.loads(stamp.read_text())
+    data["first_absent_at"] = (NOW - timedelta(seconds=lease.ABSENT_CONFIRM_S + 1)).isoformat()
+    stamp.write_text(json.dumps(data))
+    out = lease.acquire(_acquire_stub, repo, "cpu", now_dt=NOW)
+    assert out["action"] == "created"
+    assert lease.load_record(repo, "standard") is None
 
 
 # --- Concurrent leases (profile retirement) ------------------------------------

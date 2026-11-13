@@ -9,7 +9,7 @@ forgotten while it may still bill.
 
 import json
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from unit_harness import NOW, cp, gate_permissive, lease, repo, seed_record  # noqa: F401
@@ -27,10 +27,38 @@ def test_reap_keeps_record_when_sessions_unreadable(repo, tmp_path, monkeypatch)
 
 
 def test_reap_clears_only_on_confirmed_absent(repo, tmp_path, monkeypatch):
+    """Confirmation is across passes (2026-11-13): one absent
+    read can be the session list's flicker, so the first absent
+    reap stamps and keeps; only a pass still absent past the
+    confirmation window clears the record."""
     seed_record(repo)
     out = lease.reap(lambda *a, **k: cp("[]"), repo, now_dt=NOW)
+    assert out["action"] == "kept-absent-unconfirmed"
+    assert lease.load_record(repo) is not None
+    later = NOW + timedelta(seconds=lease.ABSENT_CONFIRM_S + 1)
+    out = lease.reap(lambda *a, **k: cp("[]"), repo, now_dt=later)
     assert out["action"] == "cleared-dead"
     assert lease.load_record(repo) is None
+
+
+def test_reap_live_read_resets_absence_confirmation(repo, tmp_path, monkeypatch):
+    """A live read between absences restarts the clock: the
+    second absence is a first absence again, not a clearing."""
+    seed_record(repo)
+    out = lease.reap(lambda *a, **k: cp("[]"), repo, now_dt=NOW)
+    assert out["action"] == "kept-absent-unconfirmed"
+
+    def alive(*a, **k):
+        if a and a[0] == "sessions":
+            return cp('["standard"]')
+        return cp("")
+
+    out = lease.reap(alive, repo, now_dt=NOW + timedelta(seconds=60))
+    assert out["action"] == "kept"
+    later = NOW + timedelta(seconds=lease.ABSENT_CONFIRM_S + 120)
+    out = lease.reap(lambda *a, **k: cp("[]"), repo, now_dt=later)
+    assert out["action"] == "kept-absent-unconfirmed"
+    assert lease.load_record(repo) is not None
 
 
 def test_reap_pulses_kernel_when_due_and_skips_when_fresh(repo, tmp_path, monkeypatch):

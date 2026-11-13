@@ -31,7 +31,7 @@ host when a session is born (acquire / renewal swap / adoption).
 """
 
 from . import (foundation, catalog, callers, syncclaims, gate, sessions, records, spend, access, keepalive, grants, listeners, orphans, renewal, lifecycle, bridge, state, standing, reap, auto, health, identity, reconcile)
-from .foundation import var_dir, load_json, load_config, ACTOR_ENV_CLAIM, PANEL_ACTOR, GATE_DEFAULT_AGENT_CLASSES, GATE_DEFAULT_BYPASS_ACTORS, GATE_DEFAULT_INFRA_ACTOR, parse_dt, parse_balance, spend_journal_path, reaper_events_path, append_reaper_event
+from .foundation import var_dir, load_json, load_config, ACTOR_ENV_CLAIM, PANEL_ACTOR, GATE_DEFAULT_AGENT_CLASSES, GATE_DEFAULT_BYPASS_ACTORS, GATE_DEFAULT_INFRA_ACTOR, parse_dt, parse_balance, spend_journal_path, reaper_events_path, append_reaper_event, ABSENT_CONFIRM_S, absent_since, stamp_absent, clear_absent_stamp
 from .catalog import shape_id_for, CLI_CATALOG_TTL_S, SHAPE_TIMEOUT_S, parse_cli_shapes, _catalog_cache_path, _cli_shapes, _shape_entries, shape_rates_path, load_shape_rates, shape_rate, catalog_shapes, default_shape, standing_caller, standing_shape, _session_shape_args
 from .callers import CALLER_ENV, MACHINERY_CALLERS, _CALLER_PART, callers_path, caller_registry, active_caller_registry, is_active_caller, validate_caller, resolve_caller, caller_claim_error, caller_claims_path, append_caller_claim, load_caller_claims
 from .syncclaims import sync_claim_policy, active_callers, read_sync_claim, sync_rights, claim_sync, release_sync_claim

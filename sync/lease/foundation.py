@@ -123,3 +123,44 @@ def append_reaper_event(repo: Path, event: dict) -> bool:
         return True
     except OSError:
         return False
+
+
+# Absence confirmation (2026-11-13): a lease record is deleted
+# only on a confirmed-absent session reading, and one reading
+# inside one flicker window is not a confirmation — the session
+# list renders live sessions unnamed for whole minutes under
+# load. The stamp is shared by both delete legs (the reap's
+# cleared-dead leg and acquire's candidate-clearing leg): the
+# first absent observation stamps and spares the record; an
+# observation still absent at least ABSENT_CONFIRM_S after the
+# first stamp confirms; any live read clears the stamp.
+ABSENT_CONFIRM_S = 900
+
+
+def absent_stamp_path(repo: Path, session: str) -> Path:
+    return var_dir(repo) / f"absent-{session}.json"
+
+
+def absent_since(repo: Path, session: str) -> datetime | None:
+    try:
+        data = json.loads(absent_stamp_path(repo, session).read_text())
+        return parse_dt(data["first_absent_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def stamp_absent(repo: Path, session: str, first: datetime, now_dt: datetime) -> None:
+    path = absent_stamp_path(repo, session)
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"first_absent_at": first.isoformat(), "last_absent_at": now_dt.isoformat()}))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def clear_absent_stamp(repo: Path, session: str) -> None:
+    try:
+        absent_stamp_path(repo, session).unlink(missing_ok=True)
+    except OSError:
+        pass

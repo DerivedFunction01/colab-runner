@@ -46,8 +46,16 @@ def test_reap_releases_after_deadline(tmp_path):
 def test_reap_clears_dead_session(tmp_path):
     env = lease_env(tmp_path)
     out = run_lease(env, "acquire", "--shape", "cpu")
-    active = Path(env["FAKE_COLAB_STATE"]) / "sessions" / out["record"]["session"] / "ACTIVE"
+    session = out["record"]["session"]
+    active = Path(env["FAKE_COLAB_STATE"]) / "sessions" / session / "ACTIVE"
     active.unlink()
+    # Absence must sustain across passes before the record
+    # clears (2026-11-13): the first absent reap only stamps.
+    assert run_lease(env, "reap")["action"] == "kept-absent-unconfirmed"
+    stamp = Path(env["COLAB_RUNNER_VAR"]) / f"absent-{session}.json"
+    data = json.loads(stamp.read_text())
+    data["first_absent_at"] = (datetime.now(timezone.utc) - timedelta(seconds=901)).isoformat()
+    stamp.write_text(json.dumps(data))
     assert run_lease(env, "reap")["action"] == "cleared-dead"
     assert run_lease(env, "status")["action"] == "no-lease"
 

@@ -24,12 +24,27 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
             # passes. Standing records never take this branch.
             renewed = renewal._attempt_renewal(colab, repo, cfg, rec, state, now_dt)
             if renewed is not None:
+                foundation.clear_absent_stamp(repo, rec["session"])
                 return {"action": "renewed", "session": rec["session"], **renewed}
             return {"action": "renewal-failed", "session": rec["session"]}
+        # Deletion needs the absence confirmed across passes: a
+        # single absent read is as often the session list's
+        # flicker as the runtime's death (2026-11-13: adopted
+        # records were cleared within one cycle of a false
+        # absent while their sessions lived and worked). The
+        # first absent read stamps and keeps; a later pass still
+        # absent past the confirmation window clears; any live
+        # read resets the clock (below).
+        since = foundation.absent_since(repo, rec["session"])
+        if since is None or (now_dt - since).total_seconds() < foundation.ABSENT_CONFIRM_S:
+            foundation.stamp_absent(repo, rec["session"], since or now_dt, now_dt)
+            return {"action": "kept-absent-unconfirmed", "session": rec["session"], "absent_since": (since or now_dt).isoformat()}
+        foundation.clear_absent_stamp(repo, rec["session"])
         spend.append_spend_segment(repo, rec, now_dt)
         grants._note_envelope_lease_released(repo, rec, "cleared-dead")
         records.delete_record(repo, rec["session"])
         return {"action": "cleared-dead", "session": rec["session"]}
+    foundation.clear_absent_stamp(repo, rec["session"])
     if rec.get("standing") and not grants.grant_active(grant, now_dt):
         rel = lifecycle.release(colab, repo, reason="grant-expired", session=rec["session"], now_dt=now_dt)
         return {"action": "released-standing-expired", "stop": rel.get("stop"), "was": rel.get("was")}
@@ -89,7 +104,7 @@ def _reap_record(colab, repo: Path, cfg: dict, rec: dict, grant: dict | None, no
     return out
 
 
-_REAP_PRIORITY = ("released-deadline", "cleared-dead", "released-standing-expired", "released-idle", "renewed", "renewal-failed", "kept-unknown", "kept")
+_REAP_PRIORITY = ("released-deadline", "cleared-dead", "released-standing-expired", "released-idle", "renewed", "renewal-failed", "kept-absent-unconfirmed", "kept-unknown", "kept")
 
 
 @contextlib.contextmanager
