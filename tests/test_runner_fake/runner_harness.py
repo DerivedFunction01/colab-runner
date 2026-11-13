@@ -171,6 +171,29 @@ def install_bare_job(env, name, exit_code, uploads=None):
     return job_dir
 
 
+def upload_sleep_wrapper(tmp_path):
+    """A COLAB_BIN wrapper that sleeps before delegating an
+    upload of one named file (ctl {"sleep_upload_named":
+    "name", "sleep_seconds": N} in the fake state dir) — a
+    dead channel's shape: the upload neither lands nor fails,
+    it simply never answers."""
+    wrapper = tmp_path / "uploadsleep_colab.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_COLAB_STATE'])\n"
+        "ctl_path = state / 'uploadsleep.json'\n"
+        "ctl = json.loads(ctl_path.read_text()) if ctl_path.exists() else {}\n"
+        "args = sys.argv[1:]\n"
+        "if 'upload' in args and ctl.get('sleep_upload_named') and any(ctl['sleep_upload_named'] in a for a in args):\n"
+        "    time.sleep(float(ctl.get('sleep_seconds', 60)))\n"
+        "sys.exit(subprocess.run([sys.executable, os.environ['FAKE_COLAB_REAL'], *args]).returncode)\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
 def upload_fail_wrapper(tmp_path):
     """A COLAB_BIN wrapper that fails uploads of one named file
     (ctl {"fail_upload_named": "name"} in the fake state dir),

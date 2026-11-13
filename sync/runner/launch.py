@@ -16,6 +16,31 @@ from .foundation import REPO, colab, lease, transfer
 # plain upload: the single-file ceiling the fs tools enforce.
 UPLOAD_CHUNK_THRESHOLD_BYTES = 50 * 1024 * 1024
 
+# The plain upload's timeout, size-scaled (improvement
+# commissioned 2026-11-12 from a fleet datum: in a dead
+# channel window, three launches each burned the flat 600 s
+# before failing — a dead channel should confess at the pace
+# the file's size prices, not at the largest payload's
+# budget). The scale assumes a live channel moves at least
+# ~8 KB/s (below the worst degraded-but-working rate measured
+# that night, ~12 KB/s), floored so a small file still gets a
+# real attempt, capped so the largest plain files keep the
+# budget they have always had. Only the confession speed
+# changes: the attempt stays single, the verify probe still
+# gates execution, and the failure still names its stage.
+UPLOAD_TIMEOUT_FLOOR_S = 120
+UPLOAD_TIMEOUT_CAP_S = 600
+UPLOAD_ASSUMED_MIN_BPS = 8192
+
+
+def _upload_timeout_s(size_bytes: int) -> int:
+    # The floor is env-tunable for the reason the probe's
+    # timeout is (COLAB_RUN_PROBE_TIMEOUT_S precedent): tests
+    # shrink it to watch a dead channel confess quickly.
+    floor = int(os.environ.get("COLAB_RUN_UPLOAD_FLOOR_S", str(UPLOAD_TIMEOUT_FLOOR_S)))
+    scaled = size_bytes // UPLOAD_ASSUMED_MIN_BPS
+    return max(floor, min(UPLOAD_TIMEOUT_CAP_S, scaled))
+
 
 def upload_one(session: str, src: Path, dest_name: str, tag: str) -> str | None:
     """One pre-launch upload, verified before the job starts.
@@ -43,7 +68,7 @@ def upload_one(session: str, src: Path, dest_name: str, tag: str) -> str | None:
             return f"chunked upload failed: {json.dumps(up)[:300]}"
         return None
     try:
-        r = colab("upload", "-s", session, str(src), f"/content/{dest_name}", timeout=600)
+        r = colab("upload", "-s", session, str(src), f"/content/{dest_name}", timeout=_upload_timeout_s(src.stat().st_size))
     except subprocess.TimeoutExpired:
         lease.append_launch_outcome(REPO, session, "upload", False, f"{dest_name}: upload timed out")
         return f"upload timed out for {dest_name}"

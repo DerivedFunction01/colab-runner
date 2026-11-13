@@ -6,9 +6,10 @@ chunked and verified, and job scripts land under run-scoped
 remote names."""
 
 import json
+import time
 from pathlib import Path
 
-from runner_harness import FAKE, cli_calls, install_bare_job, logging_wrapper, run_verb, runner_env, runs_dir, upload_fail_wrapper  # noqa: F401
+from runner_harness import FAKE, cli_calls, install_bare_job, logging_wrapper, run_verb, runner_env, runs_dir, upload_fail_wrapper, upload_sleep_wrapper  # noqa: F401
 
 
 def test_checkpoint_less_job_completes_on_its_exit_stamp(tmp_path):
@@ -63,6 +64,31 @@ def test_manifest_upload_failure_fails_the_run_at_upload_time(tmp_path):
     assert "manifest upload failed" in out["error"] and "payload-data.bin" in out["error"]
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec["state"] == "failed" and "remote_out" not in rec
+
+
+def test_small_upload_dead_channel_confesses_on_the_scaled_budget(tmp_path):
+    """Size-scaled upload timeout (improvement commissioned
+    2026-11-12): the runner script is a small file, so a
+    channel that never answers must fail its launch on the
+    small budget the size prices — not the flat 600 s the
+    largest payloads carry. The wrapper sleeps the script
+    upload for 60 s; with the floor shrunk to 5 s the launch
+    fails in seconds, naming the upload stage and its
+    timeout, exactly the named-stage record the flat budget
+    produced at twelve minutes."""
+    env = runner_env(tmp_path)
+    install_bare_job(env, "bareslow", 0)
+    state = Path(env["FAKE_COLAB_STATE"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "uploadsleep.json").write_text(json.dumps({"sleep_upload_named": "bareslow", "sleep_seconds": 60}))
+    env.update(COLAB_BIN=str(upload_sleep_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE), COLAB_RUN_UPLOAD_FLOOR_S="5")
+    started = time.monotonic()
+    r = run_verb(env, "bareslow")
+    elapsed = time.monotonic() - started
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = json.loads(r.stdout)
+    assert out["state"] == "failed" and "upload timed out" in out["error"], out
+    assert elapsed < 45, elapsed
 
 
 def test_oversize_manifest_upload_moves_chunked_and_verified(tmp_path):
