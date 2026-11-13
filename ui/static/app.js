@@ -269,10 +269,16 @@ function renderBudget() {
 
 function leaseChip(entry) {
   const rec = entry.record || {};
-  if (rec.standing) return `<span class="chip ok">Standing</span>`;
-  if (entry.action === "active") return `<span class="chip ok">Active</span>`;
-  if (entry.action === "recorded-but-dead") return `<span class="chip bad">Recorded · dead</span>`;
-  return `<span class="chip warn">${esc(entry.action || "unknown")}</span>`;
+  let chip;
+  if (rec.standing) chip = `<span class="chip ok">Standing</span>`;
+  else if (entry.action === "active") chip = `<span class="chip ok">Active</span>`;
+  else if (entry.action === "recorded-but-dead") chip = `<span class="chip bad">Recorded · dead</span>`;
+  else chip = `<span class="chip warn">${esc(entry.action || "unknown")}</span>`;
+  // A live-looking record whose work channel the census keeps
+  // failing to reach is named beside its state, never instead
+  // of it (the velvet shape: active chip, dead channel).
+  if (entry.channel && entry.channel.verdict === "suspect") chip += ` <span class="chip warn">Channel suspect</span>`;
+  return chip;
 }
 
 /* The extend picker: the shared duration chips plus a custom-hours

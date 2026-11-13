@@ -580,6 +580,27 @@ def test_state_listeners_part_served(ui):
     assert "state --part listeners" in ui.invocations()
 
 
+def test_records_carry_the_channel_verdict(ui):
+    """The channel verdict rides the records portion: a
+    live-looking record whose census channel keeps failing
+    serves suspect where consumers steer (the velvet shape —
+    active record, dead channel)."""
+    data = ui.get_json("/api/state/records")
+    by_session = {e["session"]: e for e in data["records"]}
+    channel = by_session["amber-otter-42"]["channel"]
+    assert channel["verdict"] == "suspect" and channel["consecutive_failures"] == 3
+    full = ui.get_json("/api/state")
+    assert {e["session"]: e for e in full["records"]}["amber-otter-42"]["channel"] == channel
+
+
+def test_frontend_names_a_suspect_channel():
+    """The lease card's chip names a suspect channel beside the
+    record's state — rendered from the served verdict only."""
+    js = (REPO / "ui" / "static" / "app.js").read_text()
+    assert "Channel suspect" in js
+    assert 'entry.channel.verdict === "suspect"' in js
+
+
 def test_frontend_polls_listeners_and_renders_them():
     """app.js polls the listeners portion and the lease card
     renders the served census fields; poll.js merges the

@@ -91,6 +91,35 @@ def test_collect_failure_stamps_the_failure(repo):
     assert stamp["error"] == "probe-failed" and "listeners" not in stamp
 
 
+def test_collect_counts_consecutive_failures_and_resets(repo):
+    """The channel verdict's raw material: failures accumulate
+    across stamps — an aged failure run is what separates a
+    dead channel from a busy session's weather — and a success
+    zeroes the count."""
+    s1 = listeners.collect_census(_stub_colab("", rc=1), repo, "standard", NOW)
+    assert s1["consecutive_failures"] == 1
+    s2 = listeners.collect_census(_stub_colab("", rc=1), repo, "standard", NOW)
+    assert s2["consecutive_failures"] == 2
+    s3 = listeners.collect_census(_stub_colab(PROBE_OUT), repo, "standard", NOW)
+    assert s3["consecutive_failures"] == 0
+
+
+def test_channel_verdict_derives_from_the_stamps(repo):
+    """unknown before any census, ok on a success, unproven on
+    a first failure, suspect once failures run consecutive —
+    the velvet shape (a live record over a dead channel) is
+    the suspect case."""
+    assert listeners.channel_verdict(repo, "standard") == {"verdict": "unknown", "at": None}
+    listeners.collect_census(_stub_colab(PROBE_OUT), repo, "standard", NOW)
+    assert listeners.channel_verdict(repo, "standard")["verdict"] == "ok"
+    listeners.collect_census(_stub_colab("", rc=1), repo, "standard", NOW)
+    v = listeners.channel_verdict(repo, "standard")
+    assert v["verdict"] == "unproven" and v["consecutive_failures"] == 1
+    listeners.collect_census(_stub_colab("", rc=1), repo, "standard", NOW)
+    v = listeners.channel_verdict(repo, "standard")
+    assert v["verdict"] == "suspect" and v["consecutive_failures"] == 2 and v["reason"] == "probe-failed"
+
+
 def test_maybe_collect_throttles_inside_the_interval(repo):
     listeners.collect_census(_stub_colab(PROBE_OUT), repo, "standard", NOW)
     calls = []

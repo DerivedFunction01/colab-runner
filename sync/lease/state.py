@@ -57,6 +57,12 @@ def status(colab, repo: Path, session: str | None = None) -> dict:
     # talking to, and — after a replacement — when it changed
     # and what it replaced. No stamp serves as None.
     out["runtime"] = identity.read_stamp(repo, rec["session"]) or None
+    # The work-channel verdict rides the same read (derived from
+    # the census stamps; a local file read, never a dial): a
+    # record can read active while its channel is dead, and the
+    # consumers steering by these records are owed that fact in
+    # the same document.
+    out["channel"] = listeners.channel_verdict(repo, rec["session"])
     if out["action"] == "active" and foundation.load_config(repo).get("keepalive", {}).get("enabled"):
         age = keepalive.heartbeat_age(colab, repo, rec["session"])
         out["keepalive_heartbeat_age_s"] = round(age, 1) if age is not None else None

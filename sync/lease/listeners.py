@@ -36,6 +36,14 @@ PREDATE_SKEW_S = 120
 # A start inside this window after boot is the platform, never
 # a predecessor's leftover.
 BOOT_COHORT_S = 300
+# A session whose census probe fails this many collections in
+# a row while its lease record reads live has a dead work
+# channel under a live-looking record (2026-11-12, velvet:
+# listed and status-readable all evening, zero bytes ever
+# moved, 11 launches dead at upload). One failure is a busy
+# session's weather; two in a row, an interval apart, is the
+# channel.
+CHANNEL_SUSPECT_FAILURES = 2
 
 
 def census_path(repo: Path, session: str) -> Path:
@@ -99,6 +107,12 @@ def collect_census(colab, repo: Path, session: str, now_dt: datetime | None = No
                 stamp["boot_epoch"] = result["boot_epoch"]
     except Exception as exc:  # noqa: BLE001
         stamp["error"] = f"probe-error: {type(exc).__name__}"
+    prev = read_census(repo, session)
+    if stamp.get("error"):
+        prev_failures = prev.get("consecutive_failures") if prev and prev.get("error") else 0
+        stamp["consecutive_failures"] = (prev_failures if isinstance(prev_failures, int) else 0) + 1
+    else:
+        stamp["consecutive_failures"] = 0
     try:
         _save_stamp(repo, session, stamp)
     except OSError:
@@ -132,6 +146,24 @@ def maybe_collect(colab, repo: Path, rec: dict, now_dt: datetime | None = None) 
         except (KeyError, ValueError, TypeError):
             pass
     return collect_census(colab, repo, session, now_dt)
+
+
+def channel_verdict(repo: Path, session: str) -> dict:
+    """One session's work-channel verdict, derived from its
+    census stamps: the census probe is an exec, so its failures
+    measure the very channel launches ride. suspect names the
+    dead-channel-under-a-live-record condition for whoever
+    steers by the records — it disposes nothing, and unknown /
+    unproven keep an unread or once-failed channel honest."""
+    stamp = read_census(repo, session)
+    if stamp is None:
+        return {"verdict": "unknown", "at": None}
+    if not stamp.get("error"):
+        return {"verdict": "ok", "at": stamp.get("at")}
+    failures = stamp.get("consecutive_failures")
+    failures = failures if isinstance(failures, int) else 1
+    verdict = "suspect" if failures >= CHANNEL_SUSPECT_FAILURES else "unproven"
+    return {"verdict": verdict, "reason": stamp["error"], "consecutive_failures": failures, "at": stamp.get("at")}
 
 
 def _suspect_reasons(entry: dict, acquired_epoch: float | None, boot_epoch: float | None = None) -> list:

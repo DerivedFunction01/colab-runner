@@ -95,6 +95,7 @@ def state_entry(session):
         "session": session,
         "warm": None,
         "sync_claim": claim,
+        "channel": {"verdict": "suspect", "reason": "probe-failed", "consecutive_failures": 3, "at": "2026-11-01T00:00:00+00:00"} if session == SESSION else {"verdict": "ok", "at": "2026-11-01T00:00:00+00:00"},
     }
 
 
