@@ -7,9 +7,20 @@ left exactly as found."""
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from runner_harness import FAKE, _fire_smoke, _write_run_record, control_sha, run_bin, run_verb, runner_env, runs_dir  # noqa: F401
+
+
+def _backdate_absence(env, session, seconds=901):
+    """Age a session's absence stamp past the confirmation
+    window, so the next sweep's absent reading is a confirmed
+    absence (the stamp is the sweep's own state file)."""
+    stamp = Path(env["COLAB_RUNNER_VAR"]) / f"absent-{session}.json"
+    data = json.loads(stamp.read_text())
+    data["first_absent_at"] = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    stamp.write_text(json.dumps(data))
 
 
 def test_colab_run_smoke_end_to_end(tmp_path):
@@ -38,6 +49,13 @@ def test_orphan_sweep_marks_dead_session(tmp_path):
     r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(stale.read_text())["state"] == "running", "the launch path swept a record it had no business touching"
+    # Orphaning needs a confirmed absence (2026-11-13): one
+    # sweep's absent reading only stamps; the run survives until
+    # a later sweep still finds the session gone past the window.
+    r = run_verb(env, "--sweep")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(stale.read_text())["state"] == "running"
+    _backdate_absence(env, "ghost-session-absent")
     r = run_verb(env, "--sweep")
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(stale.read_text())["state"] == "orphaned"
@@ -83,6 +101,11 @@ def test_orphan_sweep_marks_cotenants_of_a_dead_session_together(tmp_path):
     r = run_verb(env, "--sweep")
     assert r.returncode == 0, r.stdout + r.stderr
     for p in dead_tenants:
+        assert json.loads(p.read_text())["state"] == "running", "one absent reading orphaned a co-tenant"
+    _backdate_absence(env, "ghost-session-absent")
+    r = run_verb(env, "--sweep")
+    assert r.returncode == 0, r.stdout + r.stderr
+    for p in dead_tenants:
         assert json.loads(p.read_text())["state"] == "orphaned"
     assert live_tenant.read_text() == live_before
 
@@ -101,6 +124,13 @@ def test_sweep_matches_live_names_exactly(tmp_path):
     exact = _write_run_record(runs, "tenant-exact", session)
     suffixed = _write_run_record(runs, "tenant-suffix", session + "-extra")
     prefixed = _write_run_record(runs, "tenant-prefix", session[:8])
+    r = run_verb(env, "--sweep")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(exact.read_text())["state"] == "running"
+    assert json.loads(suffixed.read_text())["state"] == "running", "one absent reading orphaned the suffix"
+    assert json.loads(prefixed.read_text())["state"] == "running", "one absent reading orphaned the prefix"
+    _backdate_absence(env, session + "-extra")
+    _backdate_absence(env, session[:8])
     r = run_verb(env, "--sweep")
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(exact.read_text())["state"] == "running"

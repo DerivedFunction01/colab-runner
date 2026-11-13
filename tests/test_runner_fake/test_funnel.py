@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from runner_harness import FAKE, _fire_smoke, _write_run_record, run_bin, run_verb, runner_env, runs_dir, terminal_events  # noqa: F401
@@ -209,6 +210,13 @@ def test_sweep_orphans_a_starting_record_on_a_dead_session(tmp_path):
     runs.mkdir(parents=True, exist_ok=True)
     _fire_smoke(env)
     p = _write_starting_record(runs, "dead-start", "no-such-session-xyz", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    r = run_verb(env, "--sweep")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(p.read_text())["state"] == "starting", "one absent reading orphaned a starting record"
+    stamp = Path(env["COLAB_RUNNER_VAR"]) / "absent-no-such-session-xyz.json"
+    data = json.loads(stamp.read_text())
+    data["first_absent_at"] = (datetime.now(timezone.utc) - timedelta(seconds=901)).isoformat()
+    stamp.write_text(json.dumps(data))
     r = run_verb(env, "--sweep")
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(p.read_text())["state"] == "orphaned"

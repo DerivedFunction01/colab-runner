@@ -49,12 +49,38 @@ def orphan_sweep() -> tuple[list[dict], bool]:
     if live is None:
         return findings, False
     live_names = {entry["session"] for entry in live}
+    confirmed_absent: set[str] = set()
     for f in sorted(RUNS.glob("*.json")):
         try:
             rec = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        if rec.get("state") in ("running", "polling", "starting") and rec.get("session") and rec.get("session") in live_names:
+            # A live sighting resets the absence clock, whatever
+            # branch below then handles the record.
+            lease.foundation.clear_absent_stamp(REPO, rec["session"])
         if rec.get("state") in ("running", "polling", "starting") and rec.get("session") and rec.get("session") not in live_names:
+            # Orphaning needs the absence confirmed across
+            # observations (2026-11-13): the live list comes back
+            # partial under load, so a name missing from one list
+            # is as often the list's flicker as the session's
+            # death — one sweep's reading orphaned healthy,
+            # evidence-carrying runs all evening. The lease
+            # core's shared absence stamp carries the clock:
+            # first absence stamps and spares the run; a later
+            # sweep still absent past the window orphans.
+            # Co-tenants share the session's stamp: once one
+            # record's confirmation clears it, its siblings must
+            # not read the cleared stamp as a first absence —
+            # the pass remembers the confirmation itself.
+            if rec["session"] not in confirmed_absent:
+                since = lease.foundation.absent_since(REPO, rec["session"])
+                now_dt = datetime.now(timezone.utc)
+                if since is None or (now_dt - since).total_seconds() < lease.foundation.ABSENT_CONFIRM_S:
+                    lease.foundation.stamp_absent(REPO, rec["session"], since or now_dt, now_dt)
+                    continue
+                confirmed_absent.add(rec["session"])
+                lease.foundation.clear_absent_stamp(REPO, rec["session"])
             rec["state"] = "orphaned"
             rec["orphan_noted_at"] = now()
             save_record(rec)
