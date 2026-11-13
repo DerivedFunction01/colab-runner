@@ -75,7 +75,14 @@ client type. The panel's re-auth cadence is read from it.
   blinded while its lease records stayed correct. A call that
   leaves the binding missing or unparseable gets the snapshot
   restored atomically; a binding that still parses (even `{}`) is
-  the CLI's own view and is never overridden. The mirror's
+  the CLI's own view and is never overridden wholesale. Entry
+  level (same landing): a call that prunes an individual entry
+  from a parseable binding gets it restored verbatim from the
+  snapshot — merged into the CLI's current map — when the
+  session's lease record names a deadline in the future; the
+  CLI's rewrites drop entries under load while their assignments
+  live on, and the record is the authority on what should exist.
+  An entry with no live record stays pruned. The mirror's
   never-capture-empty guard counts an unparseable canonical as
   empty, so a torn binding can no longer overwrite its last good
   mirror copy either.

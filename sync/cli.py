@@ -151,6 +151,61 @@ def _restore_binding(snapshot: bytes | None) -> None:
         pass
 
 
+def _lease_record_live(name: str) -> bool:
+    """The lease record is the authority on whether <name>'s
+    binding entry should exist: a record whose deadline is still
+    in the future means the session is the fleet's to use."""
+    try:
+        rec = json.loads((_var_dir() / f"lease-{name}.json").read_text())
+        deadline = datetime.fromisoformat(rec["deadline"])
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return deadline > datetime.now(timezone.utc)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _restore_pruned_entries(snapshot: bytes | None) -> None:
+    """Re-add binding entries a call pruned while their lease
+    records live (2026-11-13 evening: the CLI's rewrites kept
+    dropping individual entries under the recovery traffic — the
+    file stayed parseable, the name vanished, and runs orphaned
+    mid-flight while their assignments lived; the whole-file
+    guard above cannot see a parseable file). The snapshot's
+    entry goes back verbatim, merged into the CLI's current map
+    so its surviving view and additions are preserved; an entry
+    whose record is gone or past its deadline stays pruned —
+    stop and expiry removals are the CLI's own business. Never
+    raises."""
+    if snapshot is None:
+        return
+    try:
+        before = json.loads(snapshot)
+        data = _binding_bytes()
+        if data is None:
+            return
+        current = json.loads(data)
+        if not isinstance(before, dict) or not isinstance(current, dict):
+            return
+        restored = {name: before[name] for name in before if name not in current and _lease_record_live(name)}
+        if not restored:
+            return
+        current.update(restored)
+        tmp = SESSIONS.with_name(SESSIONS.name + ".tmp")
+        tmp.write_text(json.dumps(current, indent=2))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SESSIONS)
+    except (ValueError, UnicodeDecodeError, OSError):
+        pass
+
+
+def _heal_binding(snapshot: bytes | None) -> None:
+    if _binding_clobbered(snapshot):
+        _restore_binding(snapshot)
+    else:
+        _restore_pruned_entries(snapshot)
+
+
 def _note_auth_required(reason: str) -> None:
     try:
         var = _var_dir()
@@ -194,8 +249,11 @@ def colab(*args: str, timeout: int = 18000) -> subprocess.CompletedProcess:
       write denied after the truncate leaves 0 bytes and every
       recorded session reads absent (2026-11-13). A call that
       leaves the binding missing or unparseable gets the snapshot
-      restored; a binding that still parses is the CLI's own view
-      and is never overridden.
+      restored. A call that prunes an individual entry from a
+      still-parseable binding gets that entry restored when its
+      lease record lives — the CLI's rewrites drop entries under
+      load while their assignments live on; an entry with no
+      live record stays pruned, as the CLI's own removal.
     Inert under COLAB_BIN: the test fakes are not credential flows."""
     cmd = [colab_bin(), "--auth", "oauth2", *args]
     if os.environ.get("COLAB_BIN"):
@@ -210,18 +268,18 @@ def colab(*args: str, timeout: int = 18000) -> subprocess.CompletedProcess:
         if not _token_valid(_token_bytes()):
             _atomic_write_token(snapshot)
             _note_auth_required("CLI call timed out after overwriting the token; snapshot restored")
-        _restore_binding(binding_snapshot)
+        _heal_binding(binding_snapshot)
         raise
     if AUTH_PROMPT in (result.stdout + result.stderr):
         if not _token_valid(_token_bytes()):
             _atomic_write_token(snapshot)
-        _restore_binding(binding_snapshot)
+        _heal_binding(binding_snapshot)
         return _auth_blocked(cmd, "CLI entered its interactive login flow")
     if not _token_valid(_token_bytes()):
         _atomic_write_token(snapshot)
-        _restore_binding(binding_snapshot)
+        _heal_binding(binding_snapshot)
         return _auth_blocked(cmd, "CLI call overwrote the stored token; snapshot restored")
-    _restore_binding(binding_snapshot)
+    _heal_binding(binding_snapshot)
     if result.returncode == 0:
         _clear_auth_required()
     return result

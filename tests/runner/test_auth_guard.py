@@ -68,7 +68,7 @@ esac
 BINDING = '{"dawn-test-1": {"name": "dawn-test-1", "endpoint": "m-hm-test"}}'
 
 
-def setup_env(tmp_path, mode, token_text, binding_text=None):
+def setup_env(tmp_path, mode, token_text, binding_text=None, lease_records=None):
     home = tmp_path / "home"
     token = home / ".config" / "colab-cli" / "token.json"
     token.parent.mkdir(parents=True)
@@ -76,6 +76,10 @@ def setup_env(tmp_path, mode, token_text, binding_text=None):
         token.write_text(token_text)
     if binding_text is not None:
         (home / ".config" / "colab-cli" / "sessions.json").write_text(binding_text)
+    for name, record_text in (lease_records or {}).items():
+        var = tmp_path / "var"
+        var.mkdir(parents=True, exist_ok=True)
+        (var / f"lease-{name}.json").write_text(record_text)
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     fake = fakebin / "colab"
@@ -149,8 +153,36 @@ def test_binding_deleted_by_call_is_restored(tmp_path):
 
 def test_binding_rewritten_valid_is_the_clis_own_view(tmp_path):
     """A rewrite that still parses is the CLI's validated view
-    (it drops entries it rejects): the guard never overrides it."""
+    (it drops entries it rejects): the guard never overrides it
+    for a session no live lease record backs (none seeded here)."""
     env, driver, _token, _marker, _log = setup_env(tmp_path, "bind-rewrite", VALID_TOKEN, BINDING)
+    out = run_driver(env, driver)
+    assert out["rc"] == 0
+    sessions = tmp_path / "home" / ".config" / "colab-cli" / "sessions.json"
+    assert json.loads(sessions.read_text()) == {"other-session": {"name": "other-session"}}
+
+
+def test_pruned_entry_with_live_lease_record_is_restored(tmp_path):
+    """2026-11-13 evening: under the recovery traffic the CLI's
+    rewrites dropped individual entries from a parseable binding
+    and runs orphaned mid-flight. An entry whose lease record
+    still lives is restored verbatim from the snapshot, merged
+    into the CLI's surviving view."""
+    live = '{"session": "dawn-test-1", "deadline": "2999-01-01T00:00:00+00:00"}'
+    env, driver, _token, _marker, _log = setup_env(tmp_path, "bind-rewrite", VALID_TOKEN, BINDING, {"dawn-test-1": live})
+    out = run_driver(env, driver)
+    assert out["rc"] == 0
+    sessions = tmp_path / "home" / ".config" / "colab-cli" / "sessions.json"
+    merged = json.loads(sessions.read_text())
+    assert merged["dawn-test-1"] == {"name": "dawn-test-1", "endpoint": "m-hm-test"}
+    assert merged["other-session"] == {"name": "other-session"}
+
+
+def test_pruned_entry_with_expired_lease_record_stays_pruned(tmp_path):
+    """A removal the CLI made for a session whose record is past
+    its deadline is the CLI's own business: no restoration."""
+    expired = '{"session": "dawn-test-1", "deadline": "2000-01-01T00:00:00+00:00"}'
+    env, driver, _token, _marker, _log = setup_env(tmp_path, "bind-rewrite", VALID_TOKEN, BINDING, {"dawn-test-1": expired})
     out = run_driver(env, driver)
     assert out["rc"] == 0
     sessions = tmp_path / "home" / ".config" / "colab-cli" / "sessions.json"
