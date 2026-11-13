@@ -29,6 +29,13 @@ CENSUS_EXEC_TIMEOUT_S = 90
 # acquisition is the lease's own provisioning era, not a
 # predecessor's leftover.
 PREDATE_SKEW_S = 120
+# The runtime's own platform cohort (kernel manager, jupyter,
+# the ssh and fileshim bridges, node) starts within seconds of
+# the runtime's boot — which predates the lease record whenever
+# the record was written by a renewal or adoption after boot.
+# A start inside this window after boot is the platform, never
+# a predecessor's leftover.
+BOOT_COHORT_S = 300
 
 
 def census_path(repo: Path, session: str) -> Path:
@@ -54,7 +61,7 @@ def read_census(repo: Path, session: str) -> dict | None:
     return stamp if isinstance(stamp, dict) else None
 
 
-def _parse_probe(stdout: str) -> list | None:
+def _parse_probe(stdout: str) -> dict | None:
     """The probe's JSON is the last stdout line that parses as
     an object carrying listeners — the CLI's own notice lines
     ride the same stream (the preamble lesson, 2026-11-11)."""
@@ -68,7 +75,7 @@ def _parse_probe(stdout: str) -> list | None:
         except ValueError:
             continue
         if isinstance(obj, dict) and isinstance(obj.get("listeners"), list):
-            found = obj["listeners"]
+            found = obj
     return found
 
 
@@ -83,11 +90,13 @@ def collect_census(colab, repo: Path, session: str, now_dt: datetime | None = No
         probe.parent.mkdir(parents=True, exist_ok=True)
         probe.write_text((repo / "snippets" / "listener_census.py").read_text())
         r = colab("exec", "-s", session, "--timeout", "60", "-f", str(probe), timeout=CENSUS_EXEC_TIMEOUT_S)
-        listeners = _parse_probe(r.stdout or "") if r.returncode == 0 else None
-        if listeners is None:
+        result = _parse_probe(r.stdout or "") if r.returncode == 0 else None
+        if result is None:
             stamp["error"] = "probe-failed"
         else:
-            stamp["listeners"] = listeners
+            stamp["listeners"] = result["listeners"]
+            if isinstance(result.get("boot_epoch"), (int, float)):
+                stamp["boot_epoch"] = result["boot_epoch"]
     except Exception as exc:  # noqa: BLE001
         stamp["error"] = f"probe-error: {type(exc).__name__}"
     try:
@@ -125,14 +134,19 @@ def maybe_collect(colab, repo: Path, rec: dict, now_dt: datetime | None = None) 
     return collect_census(colab, repo, session, now_dt)
 
 
-def _suspect_reasons(entry: dict, acquired_epoch: float | None) -> list:
+def _suspect_reasons(entry: dict, acquired_epoch: float | None, boot_epoch: float | None = None) -> list:
     reasons = []
     cwd = entry.get("cwd") or ""
     if cwd.endswith("(deleted)"):
         reasons.append("deleted-cwd")
     started = entry.get("started_epoch")
     if acquired_epoch is not None and isinstance(started, (int, float)) and started < acquired_epoch - PREDATE_SKEW_S:
-        reasons.append("predates-lease")
+        # The platform cohort starts with the runtime itself and
+        # predates any record a renewal wrote; it is not a
+        # leftover, so the reason stands only for a start clear
+        # of the boot window.
+        if boot_epoch is None or started > boot_epoch + BOOT_COHORT_S:
+            reasons.append("predates-lease")
     return reasons
 
 
@@ -169,7 +183,7 @@ def listeners_state(repo: Path, rec: dict, now_dt: datetime | None = None) -> di
                 "cwd": entry.get("cwd") or "",
                 "cmd": entry.get("cmd") or "",
                 "started_at": datetime.fromtimestamp(started, tz=timezone.utc).isoformat() if isinstance(started, (int, float)) else None,
-                "suspect": _suspect_reasons(entry, acquired_epoch),
+                "suspect": _suspect_reasons(entry, acquired_epoch, stamp.get("boot_epoch")),
             }
         )
     return {"at": stamp.get("at"), "age_s": age_s, "error": stamp.get("error"), "listeners": listeners}

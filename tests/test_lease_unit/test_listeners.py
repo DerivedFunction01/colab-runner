@@ -52,6 +52,7 @@ def _fixture_proc(tmp_path):
 
 def test_probe_reads_the_listening_owner(tmp_path):
     out = probe.census(_fixture_proc(tmp_path))
+    assert out["boot_epoch"] == 1700000000.0
     assert len(out["listeners"]) == 1, out
     entry = out["listeners"][0]
     assert entry["port"] == 3273 and entry["pid"] == 947
@@ -65,7 +66,7 @@ def test_probe_empty_when_nothing_listens(tmp_path):
     (proc / "net").mkdir(parents=True)
     (proc / "net" / "tcp").write_text("  sl  local_address rem_address   st inode\n")
     (proc / "stat").write_text("btime 1700000000\n")
-    assert probe.census(proc) == {"listeners": []}
+    assert probe.census(proc) == {"boot_epoch": 1700000000.0, "listeners": []}
 
 
 def _stub_colab(stdout, rc=0):
@@ -129,6 +130,32 @@ def test_served_state_derives_suspects(repo):
     assert by_port[3273]["suspect"] == ["deleted-cwd", "predates-lease"]
     assert by_port[3100]["suspect"] == []
     assert state["error"] is None and state["age_s"] == 0
+
+
+def test_platform_cohort_is_not_a_predates_suspect(repo):
+    """The runtime's own platform processes start at boot,
+    which predates any record a renewal wrote later; the
+    boot-cohort window keeps them off the suspect list, while
+    a leftover starting clear of the window still flags."""
+    rec = seed_record(repo)
+    boot = ACQUIRED_EPOCH - 7200
+    listeners._save_stamp(
+        repo,
+        "standard",
+        {
+            "session": "standard",
+            "at": NOW.isoformat(),
+            "boot_epoch": boot,
+            "listeners": [
+                {"port": 6000, "pid": 12, "cwd": "/", "cmd": "kernel_manager", "started_epoch": boot + 5},
+                {"port": 3271, "pid": 85247, "cwd": "/content/sp-month-gate/apps/web", "cmd": "next-server", "started_epoch": boot + 3600},
+            ],
+        },
+    )
+    state = listeners.listeners_state(repo, rec, NOW)
+    by_port = {e["port"]: e for e in state["listeners"]}
+    assert by_port[6000]["suspect"] == []
+    assert by_port[3271]["suspect"] == ["predates-lease"]
 
 
 def test_served_state_without_a_stamp_is_an_honest_empty(repo):

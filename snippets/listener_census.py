@@ -49,12 +49,12 @@ def _listen_inodes(proc: Path) -> dict:
 
 
 def census(proc: Path = PROC) -> dict:
+    boot = _boot_time(proc)
     inodes = _listen_inodes(proc)
     if not inodes:
-        return {"listeners": []}
+        return {"boot_epoch": boot, "listeners": []}
     clk = os.sysconf("SC_CLK_TCK")
-    boot = _boot_time(proc)
-    return {"listeners": _join(proc, inodes, clk, boot)}
+    return {"boot_epoch": boot, "listeners": _join(proc, inodes, clk, boot)}
 
 
 def _join(proc: Path, inodes: dict, clk: int, boot: float) -> list:
