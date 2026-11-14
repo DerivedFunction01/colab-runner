@@ -642,6 +642,26 @@ def main() -> int:
                 return 1
         stamp_collector(rec, rec.get("caller"))
         rc, result = finalize_run(rec, job, session, remote_out, state, usage_before)
+        if result.get("state") == "collecting":
+            # The payload is done; only the output transfer
+            # failed. The finally below tears the session down
+            # when this call returns, so the retries live here,
+            # on the poll cadence inside a bounded hold: each
+            # pass re-reads the session and finalize retries
+            # the pull. On expiry one last finalize closes
+            # without the hold and names the collection failure
+            # on the record — closing is honest there because
+            # the teardown ends collection either way.
+            hold_deadline = time.time() + int(os.environ.get("COLAB_RUN_COLLECTION_HOLD_S", "900"))
+            while result.get("state") == "collecting" and time.time() < hold_deadline:
+                time.sleep(cadence)
+                state2, _hold_error = read_reader(session, reader, poll_timeout)
+                if state2 is not None:
+                    state = state2
+                stamp_collector(rec, rec.get("caller"))
+                rc, result = finalize_run(rec, job, session, remote_out, state, usage_before)
+            if result.get("state") == "collecting":
+                rc, result = finalize_run(rec, job, session, remote_out, state, usage_before, hold=False)
         print(json.dumps(result, indent=2))
         return rc
     finally:

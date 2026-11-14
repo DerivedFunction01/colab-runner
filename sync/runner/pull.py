@@ -11,7 +11,18 @@ import time
 from datetime import datetime, timezone
 
 from .foundation import REPO, RUNS, colab, now, transfer
-from .records import TERMINAL_STATES, mark_terminal
+from .records import TERMINAL_STATES, mark_terminal, save_record
+
+
+def _stamp_pull_error(rec: dict, name: str, msg: str) -> None:
+    """One failed pull attempt, recorded twice over: the
+    human-readable last_pull_error the record has always
+    carried, and the per-name pull_failures map finalize
+    partitions on — a name with a fresh failure this pass
+    whose file probes present remotely is a collection
+    shortfall, not an absence."""
+    rec["last_pull_error"] = msg
+    rec.setdefault("pull_failures", {})[name] = msg
 
 # E6: the file channel's measured single-file reliability ceiling
 # (AGENTS.md, file channel) — a declared output larger than this
@@ -72,7 +83,7 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
         if stat is not None and stat["size"] > SINGLE_FILE_CEILING_BYTES:
             res = transfer.chunked_download(session, f"{remote_out}/{name}", staging)
             if not res.get("ok"):
-                rec["last_pull_error"] = f"chunked pull of {name} failed at {now()}: {res.get('stage', 'unknown stage')}"
+                _stamp_pull_error(rec, name, f"chunked pull of {name} failed at {now()}: {res.get('stage', 'unknown stage')}")
                 staging.unlink(missing_ok=True)
                 continue
             entry = {"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "chunked"}
@@ -80,14 +91,14 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
             try:
                 colab("download", "-s", session, f"/content/{remote_out}/{name}", str(staging), timeout=600)
             except subprocess.TimeoutExpired:
-                rec["last_pull_error"] = f"checkpoint pull of {name} timed out at {now()}"
+                _stamp_pull_error(rec, name, f"checkpoint pull of {name} timed out at {now()}")
                 staging.unlink(missing_ok=True)
                 continue
             except (SystemExit, OSError) as exc:
                 # The download channel refusing or failing is a
                 # failed pull, never a landed one: whatever file
                 # the attempt left behind is not the output.
-                rec["last_pull_error"] = f"checkpoint pull of {name} failed at {now()}: {exc}"
+                _stamp_pull_error(rec, name, f"checkpoint pull of {name} failed at {now()}: {exc}")
                 staging.unlink(missing_ok=True)
                 continue
             if staging.exists():
@@ -102,7 +113,7 @@ def pull_outputs(rec: dict, job: dict, session: str, remote_out: str, reader_sta
                     # entry and the run read complete on it). The
                     # stored stat stays unset, so the next cadence
                     # retries instead of skipping on a false match.
-                    rec["last_pull_error"] = f"pull of {name} landed {entry['bytes']} bytes against a remote size of {stat['size']} at {now()}"
+                    _stamp_pull_error(rec, name, f"pull of {name} landed {entry['bytes']} bytes against a remote size of {stat['size']} at {now()}")
                     staging.unlink(missing_ok=True)
                     continue
         if entry is None:
@@ -397,7 +408,7 @@ def collect_misplaced(rec: dict, session: str, misplaced: list) -> list:
             if res.get("ok"):
                 new_entry = {"path": name, "bytes": res["bytes"], "sha256": res["sha256"], "route": "misplaced-chunked"}
             else:
-                rec["last_pull_error"] = f"misplaced pull of {name} failed at {now()}: chunked stage {res.get('stage', 'unknown stage')}"
+                _stamp_pull_error(rec, name, f"misplaced pull of {name} failed at {now()}: chunked stage {res.get('stage', 'unknown stage')}")
                 staging.unlink(missing_ok=True)
                 continue
         else:
@@ -408,13 +419,13 @@ def collect_misplaced(rec: dict, session: str, misplaced: list) -> list:
                 # file, the download speaks session paths.
                 colab("download", "-s", session, f"/content/{name}", str(staging), timeout=600)
             except Exception as exc:  # noqa: BLE001 — a failed pull is a noted absence, never a landed file
-                rec["last_pull_error"] = f"misplaced pull of {name} failed at {now()}: {exc}"
+                _stamp_pull_error(rec, name, f"misplaced pull of {name} failed at {now()}: {exc}")
                 staging.unlink(missing_ok=True)
                 continue
             if staging.exists():
                 landed = staging.stat().st_size
                 if landed != entry["bytes"]:
-                    rec["last_pull_error"] = f"misplaced pull of {name} landed {landed} bytes against a probed size of {entry['bytes']} at {now()}"
+                    _stamp_pull_error(rec, name, f"misplaced pull of {name} landed {landed} bytes against a probed size of {entry['bytes']} at {now()}")
                     staging.unlink(missing_ok=True)
                     continue
                 new_entry = {"path": name, "bytes": landed, "sha256": hashlib.sha256(staging.read_bytes()).hexdigest(), "route": "misplaced"}
@@ -441,7 +452,7 @@ def collect_misplaced(rec: dict, session: str, misplaced: list) -> list:
     return collected
 
 
-def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before) -> tuple[int, dict]:
+def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_state: dict, usage_before, hold: bool = True) -> tuple[int, dict]:
     """The terminal tail, shared by the foreground poll loop and
     --poll: final pull, the payload's own exit code, the terminal
     record + its one outbox event. Returns (exit_code, result).
@@ -455,6 +466,9 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     payloads that never write a checkpoint. Outputs are pulled
     regardless — reports and
     verdicts land locally either way."""
+    # Per-pass failure evidence for the collection partition
+    # below: only this pass's pull attempts may hold the run.
+    rec["pull_failures"] = {}
     pulled = pull_outputs(rec, job, session, remote_out, reader_state)
     # Declared-vs-pulled accounting: a payload can exit 0 with
     # declared artifacts unwritten (or written outside its out
@@ -505,6 +519,48 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
     ]
     if empty:
         rec["empty_outputs"] = empty
+    # Collection hold: partition the shortfall. An output that
+    # probes PRESENT remotely — a fresh misplaced entry, a
+    # reader-sized out-dir file, a held 0-byte pull against a
+    # non-zero remote — and whose collection failed on this
+    # pass is not an absence: the payload wrote it and the
+    # transfer failed, and a terminal close would freeze that
+    # failure as the verdict (2026-11-14 specimen: a run closed
+    # complete 8 s after its misplaced pull landed 0 bytes, all
+    # three outputs probed fresh at /content/ and uncollected,
+    # and a later --poll echoed complete because a terminal
+    # record never retries). Hold the record non-terminal; the
+    # next poll retries the pull, and the hold dissolves on its
+    # own when the files collect or stop probing present.
+    # Contended misplaced entries never hold: that file is
+    # another run's to disambiguate, by the attribution rule.
+    failures = rec.get("pull_failures") or {}
+    present_uncollected = set(empty)
+    for entry in misplaced:
+        if entry.get("fresh") and not entry.get("contended") and not entry.get("collected") and entry["name"] in failures:
+            present_uncollected.add(entry["name"])
+    for name in missing:
+        if (final_stats.get(name) or {}).get("size", 0) > 0 and name in failures:
+            present_uncollected.add(name)
+    present_uncollected &= set(missing) | set(empty)
+    if present_uncollected and hold:
+        rec["collection_pending"] = sorted(present_uncollected)
+        rec.setdefault("collection_since", now())
+        save_record(rec)
+        result = {"run_id": rec["run_id"], "state": "collecting", "collection_pending": sorted(present_uncollected), "pulled": pulled}
+        if missing:
+            result["missing_outputs"] = missing
+        if misplaced:
+            result["misplaced_outputs"] = misplaced
+        return 3, result
+    if present_uncollected:
+        # The caller declined the hold (the foreground loop's
+        # bound expired): the close proceeds, but the record
+        # names the collection failure as its own fact, apart
+        # from the payload's outcome.
+        rec["collection_failed"] = sorted(present_uncollected)
+    rec.pop("collection_pending", None)
+    rec.pop("collection_since", None)
     exit_code = (reader_state.get("checkpoint") or {}).get("exit_code")
     if exit_code is None:
         exit_code = reader_state.get("exit_stamp")
@@ -526,4 +582,6 @@ def finalize_run(rec: dict, job: dict, session: str, remote_out: str, reader_sta
         result["misplaced_outputs"] = misplaced
     if empty:
         result["empty_outputs"] = empty
+    if rec.get("collection_failed"):
+        result["collection_failed"] = rec["collection_failed"]
     return (1 if result["state"] == "failed" else 0), result

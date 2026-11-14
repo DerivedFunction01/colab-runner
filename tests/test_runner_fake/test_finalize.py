@@ -63,13 +63,20 @@ def test_a_download_that_delivers_empty_is_not_a_pull(tmp_path):
     fewer bytes than the reader sizes the remote output at, the
     pull is refused — no entry is certified, the error names the
     mismatch, and the shortfall surfaces at finalize as missing
-    or empty, never as a clean complete on 0-byte artifacts."""
+    or empty, never as a clean complete on 0-byte artifacts.
+    Collection hold (2026-11-14): the foreground loop now holds
+    and retries the pull before closing; this manufacture's
+    channel never recovers, so the hold is shrunk to seconds
+    and the expiry close must name the failure as
+    collection_failed, apart from the payload's outcome."""
     env = runner_env(tmp_path)
-    env.update(COLAB_BIN=str(_truncating_download_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE))
+    env.update(COLAB_BIN=str(_truncating_download_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE), COLAB_RUN_COLLECTION_HOLD_S="3")
     r = subprocess.run([sys.executable, str(run_bin(env)), "smoke"], capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     out = json.loads(r.stdout)
     assert out["state"] == "complete"
+    assert "heartbeat.log" in (out.get("collection_failed") or []), out
+    assert "checkpoint.json" in (out.get("collection_failed") or []), out
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     surfaced = set(out.get("missing_outputs", [])) | set(out.get("empty_outputs", []))
     assert "heartbeat.log" in surfaced, out
@@ -82,12 +89,16 @@ def test_a_download_that_delivers_empty_is_not_a_pull(tmp_path):
     assert not list(results.glob("*.pulling")), "a refused pull left a staging file behind"
 
 
-def test_finalize_names_a_held_empty_pull_against_remote_content(tmp_path):
-    """The belt (2026-11-11): a record already holding a 0-byte
-    pulled entry (landed before the size cross-check existed)
-    whose remote output has content is named in empty_outputs
-    at finalize — the terminal record never reads clean over a
-    pulled-but-empty artifact."""
+def test_finalize_holds_a_held_empty_pull_until_it_collects(tmp_path):
+    """A record already holding a 0-byte pulled entry (landed
+    before the size cross-check existed) whose remote output
+    has content: the 2026-11-11 belt named it in empty_outputs
+    at a terminal finalize. The 2026-11-14 collection hold
+    supersedes the close: while the pull keeps failing the run
+    does not close at all — the poll answers collecting with
+    the output named in collection_pending — and once the
+    channel recovers, the next poll collects the real bytes
+    and closes complete with no hold left on the record."""
     env = runner_env(tmp_path)
     first = _fire_smoke(env)
     runs = runs_dir(env)
@@ -105,12 +116,29 @@ def test_finalize_names_a_held_empty_pull_against_remote_content(tmp_path):
     }))
     env.update(COLAB_BIN=str(_truncating_download_wrapper(tmp_path)), FAKE_COLAB_REAL=str(FAKE))
     r = run_verb(env, "--poll", seeded_id)
-    assert r.returncode == 0, r.stdout + r.stderr
-    rec = json.loads(seeded.read_text())
-    assert rec["state"] == "complete", rec
-    assert rec.get("empty_outputs") == ["heartbeat.log"], rec.get("empty_outputs")
+    assert r.returncode == 3, r.stdout + r.stderr
     out = json.loads(r.stdout)
-    assert out.get("empty_outputs") == ["heartbeat.log"], out
+    assert out["state"] == "collecting", out
+    # The truncating wrapper fails EVERY transfer this pass, so
+    # the hold names every declared output whose remote content
+    # failed to land — the held 0-byte heartbeat plus the four
+    # outputs never yet pulled.
+    all_outputs = ["checkpoint.json", "heartbeat.log", "unit-0.bin", "unit-1.bin", "unit-2.bin"]
+    assert out.get("collection_pending") == all_outputs, out
+    rec = json.loads(seeded.read_text())
+    assert rec["state"] == "polling", rec
+    assert rec.get("collection_pending") == all_outputs, rec.get("collection_pending")
+    assert rec.get("collection_since"), rec
+    env2 = runner_env(tmp_path)
+    r2 = run_verb(env2, "--poll", seeded_id)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    out2 = json.loads(r2.stdout)
+    assert out2["state"] == "complete", out2
+    rec2 = json.loads(seeded.read_text())
+    assert rec2["state"] == "complete", rec2
+    assert "collection_pending" not in rec2 and "collection_since" not in rec2, rec2
+    held = {e["path"]: e for e in rec2.get("pulled", [])}
+    assert held["heartbeat.log"]["bytes"] > 0, held
 
 
 def install_stray_job(env, name):
@@ -401,3 +429,8 @@ def test_finalize_reports_declared_outputs_that_never_arrived(tmp_path):
     rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
     assert rec.get("missing_outputs") == ["absent.txt"]
     assert [e["path"] for e in rec["pulled"]] == ["present.txt"]
+    # The collection hold must not fire here: absent.txt was
+    # never written anywhere, so its failed pull is an absence,
+    # not a transfer shortfall (2026-11-14 partition).
+    assert "collection_pending" not in rec and "collection_failed" not in rec, rec
+    assert "collection_failed" not in out, out

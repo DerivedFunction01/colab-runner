@@ -173,6 +173,15 @@ def poll_run(run_id: str) -> int:
     if complete or past_deadline:
         stamp_collector(rec, os.environ.get("COLAB_CALLER"))
         rc, result = finalize_run(rec, job, session, remote_out, state, rec.get("usage_before"))
+        if result.get("state") == "collecting":
+            # Not a close: outputs probed present remotely
+            # failed to transfer on this pass, so the record
+            # stays non-terminal (finalize saved it with the
+            # hold stamped), the lease stays, and the next
+            # poll — this verb's whole design — retries the
+            # pull. Exit 3 is this verb's still-running code.
+            print(json.dumps(result, indent=2))
+            return 3
         close_out_lease(rec)
         print(json.dumps(result, indent=2))
         return rc
