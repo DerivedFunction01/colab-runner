@@ -59,6 +59,28 @@ def test_collect_stale_finalizes_a_wedged_detached_run(tmp_path):
     assert len(terminal_events(env, out["run_id"])) == 1
 
 
+def test_collect_stale_honors_the_env_budget(tmp_path):
+    """The reap command's collector ride passes its remaining
+    command budget through COLAB_COLLECT_BUDGET_S: at zero the
+    pass still counts its candidates but attends none and
+    reports itself capped — the ride can be allotted too little
+    to start, never silently unbounded."""
+    env = runner_env(tmp_path)
+    out = _detach_smoke(env)
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    _wait_session_side_done(env, out["session"], rec["remote_out"])
+    _age_the_record(env, out["run_id"])
+    env["COLAB_COLLECT_BUDGET_S"] = "0"
+    r = run_verb(env, "--collect-stale")
+    assert r.returncode == 0, r.stdout + r.stderr
+    summary = json.loads(r.stdout)
+    assert summary["checked"] == 1
+    assert summary["attended"] == [] and summary["finalized"] == []
+    assert summary["capped"] is True
+    rec = json.loads((runs_dir(env) / f"{out['run_id']}.json").read_text())
+    assert rec["state"] == "polling"
+
+
 def test_fresh_detached_and_stale_foreground_records_are_untouched(tmp_path):
     env = runner_env(tmp_path)
     out = _detach_smoke(env)

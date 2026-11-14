@@ -18,10 +18,14 @@ from . import foundation, sessions, records, spend, access, keepalive, grants, l
 # record completes before any furniture starts, furniture runs
 # under a remaining-budget check that skips-and-reports instead
 # of being killed, and keepalive launches execute as their own
-# deferred phase. The default leaves the hook 60 s for its other
-# legs and process startup.
+# deferred phase. The default is sized against the reap
+# COMMAND's budget (bin/colab-lease composes pass + collector
+# against COLAB_LEASE_REAP_COMMAND_BUDGET_S, default 390): the
+# pass takes at most 300 of it, the collector's subprocess ride
+# takes the remainder, and the hook's 420 keeps ~30 for process
+# startup, the result print, and the mirror capture.
 
-_REAP_BUDGET_DEFAULT_S = 360.0
+_REAP_BUDGET_DEFAULT_S = 300.0
 
 
 def _budget_s() -> float:

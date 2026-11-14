@@ -34,7 +34,18 @@ def main() -> int:
         print(json.dumps({"findings": findings, "live_list_unreadable": not live_ok}, indent=2))
         return 0
     if "--collect-stale" in core_args:
-        print(json.dumps(collect_stale_detached(), indent=2))
+        # The reap command's collector ride passes its remaining
+        # command budget through the env; a direct call keeps the
+        # pass's own default budget.
+        raw_budget = os.environ.get("COLAB_COLLECT_BUDGET_S")
+        budget_s = None
+        if raw_budget:
+            try:
+                budget_s = float(raw_budget)
+            except ValueError:
+                budget_s = None
+        summary = collect_stale_detached(budget_s=budget_s) if budget_s is not None else collect_stale_detached()
+        print(json.dumps(summary, indent=2))
         return 0
     if "--poll" in core_args:
         idx = core_args.index("--poll")

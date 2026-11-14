@@ -344,17 +344,28 @@ when the listing itself could not be read — and unknown is
 never treated as dead. A lease record is deleted only on a
 confirmed-absent reading or a successful stop, never on an
 unreadable one. The pass then runs in phases under a cycle
-budget (`COLAB_LEASE_REAP_BUDGET_S`, default 360 s — inside
-the hook's 420 s reap bound): every record's lifecycle legs
-(renewal, release, absence clearing) complete first,
-unconditionally; the liveness furniture (identity check,
-keepalive freshness, kernel pulse), the keepalive launches
-the freshness reads owe, and the listener census follow
-under the budget's remaining time, each item checked before
-it starts. An exhausted budget skips-and-reports — the pass
-result carries `budget: {budget_s, spent_s, skipped}` and a
-skipped record is marked — instead of the hook's timeout
-killing the cycle mid-flight. Keepalive launches are their
+budget (`COLAB_LEASE_REAP_BUDGET_S`, default 300 s): every
+record's lifecycle legs (renewal, release, absence clearing)
+complete first, unconditionally; the liveness furniture
+(identity check, keepalive freshness, kernel pulse), the
+keepalive launches the freshness reads owe, and the listener
+census follow under the budget's remaining time, each item
+checked before it starts. An exhausted budget
+skips-and-reports — the pass result carries
+`budget: {budget_s, spent_s, skipped}` and a skipped record
+is marked — instead of the hook's timeout killing the cycle
+mid-flight. The hook's 420 s bound applies to the whole reap
+COMMAND, which composes the pass and the standing
+collector's ride, so the command composes both against one
+budget (`COLAB_LEASE_REAP_COMMAND_BUDGET_S`, default
+390 s): the pass result is first persisted to
+`var/last-reap.json`, then the collector runs as a bounded
+subprocess (the standalone `colab-run --collect-stale` verb)
+allotted whatever the pass did not spend, passed through
+`COLAB_COLLECT_BUDGET_S` — too little remaining skips it,
+reported, and a subprocess timeout reports in the result's
+collect block rather than killing the command. Keepalive
+launches are their
 own phase: a stale freshness read records the launch as owed
 rather than launching in line, so a stalled launch starves
 nothing; a launch the budget cannot fit is reported

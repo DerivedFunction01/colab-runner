@@ -117,6 +117,68 @@ def shape_arg(rest: list[str]) -> tuple[str | None, list[str], str | None]:
     return shape, rest, None
 
 
+# --- reap command composition -------------------------------------------------
+# The reaper hook bounds the whole `colab-lease reap` command at
+# 420 s, but the command composes two channel acts: the lease
+# pass and the standing collector that rides it. 7739f5d budgeted
+# the pass alone and the collector kept its own independent
+# budget — 600 s of sanctioned work inside the bound, and cycles
+# kept dying inside the collector (2026-11-14, hook invocations
+# 0f5d985b and 12:11:44Z). The composition therefore runs
+# against ONE command budget: the collector rides as a
+# subprocess over the standalone --collect-stale verb, allotted
+# whatever the pass did not spend, and the pass result is
+# persisted to var/last-reap.json before the collector runs, so
+# a death anywhere later in the command cannot eat the pass's
+# budget report. A killed attendance is safe: poll_run saves as
+# it goes, the attended record's collector stamp has advanced,
+# and partial pulls resume next cycle.
+
+_REAP_COMMAND_BUDGET_DEFAULT_S = 390.0
+_COLLECT_MIN_REMAINING_S = 20.0
+
+
+def _reap_command_budget_s() -> float:
+    raw = os.environ.get("COLAB_LEASE_REAP_COMMAND_BUDGET_S")
+    try:
+        return float(raw) if raw else _REAP_COMMAND_BUDGET_DEFAULT_S
+    except ValueError:
+        return _REAP_COMMAND_BUDGET_DEFAULT_S
+
+
+def _reap_with_collector() -> dict:
+    """The reap duty: the lease pass, then the standing
+    collector — stale detached run records get the poll their
+    consumer never ran — inside the command budget. Guarded
+    throughout: a collection failure reports in the result's
+    collect block and never breaks the reap duty itself."""
+    import subprocess
+    import time
+
+    started = time.monotonic()
+    result = lease.reap(cr.colab, REPO)
+    try:
+        var = REPO / "var"
+        var.mkdir(parents=True, exist_ok=True)
+        (var / "last-reap.json").write_text(json.dumps(result, indent=2))
+    except Exception:  # noqa: BLE001 — evidence only, never the duty
+        pass
+    remaining = _reap_command_budget_s() - (time.monotonic() - started)
+    if remaining < _COLLECT_MIN_REMAINING_S:
+        result["collect"] = {"skipped": "command-budget", "remaining_s": round(remaining, 1)}
+        return result
+    env = dict(os.environ)
+    env["COLAB_COLLECT_BUDGET_S"] = str(max(0.0, remaining - 5.0))
+    try:
+        child = subprocess.run([sys.executable, str(REPO / "bin" / "colab-run"), "--collect-stale"], capture_output=True, text=True, timeout=remaining, env=env)
+        result["collect"] = json.loads(child.stdout)
+    except subprocess.TimeoutExpired:
+        result["collect"] = {"error": "command-budget", "budget_s": round(remaining, 1)}
+    except Exception as exc:  # noqa: BLE001
+        result["collect"] = {"error": type(exc).__name__}
+    return result
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args or args[0] not in ("status", "acquire", "extend", "adopt", "shorten", "claim-sync", "release-sync", "release", "release-session", "reap", "keepalive", "auto", "request", "unrequest", "grant", "extend-grant", "ungrant", "standing", "state", "budget-caps", "admission", "plan"):
@@ -418,17 +480,7 @@ def main() -> int:
         lease.clear_request(REPO)
         result = {"action": "request-cleared" if had else "no-demand"}
     else:
-        result = lease.reap(cr.colab, REPO)
-        # The standing collector rides the reap cycle: stale
-        # detached run records get the poll their consumer
-        # never ran. Guarded — a collection failure reports in
-        # the result and never breaks the reap duty itself.
-        try:
-            import _load as _bin_load
-
-            result["collect"] = _bin_load.sync("runner").sweep.collect_stale_detached()
-        except Exception as exc:  # noqa: BLE001
-            result["collect"] = {"error": type(exc).__name__}
+        result = _reap_with_collector()
     print(json.dumps(result, indent=2))
     cr.mirror("capture")
     return 0 if result.get("action") not in ("refused-budget", "create-failed", "auto-failed", "standing-failed", "standing-refused-budget", "extend-no-lease", "extend-unknown", "extend-standing-managed", "grant-inactive", "caps-invalid", "unknown-shape", "shape-refused", "shape-mismatch", "caller-start-refused", "session-has-record", "session-stop-failed", "adopt-has-record", "adopt-absent", "adopt-unknown", "adopt-deadline-past", "adopt-deadline-shortens", "adopt-no-deadline", "adopt-shape-ambiguous", "adopt-shape-unknown", "adopt-shape-conflict", "adopt-bridge-managed", "adopt-handover-pending", "shorten-no-lease", "shorten-unknown", "shorten-standing-managed", "shorten-not-earlier", "shorten-deadline-past", "shorten-no-target", "sync-claim-refused-claim", "sync-claim-refused-activity", "sync-claim-unattributed", "sync-release-refused") else 1
