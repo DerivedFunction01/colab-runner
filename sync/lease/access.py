@@ -81,7 +81,10 @@ def release_session(colab, repo: Path, session: str) -> dict:
     return {"action": "session-released", "session": session, "stop": verdict}
 
 
-def detect_unattributed(colab, repo: Path, now_dt: datetime) -> dict:
+_LIVE_UNSET = object()
+
+
+def detect_unattributed(colab, repo: Path, now_dt: datetime, live=_LIVE_UNSET) -> dict:
     """Unattributed detection (Step 6), run by reap() each pass: a
     live session with no lease record and no caller claim is a
     stray — stamped with its first-seen time and spooled once as
@@ -91,8 +94,11 @@ def detect_unattributed(colab, repo: Path, now_dt: datetime) -> dict:
     being a live stray — it died, or it gained a record or a claim
     — is cleared with an unattributed-cleared event. An unreadable
     live list detects nothing: detection never acts on a list it
-    could not read."""
-    live = sessions.live_sessions(colab, repo)
+    could not read. The reap pass hands its own live reading in
+    as `live` (a list, or None for unreadable) so the pass pays
+    one listing for every verdict it derives."""
+    if live is _LIVE_UNSET:
+        live = sessions.live_sessions(colab, repo)
     if live is None:
         return {"detected": [], "cleared": []}
     known = {rec.get("session") for rec in _mod_records.all_records(repo)} | set(callers.load_caller_claims(repo).keys())

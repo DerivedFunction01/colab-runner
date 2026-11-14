@@ -54,22 +54,19 @@ _REAP_READ_ATTEMPTS = 2
 _REAP_READ_TIMEOUT_S = 45
 
 
-def session_state(colab, session: str, diag: dict | None = None, attempts: int | None = None, timeout: int = 120) -> str:
-    """Tri-state: "alive" (listed), "absent" (list obtained, name not in
-    it), "unknown" (the CLI call failed or returned nothing). Unknown must
-    never be treated as dead: on 2026-10-29 the lease record vanished
-    while its session lived, and a hiccup-reads-as-death path is the
-    standing suspect class. Callers reconcile only on "absent".
-
-    The read is retried (bounded, with backoff): a single transient
-    failure — a subprocess timeout under the account's parallel load
-    is the observed class — otherwise poisons a whole guard or
-    reaper cycle with an unknown it did not earn (2026-11-07: a
-    healthy, pulsing session classified extend-unknown and twice
-    kept-unknown overnight). Only exhausted retries classify
-    unknown, and `diag`, when passed, records why: the attempt
-    count and the last failure's shape, so an unknown is never
-    silent again. The auth prompt is definitive, never retried."""
+def _read_sessions_text(colab, diag: dict | None = None, attempts: int | None = None, timeout: int = 120) -> str | None:
+    """One retried raw sessions listing: the listing text on
+    success, None when every attempt failed (an exception, an
+    empty answer) or the CLI's auth prompt answered instead. The
+    read is retried (bounded, with backoff): a single transient
+    failure — a subprocess timeout under the account's parallel
+    load is the observed class — otherwise poisons a whole guard
+    or reaper cycle with an unknown it did not earn (2026-11-07:
+    a healthy, pulsing session classified extend-unknown and
+    twice kept-unknown overnight). Only exhausted retries fail,
+    and `diag`, when passed, records why: the attempt count and
+    the last failure's shape, so a failure is never silent again.
+    The auth prompt is definitive, never retried."""
     last_error = "no-attempt"
     tries = attempts if attempts is not None else _SESSION_READ_ATTEMPTS
     for attempt in range(tries):
@@ -88,14 +85,46 @@ def session_state(colab, session: str, diag: dict | None = None, attempts: int |
             # the seam, for any path that bypasses the wrapper.
             if diag is not None:
                 diag.update({"attempts": attempt + 1, "read_error": "auth-prompt"})
-            return "unknown"
+            return None
         if not out or not out.strip():
             last_error = "empty-output"
             continue
-        return "alive" if session in out else "absent"
+        return out
     if diag is not None:
         diag.update({"attempts": tries, "read_error": last_error})
-    return "unknown"
+    return None
+
+
+def session_state(colab, session: str, diag: dict | None = None, attempts: int | None = None, timeout: int = 120) -> str:
+    """Tri-state: "alive" (listed), "absent" (list obtained, name not in
+    it), "unknown" (the CLI call failed or returned nothing). Unknown must
+    never be treated as dead: on 2026-10-29 the lease record vanished
+    while its session lived, and a hiccup-reads-as-death path is the
+    standing suspect class. Callers reconcile only on "absent"."""
+    text = _read_sessions_text(colab, diag, attempts, timeout)
+    if text is None:
+        return "unknown"
+    return "alive" if session in text else "absent"
+
+
+def list_snapshot(colab, diag: dict | None = None, attempts: int | None = None, timeout: int = 120) -> str | None:
+    """One listing fetched for a whole reap pass (the reap cycle
+    budget plan, 2026-11-14): every record's state verdict and
+    the pass's unattributed detection derive from this single
+    read instead of each record paying its own retried listing —
+    the sum of those reads was the cycle's unbounded cost. None
+    when the listing could not be read: every verdict from a
+    None snapshot is unknown, never dead."""
+    return _read_sessions_text(colab, diag, attempts, timeout)
+
+
+def state_in_snapshot(snapshot: str | None, session: str) -> str:
+    """session_state's verdict against a shared snapshot: the
+    same substring test, so a pass classifies exactly as the
+    per-record reads did — from one listing."""
+    if snapshot is None:
+        return "unknown"
+    return "alive" if session in snapshot else "absent"
 
 
 def session_alive(colab, session: str) -> bool:
@@ -252,17 +281,22 @@ def _endpoint_shape(endpoint: str | None) -> str | None:
     return "high_ram" if m.group(1) == "hm" else "standard"
 
 
-def live_sessions(colab, repo: Path) -> list[dict] | None:
+def live_sessions(colab, repo: Path, text: str | None = None) -> list[dict] | None:
     """The server's live sessions: [{session, endpoint,
     shape_class}], endpoint/shape filled from the listing line when
     it carries them, else from the local binding. None when the
     listing is unreadable — a failed call, an empty answer, an auth
     prompt: the session_state rule, that no caller may act on a
-    list it could not read."""
-    try:
-        out = colab("sessions", timeout=120).stdout
-    except Exception:  # noqa: BLE001
-        return None
+    list it could not read. A caller that already holds a listing
+    (the reap pass's snapshot) passes it as `text` and pays no
+    second read for the same evidence."""
+    if text is None:
+        try:
+            out = colab("sessions", timeout=120).stdout
+        except Exception:  # noqa: BLE001
+            return None
+    else:
+        out = text
     if not out or not out.strip() or "Enter the authorization code" in out:
         return None
     found: dict[str, dict] = {}

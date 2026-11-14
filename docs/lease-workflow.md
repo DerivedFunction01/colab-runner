@@ -332,16 +332,38 @@ hour is allowed, the probe stamp is written when the pass is
 decided — before any duty dials — and a host once reached latches
 `contact_ok` and is never gated again.
 
-**Reap**: passes are mutually exclusive (flock). Reap classifies
-each record's session through the core's tri-state read, which
-retries transient failures inside a bounded budget before a
-session may read `unknown` — and unknown is never treated as
-dead. A lease record is deleted only on a confirmed-absent
-reading or a successful stop, never on an unreadable one. Reap
-also keeps live sessions warm: it relaunches the detached
-keepalive loop (CPU touch + heartbeat every 60 s) whenever its
-heartbeat goes stale, and pulses the session's kernel with a
-trivial exec every `pulse_seconds` — a pulse timeout reads as
+**Reap**: passes are mutually exclusive (flock). A pass opens
+with ONE shared sessions listing (the snapshot, read at the
+reap read budget: 2 attempts × 45 s): every record's tri-state
+verdict derives from it by the same substring test the
+per-record read used, and unattributed detection parses the
+same listing — a pass pays one listing for every verdict it
+derives, where it once paid a retried read per record plus
+one more for detection. A session may read `unknown` only
+when the listing itself could not be read — and unknown is
+never treated as dead. A lease record is deleted only on a
+confirmed-absent reading or a successful stop, never on an
+unreadable one. The pass then runs in phases under a cycle
+budget (`COLAB_LEASE_REAP_BUDGET_S`, default 360 s — inside
+the hook's 420 s reap bound): every record's lifecycle legs
+(renewal, release, absence clearing) complete first,
+unconditionally; the liveness furniture (identity check,
+keepalive freshness, kernel pulse), the keepalive launches
+the freshness reads owe, and the listener census follow
+under the budget's remaining time, each item checked before
+it starts. An exhausted budget skips-and-reports — the pass
+result carries `budget: {budget_s, spent_s, skipped}` and a
+skipped record is marked — instead of the hook's timeout
+killing the cycle mid-flight. Keepalive launches are their
+own phase: a stale freshness read records the launch as owed
+rather than launching in line, so a stalled launch starves
+nothing; a launch the budget cannot fit is reported
+`launch-deferred` and the next cycle's freshness read asks
+again. Reap also keeps live sessions warm: it relaunches
+the detached keepalive loop (CPU touch + heartbeat every
+60 s) whenever its heartbeat goes stale, and pulses the
+session's kernel with a trivial exec every `pulse_seconds`
+— a pulse timeout reads as
 busy, since a kernel that cannot take the pulse is already
 executing. The idle path releases a lease only past its idle
 threshold AND with an empty `jobs` list: registered jobs are
